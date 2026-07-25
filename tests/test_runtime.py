@@ -135,7 +135,7 @@ def test_tool_failure_carries_final_context() -> None:
 
     with pytest.raises(ToolExecutionError) as caught:
         fail()
-    assert caught.value.context.status.value == "failed"
+    assert caught.value.context.status.value == "unknown"
     assert "ValueError" in (caught.value.context.error or "")
 
 
@@ -149,4 +149,3 @@ async def test_sync_invoke_rejected_inside_event_loop() -> None:
 
     with pytest.raises(RuntimeError, match="use ainvoke"):
         work()
-

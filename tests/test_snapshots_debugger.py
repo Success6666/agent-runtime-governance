@@ -31,7 +31,9 @@ def test_snapshot_middleware_records_governance_and_result() -> None:
 
 
 def test_jsonl_snapshot_store_round_trip(tmp_path) -> None:
-    store = JSONLSnapshotStore(tmp_path / "snapshots.jsonl")
+    store = JSONLSnapshotStore(
+        tmp_path / "snapshots.jsonl", redact_sensitive=False
+    )
     result = run_with_snapshots(store)
     restored = store.read_trace(result.context.trace_id)
     assert len(restored) == 2
@@ -91,4 +93,3 @@ def test_mermaid_trace_contains_ordered_edges() -> None:
 
 def test_empty_mermaid_trace_is_valid() -> None:
     assert "No snapshots" in trace_to_mermaid([])
-

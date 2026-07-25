@@ -1,0 +1,531 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import sqlite3
+from contextlib import contextmanager
+
+import pytest
+
+from agent_runtime_governance import Runtime
+from agent_runtime_governance.audit import JSONLAuditSink, SQLiteAuditSink
+from agent_runtime_governance.context import (
+    ExecutionContext,
+    ExecutionMode,
+    ExecutionStatus,
+    HistoryEntry,
+    RiskTier,
+    ToolCall,
+)
+from agent_runtime_governance.decisions import DecisionOutcome, DecisionRecord
+from agent_runtime_governance.errors import AuditIntegrityError
+from agent_runtime_governance.plugins.opa import OPAClient
+from agent_runtime_governance.plugins.slack import SlackWebhookNotifier
+from agent_runtime_governance.snapshots import (
+    InMemorySnapshotStore,
+    JSONLSnapshotStore,
+    SnapshotMiddleware,
+    SQLiteSnapshotStore,
+)
+from agent_runtime_governance.telemetry import OpenTelemetryMiddleware
+
+
+def make_context(**changes) -> ExecutionContext:
+    context = ExecutionContext.create(
+        ToolCall("danger", args=("secret-positional",), kwargs={"password": "secret"}),
+        input_text="delete user token-123",
+        user="alice",
+        permissions=frozenset({"admin"}),
+        risk_tier=RiskTier.CRITICAL,
+    )
+    if changes:
+        context = context.evolve(**changes)
+    return context
+
+
+def test_jsonl_audit_hash_chain_detects_deletion_and_tamper(tmp_path) -> None:
+    sink = JSONLAuditSink(tmp_path / "audit.jsonl", sign_key="k")
+    sink.write({"trace_id": "t", "stage": "decision", "context": {"tool_call": {"args": ["x"]}}})
+    sink.write({"trace_id": "t", "stage": "completed", "context": {"tool_call": {"args": ["x"]}}})
+    assert [event["sequence"] for event in sink.read_verified()] == [0, 1]
+
+    path = tmp_path / "audit.jsonl"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    path.write_text("\n".join(lines[:1]) + "\n", encoding="utf-8")
+    with pytest.raises(AuditIntegrityError):
+        sink.read_verified()
+
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    path.write_text(path.read_text(encoding="utf-8").replace("decision", "approve", 1), encoding="utf-8")
+    with pytest.raises(AuditIntegrityError):
+        sink.read_verified()
+
+
+def test_jsonl_audit_rotation_preserves_verifiable_chain(tmp_path) -> None:
+    sink = JSONLAuditSink(
+        tmp_path / "audit.jsonl",
+        sign_key="k",
+        max_bytes=450,
+        backup_count=4,
+    )
+    for index in range(8):
+        sink.write({"trace_id": "t", "stage": f"s{index}", "context": {"tool_call": {"args": []}}})
+    events = sink.read_verified()
+    assert events
+    assert events == sorted(events, key=lambda event: event["sequence"])
+    assert any((tmp_path / f"audit.jsonl.{index}").exists() for index in range(1, 5))
+
+
+def test_jsonl_audit_recovers_a_fsynced_tail_after_state_lag(tmp_path) -> None:
+    path = tmp_path / "audit.jsonl"
+    state_path = tmp_path / "audit.jsonl.state"
+    sink = JSONLAuditSink(path, sign_key="k")
+    sink.write({"event": 1})
+    old_state = state_path.read_bytes()
+    sink.write({"event": 2})
+
+    state_path.write_bytes(old_state)
+
+    assert [event["event"] for event in sink.read_verified()] == [1, 2]
+    recovered = json.loads(state_path.read_text(encoding="utf-8"))
+    assert recovered["last_sequence"] == 1
+
+
+def test_jsonl_audit_does_not_recover_a_non_extending_state(tmp_path) -> None:
+    path = tmp_path / "audit.jsonl"
+    state_path = tmp_path / "audit.jsonl.state"
+    sink = JSONLAuditSink(path, sign_key="k")
+    sink.write({"event": 1})
+    sink.write({"event": 2})
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["last_sequence"] = 0
+    state["last_hash"] = "f" * 64
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(AuditIntegrityError, match="state signature|does not extend"):
+        sink.read_verified()
+
+
+def test_jsonl_audit_redaction_blocks_repr_and_defaults(tmp_path) -> None:
+    class SecretObject:
+        def __repr__(self) -> str:
+            return "repr-secret"
+
+    sink = JSONLAuditSink(
+        tmp_path / "audit.jsonl",
+        value_patterns=[r"token-[0-9]+"],
+    )
+    context = make_context(result=SecretObject(), error="token-123 failed")
+    from agent_runtime_governance.audit import context_event
+
+    sink.write(context_event(context, stage="completed"))
+    text = (tmp_path / "audit.jsonl").read_text(encoding="utf-8")
+    assert "secret-positional" not in text
+    assert "delete user" not in text
+    assert "repr-secret" not in text
+    assert "token-123" not in text
+    assert "[REDACTED]" in text
+
+
+def test_audit_redacts_decision_history_and_identity_claims_by_default(
+    tmp_path,
+) -> None:
+    secret = "production-secret-value"
+    context = make_context(
+        metadata={"identity_claims": {"signature": secret}},
+    )
+    context = context.with_decision(
+        DecisionRecord(DecisionOutcome.ALLOW, secret, "test", approver="operator")
+    ).append_history(HistoryEntry("test", "allow", secret))
+    from agent_runtime_governance.audit import context_event
+
+    sink = JSONLAuditSink(tmp_path / "audit.jsonl", sign_key="k")
+    sink.write(context_event(context, stage="decision"))
+    text = (tmp_path / "audit.jsonl").read_text(encoding="utf-8")
+
+    assert secret not in text
+    event = sink.read_verified()[0]
+    assert event["reason"] == "[REDACTED]"
+    assert event["context"]["decision"]["reason"] == "[REDACTED]"
+    assert event["context"]["history"][-1]["reason"] == "[REDACTED]"
+
+
+def test_jsonl_audit_allowlist_can_preserve_explicit_path(tmp_path) -> None:
+    sink = JSONLAuditSink(
+        tmp_path / "audit.jsonl",
+        allow_paths={"context.input_text"},
+    )
+    from agent_runtime_governance.audit import context_event
+
+    sink.write(context_event(make_context(), stage="decision"))
+    text = (tmp_path / "audit.jsonl").read_text(encoding="utf-8")
+    assert "delete user token-123" in text
+    assert "secret-positional" not in text
+
+
+def test_sqlite_audit_sink_is_transactional_and_verifiable(tmp_path) -> None:
+    path = tmp_path / "audit.db"
+    sink = SQLiteAuditSink(path, sign_key="k")
+    sink.write({"trace_id": "t", "stage": "decision", "context": {"tool_call": {"args": []}}})
+    sink.write({"trace_id": "t", "stage": "completed", "context": {"tool_call": {"args": []}}})
+    assert [event["sequence"] for event in sink.read_verified()] == [0, 1]
+
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE audit_events SET event_json = replace(event_json, 'completed', 'tampered') WHERE sequence = 1"
+        )
+    with pytest.raises(AuditIntegrityError):
+        sink.read_verified()
+
+
+def test_jsonl_snapshot_store_allocates_sequence_across_instances(tmp_path) -> None:
+    path = tmp_path / "snapshots.jsonl"
+    first = JSONLSnapshotStore(path)
+    second = JSONLSnapshotStore(path)
+    context = make_context()
+    first.write_context(
+        trace_id=context.trace_id,
+        stage="governance",
+        context=context,
+        created_at="2026-01-01T00:00:00+00:00",
+        policy_version=None,
+        policy_digest=None,
+    )
+    second.write_context(
+        trace_id=context.trace_id,
+        stage="result",
+        context=context.evolve(status=ExecutionStatus.SUCCEEDED, result=True),
+        created_at="2026-01-01T00:00:01+00:00",
+        policy_version=None,
+        policy_digest=None,
+    )
+    assert [snapshot.sequence for snapshot in first.read_trace(context.trace_id)] == [0, 1]
+
+
+def test_sqlite_snapshot_store_round_trips_with_atomic_sequence(tmp_path) -> None:
+    store = SQLiteSnapshotStore(tmp_path / "snapshots.db")
+    context = make_context()
+    store.write_context(
+        trace_id=context.trace_id,
+        stage="governance",
+        context=context,
+        created_at="2026-01-01T00:00:00+00:00",
+        policy_version="v1",
+        policy_digest="digest",
+    )
+    store.write_context(
+        trace_id=context.trace_id,
+        stage="result",
+        context=context.evolve(status=ExecutionStatus.SUCCEEDED, result=True),
+        created_at="2026-01-01T00:00:01+00:00",
+        policy_version="v1",
+        policy_digest="digest",
+    )
+    restored = store.read_trace(context.trace_id)
+    assert [snapshot.sequence for snapshot in restored] == [0, 1]
+    assert restored[0].policy_version == "v1"
+
+
+def test_jsonl_snapshot_redacts_secrets_and_detects_tampering(tmp_path) -> None:
+    path = tmp_path / "snapshots.jsonl"
+    secret = "snapshot-secret-value"
+    store = JSONLSnapshotStore(path, sign_key="snapshot-signing-key")
+    context = ExecutionContext.create(
+        ToolCall("danger", args=(secret,), kwargs={"payload": secret}),
+        input_text=secret,
+    )
+    store.write_context(
+        trace_id=context.trace_id,
+        stage="governance",
+        context=context,
+        created_at="2026-01-01T00:00:00+00:00",
+        policy_version=None,
+        policy_digest=None,
+    )
+
+    text = path.read_text(encoding="utf-8")
+    assert secret not in text
+    assert store.read_trace(context.trace_id)[0].context.input_text == "[REDACTED]"
+
+    path.write_text(text.replace('"pending"', '"failed"', 1), encoding="utf-8")
+    with pytest.raises(AuditIntegrityError, match="snapshot"):
+        store.read_trace(context.trace_id)
+
+
+def test_sqlite_snapshot_redacts_secrets_on_disk(tmp_path) -> None:
+    path = tmp_path / "snapshots.db"
+    secret = "sqlite-snapshot-secret"
+    store = SQLiteSnapshotStore(path, sign_key="snapshot-signing-key")
+    context = ExecutionContext.create(
+        ToolCall("danger", kwargs={"payload": secret}),
+        input_text=secret,
+    )
+    store.write_context(
+        trace_id=context.trace_id,
+        stage="governance",
+        context=context,
+        created_at="2026-01-01T00:00:00+00:00",
+        policy_version=None,
+        policy_digest=None,
+    )
+
+    assert secret.encode() not in path.read_bytes()
+    assert store.read_trace(context.trace_id)[0].context.input_text == "[REDACTED]"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_records_unknown_as_a_terminal_result() -> None:
+    store = InMemorySnapshotStore()
+    middleware = SnapshotMiddleware(store)
+    context = ExecutionContext.create(ToolCall("danger"))
+    context = await middleware.process(context)
+    context = context.evolve(
+        status=ExecutionStatus.UNKNOWN,
+        error="side effect outcome unknown",
+    )
+
+    context = await middleware.process(context)
+
+    snapshots = store.read_trace(context.trace_id)
+    assert [snapshot.stage for snapshot in snapshots] == ["governance", "result"]
+    assert snapshots[-1].context.status is ExecutionStatus.UNKNOWN
+
+
+def test_opa_client_limits_payload_and_circuit_breaks() -> None:
+    context = make_context()
+    with pytest.raises(ValueError):
+        OPAClient(
+            "http://localhost:8181",
+            "agent/allow",
+            transport=lambda payload: {"result": True},
+            max_request_bytes=8,
+        ).evaluate(context)
+
+    client = OPAClient(
+        "http://localhost:8181",
+        "agent/allow",
+        transport=lambda payload: (_ for _ in ()).throw(ConnectionError("down")),
+        failure_threshold=1,
+        recovery_timeout=60,
+    )
+    with pytest.raises(ConnectionError):
+        client.evaluate(context)
+    with pytest.raises(RuntimeError, match="circuit breaker"):
+        client.evaluate(context)
+
+
+def test_external_header_validation_rejects_injection() -> None:
+    with pytest.raises(ValueError):
+        OPAClient("http://localhost:8181", "agent/allow", headers={"X-Test\n": "1"})
+    with pytest.raises(ValueError):
+        SlackWebhookNotifier(
+            "https://hooks.slack.com/services/T/B/C",
+            headers={"X-Test": "one\ntwo"},
+        )
+
+
+def test_slack_notifier_limits_payload_and_circuit_breaks(monkeypatch) -> None:
+    notifier = SlackWebhookNotifier(
+        "https://hooks.slack.com/services/T/B/C",
+        max_request_bytes=16,
+    )
+    with pytest.raises(ValueError):
+        notifier.send({"text": "x" * 100})
+
+    calls = {"count": 0}
+
+    def failing_urlopen(*args, **kwargs):
+        calls["count"] += 1
+        raise ConnectionError("down")
+
+    monkeypatch.setattr("agent_runtime_governance.plugins.slack.urlopen", failing_urlopen)
+    notifier = SlackWebhookNotifier(
+        "https://hooks.slack.com/services/T/B/C",
+        failure_threshold=1,
+        recovery_timeout=60,
+    )
+    with pytest.raises(ConnectionError):
+        notifier.send({"text": "ok"})
+    with pytest.raises(RuntimeError, match="circuit breaker"):
+        notifier.send({"text": "ok"})
+    assert calls["count"] == 1
+
+
+class FakeSpan:
+    def __init__(self) -> None:
+        self.attributes = {}
+        self.statuses = []
+        self.exceptions = []
+        self.ended = False
+
+    def set_attribute(self, key, value) -> None:
+        self.attributes[key] = value
+
+    def set_status(self, status) -> None:
+        self.statuses.append(status)
+
+    def record_exception(self, exc) -> None:
+        self.exceptions.append(exc)
+
+    def end(self) -> None:
+        self.ended = True
+
+
+class FakeSpanManager:
+    def __init__(self, span: FakeSpan) -> None:
+        self.span = span
+        self.exited = False
+
+    def __enter__(self) -> FakeSpan:
+        return self.span
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.exited = True
+        self.span.end()
+
+
+class FakeCurrentTracer:
+    def __init__(self) -> None:
+        self.spans: list[FakeSpan] = []
+        self.managers: list[FakeSpanManager] = []
+        self.parent_contexts = []
+
+    @contextmanager
+    def start_as_current_span(self, name, **kwargs):
+        span = FakeSpan()
+        span.attributes.update(kwargs["attributes"])
+        self.spans.append(span)
+        self.parent_contexts.append(kwargs.get("context"))
+        manager = FakeSpanManager(span)
+        self.managers.append(manager)
+        try:
+            yield manager.__enter__()
+        finally:
+            manager.__exit__(None, None, None)
+
+
+def test_opentelemetry_uses_current_span_parent_and_cleans_failed_span() -> None:
+    tracer = FakeCurrentTracer()
+    parent = object()
+    middleware = OpenTelemetryMiddleware(tracer, parent_context=parent)
+    runtime = Runtime([middleware])
+
+    @runtime.tool(execution_mode=ExecutionMode.READ_ONLY)
+    def fail() -> None:
+        raise RuntimeError("boom")
+
+    with pytest.raises(Exception):
+        runtime.invoke("fail")
+    assert tracer.parent_contexts == [parent]
+    assert tracer.spans[0].ended
+    assert tracer.spans[0].exceptions
+    assert tracer.spans[0].attributes["arg.status"] == "failed"
+    assert middleware._spans == {}
+
+
+def test_opentelemetry_does_not_export_raw_error_details() -> None:
+    tracer = FakeCurrentTracer()
+    middleware = OpenTelemetryMiddleware(tracer)
+    context = make_context(
+        status=ExecutionStatus.FAILED,
+        error="database password is production-secret",
+    )
+
+    import asyncio
+
+    asyncio.run(middleware.process(context))
+
+    span = tracer.spans[0]
+    assert "arg.error" not in span.attributes
+    assert all("production-secret" not in str(exc) for exc in span.exceptions)
+
+
+def test_opentelemetry_abort_finishes_and_forgets_active_span() -> None:
+    tracer = FakeCurrentTracer()
+    middleware = OpenTelemetryMiddleware(tracer)
+    context = make_context()
+
+    import asyncio
+
+    asyncio.run(middleware.process(context))
+    assert middleware.active_span_count == 1
+
+    assert middleware.abort(context.trace_id)
+    assert middleware.active_span_count == 0
+    assert tracer.spans[0].ended
+    assert not middleware.abort(context.trace_id)
+
+
+def test_opentelemetry_exports_a_real_sdk_span_without_secret_details() -> None:
+    pytest.importorskip("opentelemetry.sdk")
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    middleware = OpenTelemetryMiddleware(provider.get_tracer("test"))
+    context = make_context(
+        status=ExecutionStatus.FAILED,
+        error="production-secret",
+    )
+
+    import asyncio
+
+    asyncio.run(middleware.process(context))
+
+    spans = exporter.get_finished_spans()
+    assert len(spans) == 1
+    encoded = repr(spans[0].attributes) + repr(spans[0].events)
+    assert "production-secret" not in encoded
+    assert spans[0].status.status_code.name == "ERROR"
+
+
+def test_opentelemetry_context_propagates_into_synchronous_tool_thread() -> None:
+    pytest.importorskip("opentelemetry.sdk")
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test")
+    runtime = Runtime([OpenTelemetryMiddleware(tracer)])
+
+    @runtime.tool(execution_mode=ExecutionMode.READ_ONLY)
+    def read() -> str:
+        with tracer.start_as_current_span("inside-tool"):
+            return "ok"
+
+    assert read() == "ok"
+    spans = {span.name: span for span in exporter.get_finished_spans()}
+    assert spans["inside-tool"].parent is not None
+    assert spans["inside-tool"].parent.span_id == spans["tool.read"].context.span_id
+    runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_cancellation_closes_opentelemetry_span() -> None:
+    tracer = FakeCurrentTracer()
+    middleware = OpenTelemetryMiddleware(tracer)
+    runtime = Runtime([middleware])
+    started = asyncio.Event()
+
+    @runtime.tool()
+    async def mutate() -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(runtime.arun("mutate"))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert middleware.active_span_count == 0
+    assert tracer.spans[0].ended
