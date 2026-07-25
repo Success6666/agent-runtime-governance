@@ -545,7 +545,7 @@ async def test_human_provider_applies_configured_approver_to_full_record() -> No
 
 
 @pytest.mark.asyncio
-async def test_decision_middleware_prunes_expired_local_reservations() -> None:
+async def test_pruned_approval_reservation_denies_at_delayed_execution_boundary() -> None:
     class Provider:
         async def decide(self, context, request):
             return DecisionRecord(
@@ -573,6 +573,13 @@ async def test_decision_middleware_prunes_expired_local_reservations() -> None:
     second = await middleware.process(second_context)
     assert second.decision.outcome is DecisionOutcome.ALLOW
     assert middleware.active_reservation_count == 1
+
+    delayed = await middleware.commit_approval(first)
+    assert delayed.denied
+    assert "unavailable at the execution boundary" in delayed.decision.reason
+    assert middleware.active_reservation_count == 1
+    await middleware.release_approval(second)
+    assert middleware.active_reservation_count == 0
 
 
 def test_runtime_builder_applies_all_runtime_dependencies() -> None:
