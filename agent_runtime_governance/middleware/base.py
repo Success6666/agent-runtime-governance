@@ -49,6 +49,10 @@ class GatingMiddleware(Middleware):
 
 class ObservingMiddleware(Middleware):
     kind = MiddlewareKind.OBSERVING
+    critical = False
+
+    def is_critical(self, context: ExecutionContext) -> bool:
+        return self.critical
 
 
 ExecutionCall = Callable[[ExecutionContext], Awaitable[tuple[ExecutionContext, Any]]]

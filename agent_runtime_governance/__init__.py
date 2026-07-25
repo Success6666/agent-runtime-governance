@@ -1,15 +1,33 @@
-from .audit import InMemoryAuditSink, JSONLAuditSink
-from .context import ExecutionContext, ExecutionStatus, HistoryEntry, RiskTier, ToolCall
+from .approval_store import (
+    ApprovalReservation,
+    ApprovalStatus,
+    ApprovalStore,
+    InMemoryApprovalStore,
+    SQLiteApprovalStore,
+    StoredApproval,
+)
+from .audit import AuditSink, InMemoryAuditSink, JSONLAuditSink, SQLiteAuditSink
+from .context import (
+    ExecutionContext,
+    ExecutionMode,
+    ExecutionStatus,
+    HistoryEntry,
+    RiskTier,
+    ToolCall,
+)
 from .debugger import DiffEntry, ReplayDebugger, diff_values
 from .decisions import (
     ApprovalRequest,
     DecisionOutcome,
+    DecisionProvider,
     DecisionRecord,
     HumanDecisionProvider,
 )
 from .errors import (
+    AuditDeliveryError,
     AuditIntegrityError,
     ContextMutationError,
+    ContractValidationError,
     GovernanceDenied,
     GovernanceError,
     RegistryError,
@@ -25,6 +43,15 @@ from .evaluation import (
     RegressionResult,
 )
 from .hooks import HookPoint, HookRegistry
+from .identity import (
+    HMACClaimsIdentityProvider,
+    IdentityProvider,
+    IdentityReplayStore,
+    InMemoryIdentityReplayStore,
+    SQLiteIdentityReplayStore,
+    StaticIdentityProvider,
+    VerifiedPrincipal,
+)
 from .middleware import (
     ApprovalMiddleware,
     AuditMiddleware,
@@ -62,34 +89,66 @@ from .plugins import (
     SlackWebhookNotifier,
 )
 from .policy import PolicyMiddleware, SimplePolicy
+from .registry import (
+    IdempotencyClaim,
+    IdempotencyConflictError,
+    IdempotencyInProgressError,
+    IdempotencyOutcomeUnknownError,
+    IdempotencyStore,
+    InMemoryIdempotencyStore,
+    SQLiteIdempotencyStore,
+    ToolSpec,
+)
 from .replay import ReplayTrace
+from .resilience import (
+    CapacityExceededError,
+    CircuitBreaker,
+    CircuitOpenError,
+    CircuitState,
+    RuntimeLimits,
+    StageTimeoutError,
+)
 from .runtime import Harness, InvocationOptions, RunResult, Runtime
 from .snapshots import (
     ContextSnapshot,
     InMemorySnapshotStore,
     JSONLSnapshotStore,
     SnapshotMiddleware,
+    SnapshotStore,
+    SQLiteSnapshotStore,
 )
 from .telemetry import OpenTelemetryMiddleware
 from .visualization import trace_to_mermaid
 from .yaml_policy import PolicyDocument, PolicyValidationError, YAMLPolicyLoader
 
-__version__ = "0.4.2"
+__version__ = "0.5.0"
 
 __all__ = [
     "ApprovalMiddleware",
     "ApprovalRequest",
+    "ApprovalReservation",
+    "ApprovalStatus",
+    "ApprovalStore",
+    "AuditDeliveryError",
+    "AuditSink",
     "AuditIntegrityError",
     "AuditMiddleware",
     "ContextMutationError",
     "ContextSnapshot",
+    "ContractValidationError",
+    "CapacityExceededError",
+    "CircuitBreaker",
+    "CircuitOpenError",
+    "CircuitState",
     "DecisionMiddleware",
     "DecisionOutcome",
+    "DecisionProvider",
     "DecisionRecord",
     "DiffEntry",
     "DriftRecord",
     "ExecutionMiddleware",
     "ExecutionContext",
+    "ExecutionMode",
     "ExecutionStatus",
     "EvaluationSuite",
     "GatingMiddleware",
@@ -100,7 +159,13 @@ __all__ = [
     "HookPoint",
     "HookRegistry",
     "HumanDecisionProvider",
+    "HMACClaimsIdentityProvider",
+    "IdentityProvider",
+    "IdentityReplayStore",
     "InMemoryAuditSink",
+    "InMemoryApprovalStore",
+    "InMemoryIdentityReplayStore",
+    "InMemoryIdempotencyStore",
     "InMemoryMetrics",
     "InMemorySnapshotStore",
     "InvocationOptions",
@@ -142,16 +207,33 @@ __all__ = [
     "RunResult",
     "Runtime",
     "RuntimeBuilder",
+    "RuntimeLimits",
     "SemanticReview",
     "SimplePolicy",
     "SnapshotMiddleware",
+    "SnapshotStore",
+    "SQLiteApprovalStore",
+    "SQLiteAuditSink",
+    "SQLiteIdentityReplayStore",
+    "SQLiteIdempotencyStore",
+    "SQLiteSnapshotStore",
+    "StageTimeoutError",
+    "StaticIdentityProvider",
+    "StoredApproval",
     "SlackNotificationMiddleware",
     "SlackPlugin",
     "SlackWebhookNotifier",
     "TimeoutMiddleware",
     "ToolCall",
+    "ToolSpec",
     "ToolExecutionError",
+    "VerifiedPrincipal",
     "YAMLPolicyLoader",
     "diff_values",
     "trace_to_mermaid",
+    "IdempotencyConflictError",
+    "IdempotencyClaim",
+    "IdempotencyInProgressError",
+    "IdempotencyOutcomeUnknownError",
+    "IdempotencyStore",
 ]

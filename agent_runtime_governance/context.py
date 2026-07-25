@@ -18,6 +18,12 @@ class RiskTier(IntEnum):
     CRITICAL = 4
 
 
+class ExecutionMode(str, Enum):
+    READ_ONLY = "read_only"
+    IDEMPOTENT = "idempotent"
+    MUTATING = "mutating"
+
+
 class ExecutionStatus(str, Enum):
     PENDING = "pending"
     ALLOWED = "allowed"
@@ -25,6 +31,7 @@ class ExecutionStatus(str, Enum):
     EXECUTING = "executing"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,7 +64,7 @@ class ToolCall:
     kwargs: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "args", tuple(self.args))
+        object.__setattr__(self, "args", tuple(_freeze(item) for item in self.args))
         object.__setattr__(self, "kwargs", _freeze_mapping(self.kwargs))
 
     def to_dict(self) -> dict[str, Any]:
@@ -81,6 +88,9 @@ _IDENTITY_FIELDS = frozenset(
         "permissions",
         "tool_call",
         "input_text",
+        "execution_mode",
+        "idempotency_key",
+        "deadline",
         "history",
     }
 )
@@ -99,6 +109,9 @@ class ExecutionContext:
     tenant: str | None = None
     permissions: frozenset[str] = field(default_factory=frozenset)
     input_text: str = ""
+    execution_mode: ExecutionMode = ExecutionMode.MUTATING
+    idempotency_key: str | None = None
+    deadline: datetime | None = None
     risk_tier: RiskTier = RiskTier.LOW
     risk_score: float = 0.0
     requires_approval: bool = False
@@ -112,6 +125,10 @@ class ExecutionContext:
     def __post_init__(self) -> None:
         if not 0.0 <= self.risk_score <= 1.0:
             raise ValueError("risk_score must be between 0.0 and 1.0")
+        if self.deadline is not None and (
+            self.deadline.tzinfo is None or self.deadline.utcoffset() is None
+        ):
+            raise ValueError("deadline must be timezone-aware")
         object.__setattr__(self, "permissions", frozenset(self.permissions))
         object.__setattr__(self, "history", tuple(self.history))
         object.__setattr__(self, "metadata", _freeze_mapping(self.metadata))
@@ -121,6 +138,7 @@ class ExecutionContext:
         cls,
         tool_call: ToolCall,
         *,
+        request_id: str | None = None,
         input_text: str = "",
         user: str | None = None,
         tenant: str | None = None,
@@ -128,6 +146,9 @@ class ExecutionContext:
         task_id: str | None = None,
         conversation_id: str | None = None,
         parent_span_id: str | None = None,
+        execution_mode: ExecutionMode = ExecutionMode.MUTATING,
+        idempotency_key: str | None = None,
+        deadline: datetime | None = None,
         risk_tier: RiskTier = RiskTier.LOW,
         requires_approval: bool = False,
         metadata: Mapping[str, Any] | None = None,
@@ -135,7 +156,7 @@ class ExecutionContext:
         return cls(
             trace_id=uuid4().hex,
             span_id=uuid4().hex[:16],
-            request_id=uuid4().hex,
+            request_id=request_id or uuid4().hex,
             parent_span_id=parent_span_id,
             task_id=task_id,
             conversation_id=conversation_id,
@@ -143,6 +164,9 @@ class ExecutionContext:
             tenant=tenant,
             permissions=frozenset(permissions),
             input_text=input_text,
+            execution_mode=execution_mode,
+            idempotency_key=idempotency_key,
+            deadline=deadline,
             tool_call=tool_call,
             risk_tier=risk_tier,
             requires_approval=requires_approval,
@@ -194,20 +218,15 @@ class ExecutionContext:
             "tenant": self.tenant,
             "permissions": sorted(self.permissions),
             "input_text": self.input_text,
+            "execution_mode": self.execution_mode.value,
+            "idempotency_key": self.idempotency_key,
+            "deadline": self.deadline.isoformat() if self.deadline else None,
             "tool_call": self.tool_call.to_dict(),
             "risk_tier": self.risk_tier.name,
             "risk_score": self.risk_score,
             "requires_approval": self.requires_approval,
             "status": self.status.value,
-            "decision": (
-                {
-                    "outcome": self.decision.outcome.value,
-                    "reason": self.decision.reason,
-                    "source": self.decision.source,
-                }
-                if self.decision
-                else None
-            ),
+            "decision": self.decision.to_dict() if self.decision else None,
             "history": [entry.to_dict() for entry in self.history],
             "metadata": _thaw(self.metadata),
             "result": _json_safe(self.result),
@@ -219,6 +238,7 @@ class ExecutionContext:
         *,
         risk_tier: RiskTier | None = None,
         requires_approval: bool | None = None,
+        execution_mode: ExecutionMode | None = None,
     ) -> "ExecutionContext":
         """Return the original request identity with governance state cleared."""
         return ExecutionContext(
@@ -232,6 +252,12 @@ class ExecutionContext:
             tenant=self.tenant,
             permissions=self.permissions,
             input_text=self.input_text,
+            execution_mode=execution_mode or self.execution_mode,
+            idempotency_key=self.idempotency_key,
+            # A recorded wall-clock deadline is historical state. Reapplying it
+            # would make deterministic policy replay expire merely because time
+            # has passed since the original request.
+            deadline=None,
             tool_call=self.tool_call,
             risk_tier=risk_tier or self.risk_tier,
             requires_approval=(
@@ -246,11 +272,7 @@ class ExecutionContext:
     def from_dict(cls, data: Mapping[str, Any]) -> "ExecutionContext":
         decision_data = data.get("decision")
         decision = (
-            DecisionRecord(
-                outcome=DecisionOutcome(decision_data["outcome"]),
-                reason=decision_data["reason"],
-                source=decision_data["source"],
-            )
+            DecisionRecord.from_dict(decision_data)
             if decision_data
             else None
         )
@@ -266,6 +288,13 @@ class ExecutionContext:
             tenant=data.get("tenant"),
             permissions=frozenset(data.get("permissions", [])),
             input_text=str(data.get("input_text", "")),
+            execution_mode=ExecutionMode(data.get("execution_mode", "mutating")),
+            idempotency_key=data.get("idempotency_key"),
+            deadline=(
+                datetime.fromisoformat(str(data["deadline"]))
+                if data.get("deadline")
+                else None
+            ),
             tool_call=ToolCall(
                 name=tool_data["name"],
                 args=tuple(tool_data.get("args", [])),
@@ -323,4 +352,4 @@ def _json_safe(value: Any) -> Any:
         return value.value
     if isinstance(value, Mapping | list | tuple | set | frozenset):
         return _thaw(value)
-    return repr(value)
+    return f"[UNSERIALIZABLE:{type(value).__module__}.{type(value).__qualname__}]"

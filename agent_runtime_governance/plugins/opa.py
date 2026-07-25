@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import ssl
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -12,6 +13,7 @@ from urllib.request import Request, urlopen
 from ..context import ExecutionContext, HistoryEntry
 from ..decisions import DecisionOutcome, DecisionRecord
 from ..middleware.base import GatingMiddleware
+from ..resilience import CircuitBreaker
 from .core import RuntimeBuilder
 
 
@@ -29,19 +31,33 @@ class OPAClient:
         *,
         timeout_seconds: float = 3.0,
         transport: Callable[[dict[str, Any]], Mapping[str, Any]] | None = None,
+        headers: Mapping[str, str] | None = None,
+        ssl_context: ssl.SSLContext | None = None,
+        max_request_bytes: int = 64 * 1024,
+        max_response_bytes: int = 256 * 1024,
+        failure_threshold: int = 0,
+        recovery_timeout: float = 30.0,
+        allow_insecure_http: bool = False,
     ) -> None:
         parsed = urlsplit(endpoint)
         is_local = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
         if (
             parsed.scheme not in {"https", "http"}
-            or (parsed.scheme == "http" and not is_local)
+            or (
+                parsed.scheme == "http"
+                and not is_local
+                and not allow_insecure_http
+            )
             or not parsed.hostname
             or parsed.username
             or parsed.password
             or parsed.query
             or parsed.fragment
         ):
-            raise ValueError("OPA endpoint must use HTTPS or local HTTP without credentials")
+            raise ValueError(
+                "OPA endpoint must use HTTPS; non-local HTTP requires "
+                "allow_insecure_http=True"
+            )
         normalized_path = policy_path.strip("/")
         if (
             not normalized_path
@@ -51,9 +67,18 @@ class OPAClient:
             raise ValueError("invalid OPA policy path")
         if not 0 < timeout_seconds <= 30:
             raise ValueError("timeout_seconds must be between 0 and 30")
+        if max_request_bytes <= 0 or max_response_bytes <= 0:
+            raise ValueError("request and response byte limits must be positive")
         self.url = f"{endpoint.rstrip('/')}/v1/data/{normalized_path}"
         self.timeout_seconds = timeout_seconds
         self.transport = transport
+        self.headers = _safe_headers(headers or {})
+        self.ssl_context = ssl_context
+        self.max_request_bytes = max_request_bytes
+        self.max_response_bytes = max_response_bytes
+        self._circuit_breaker = CircuitBreaker(
+            failure_threshold, recovery_seconds=recovery_timeout
+        )
 
     def evaluate(self, context: ExecutionContext) -> OPADecision:
         payload = {
@@ -68,7 +93,12 @@ class OPAClient:
                 "requires_approval": context.requires_approval,
             }
         }
-        response = self.transport(payload) if self.transport else self._post(payload)
+        encoded = _encode_json(payload, self.max_request_bytes)
+        def request() -> Mapping[str, Any]:
+            response = self.transport(payload) if self.transport else self._post(encoded)
+            return response
+
+        response = self._circuit_breaker.call(request)
         result = response.get("result")
         if isinstance(result, bool):
             return OPADecision(result, "OPA boolean decision")
@@ -79,20 +109,26 @@ class OPAClient:
             )
         raise ValueError("OPA response must contain result bool or result.allow bool")
 
-    def _post(self, payload: dict[str, Any]) -> Mapping[str, Any]:
+    def _post(self, encoded: bytes) -> Mapping[str, Any]:
         request = Request(
             self.url,
-            data=json.dumps(payload, ensure_ascii=True).encode("utf-8"),
+            data=encoded,
             headers={
                 "Content-Type": "application/json",
-                "User-Agent": "agent-runtime-governance/0.4",
+                "User-Agent": "agent-runtime-governance/0.5",
+                **self.headers,
             },
             method="POST",
         )
-        with urlopen(request, timeout=self.timeout_seconds) as response:
+        with urlopen(
+            request, timeout=self.timeout_seconds, context=self.ssl_context
+        ) as response:
             if not 200 <= response.status < 300:
                 raise RuntimeError(f"OPA returned HTTP {response.status}")
-            return json.loads(response.read().decode("utf-8"))
+            body = response.read(self.max_response_bytes + 1)
+            if len(body) > self.max_response_bytes:
+                raise RuntimeError("OPA response exceeded byte limit")
+            return json.loads(body.decode("utf-8"))
 
 
 class OPAMiddleware(GatingMiddleware):
@@ -111,7 +147,11 @@ class OPAMiddleware(GatingMiddleware):
             if self.fail_closed:
                 raise
             return context.append_history(
-                HistoryEntry(self.name, "error", f"OPA unavailable, fail open: {exc}")
+                HistoryEntry(
+                    self.name,
+                    "error",
+                    f"OPA unavailable, fail open: {type(exc).__name__}",
+                )
             )
         if not decision.allow:
             return context.with_decision(
@@ -137,3 +177,21 @@ class OPAPlugin:
             OPAMiddleware(self.client, fail_closed=self.fail_closed)
         )
         builder.add_service("opa", self.client)
+
+
+def _encode_json(payload: Mapping[str, Any], max_bytes: int) -> bytes:
+    encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > max_bytes:
+        raise ValueError("OPA request exceeded byte limit")
+    return encoded
+
+
+def _safe_headers(headers: Mapping[str, str]) -> dict[str, str]:
+    safe: dict[str, str] = {}
+    for key, value in headers.items():
+        if not key or any(ch in key for ch in "\r\n:"):
+            raise ValueError("invalid header name")
+        if any(ch in value for ch in "\r\n"):
+            raise ValueError("invalid header value")
+        safe[str(key)] = str(value)
+    return safe
