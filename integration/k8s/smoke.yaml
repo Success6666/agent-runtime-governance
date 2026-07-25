@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: arg-smoke
+  labels:
+    app.kubernetes.io/name: agent-runtime-governance
+    app.kubernetes.io/part-of: production-smoke
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: arg-smoke-config
+  namespace: arg-smoke
+  labels:
+    app.kubernetes.io/name: agent-runtime-governance
+data:
+  runtime.txt: "ExecutionContext pipeline smoke"
