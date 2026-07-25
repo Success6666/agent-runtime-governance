@@ -17,7 +17,9 @@ planning, model selection, prompts, or framework state.
 2. Middleware returns a new context; it does not mutate shared context state.
 3. A denial is terminal. Later middleware cannot turn it into an allow.
 4. Gating failures fail closed.
-5. Observing failures are recorded and fail open.
+5. Observing failures are recorded and fail open unless the observer is an
+   explicitly configured critical audit sink. Critical audit delivery fails
+   closed because an unaudited privileged action is not an allowed outcome.
 6. Tool execution happens only after all gating middleware allows it.
 7. Every terminal path can emit a structured audit snapshot.
 8. Rules inspect the application-supplied user input, not generated internal

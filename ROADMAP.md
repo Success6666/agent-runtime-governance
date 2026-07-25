@@ -27,6 +27,16 @@ The architecture is frozen per release. New ideas enter this file before code.
 - [x] Prometheus, Slack, and OPA integrations
 - [x] CrewAI, Agno, LlamaIndex, and AutoGen examples
 
+## v0.5 - Production reliability
+
+- [x] Idempotent execution with durable lease state
+- [x] Persistent approval stores and trusted identity providers
+- [x] Deadline propagation, cancellation handling, and concurrency limits
+- [x] Parameter/result contracts and payload size limits
+- [x] Reliable JSONL/SQLite audit and snapshot stores
+- [x] Docker-backed OPA, OpenTelemetry, Prometheus, and Kind smoke checks
+- [x] Fault, property, concurrency, benchmark, and release verification assets
+
 ## Future ideas
 
 Distributed runtime, cost governance, checkpointing, and hosted decision UI.

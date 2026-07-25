@@ -23,6 +23,12 @@ issue.
 - Audit redaction is key-based. Applications must extend `sensitive_keys` for
   domain-specific secrets and should avoid placing secrets in positional args.
 - OPA and Slack endpoints must come from trusted deployment configuration.
+- Durable approval, identity replay, idempotency, audit, and snapshot databases
+  must not be placed on an untrusted or world-writable filesystem.
+- A critical audit sink fails closed. Operators must alert on delivery failures
+  and restore the sink before retrying the request.
+- `UNKNOWN` is not success or failure. Mutating work in this state requires
+  operator reconciliation before the same idempotency key is reused.
 
 ## Deployment guidance
 
@@ -30,3 +36,4 @@ Keep HMAC keys, webhook URLs, model credentials, and OPA credentials in a secret
 manager. Restrict audit and snapshot file permissions. Use TLS for remote policy
 and decision services. Avoid user-, tenant-, conversation-, or trace-based
 Prometheus labels because they leak identity and create unbounded cardinality.
+See `docs/production.md` for storage, backup, recovery, and readiness guidance.
