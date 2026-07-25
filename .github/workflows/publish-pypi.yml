@@ -1,0 +1,84 @@
+name: Publish to PyPI
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published GitHub release tag (for example v0.5.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-pypi-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: startsWith(inputs.tag, 'v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: pypi
+      url: https://pypi.org/p/agent-runtime-governance
+    permissions:
+      attestations: read
+      contents: read
+      id-token: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - name: Require a published non-prerelease release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release_json="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,tagName)"
+          test "$(jq -r '.isDraft' <<<"$release_json")" = "false"
+          test "$(jq -r '.isPrerelease' <<<"$release_json")" = "false"
+          test "$(jq -r '.tagName' <<<"$release_json")" = "$RELEASE_TAG"
+
+      - name: Download verified release artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir dist \
+            --pattern '*.whl' \
+            --pattern '*.tar.gz' \
+            --pattern 'SHA256SUMS' \
+            --pattern 'sbom.spdx.json'
+
+      - name: Verify checksums and expected package files
+        run: |
+          test "$(find dist -maxdepth 1 -name '*.whl' -type f | wc -l)" -eq 1
+          test "$(find dist -maxdepth 1 -name '*.tar.gz' -type f | wc -l)" -eq 1
+          test -s dist/SHA256SUMS
+          test -s dist/sbom.spdx.json
+          sha256sum --check dist/SHA256SUMS
+
+      - name: Verify GitHub artifact provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          signer_workflow="github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml"
+          source_ref="refs/tags/$RELEASE_TAG"
+          gh attestation verify dist/*.whl --repo "$GITHUB_REPOSITORY" --signer-workflow "$signer_workflow" --source-ref "$source_ref" --deny-self-hosted-runners
+          gh attestation verify dist/*.tar.gz --repo "$GITHUB_REPOSITORY" --signer-workflow "$signer_workflow" --source-ref "$source_ref" --deny-self-hosted-runners
+          gh attestation verify dist/SHA256SUMS --repo "$GITHUB_REPOSITORY" --signer-workflow "$signer_workflow" --source-ref "$source_ref" --deny-self-hosted-runners
+          gh attestation verify dist/sbom.spdx.json --repo "$GITHUB_REPOSITORY" --signer-workflow "$signer_workflow" --source-ref "$source_ref" --deny-self-hosted-runners
+
+      - name: Isolate package distributions from release metadata
+        run: |
+          mkdir -p packages
+          cp dist/*.whl dist/*.tar.gz packages/
+
+      - name: Publish with PyPI Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # release/v1
+        with:
+          packages-dir: packages/
+          attestations: true
+          print-hash: true
