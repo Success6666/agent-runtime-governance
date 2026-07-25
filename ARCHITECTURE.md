@@ -38,6 +38,16 @@ produces a detached JSON-compatible representation for audit and replay.
 does not gain authority to allow or deny. v0.1 accepts a fixed Python list so
 execution order is explicit at construction time.
 
+v0.2 represents that list as an immutable `Pipeline`. Composition operations
+return a new pipeline, preserving deterministic order and avoiding concurrent
+runtime mutation. `ExecutionMiddleware` wraps only the tool executor, enabling
+retry and timeout without giving those controls policy authority.
+
+Hooks are lightweight observation/enrichment points. They cannot change status
+or decisions. A critical pre-execution hook failure is converted into an
+explicit denial; post-execution hook failures are recorded without rewriting the
+completed outcome.
+
 ## Decisions
 
 Human approval is modeled as a `DecisionProvider`, allowing CLI, chat, or HTTP
@@ -50,4 +60,3 @@ Audit events contain the context snapshot before execution and after completion.
 The JSONL sink can redact known secret keys and HMAC-sign each record. v0.1
 replay intentionally only loads and prints these snapshots; it does not execute
 tools again.
-

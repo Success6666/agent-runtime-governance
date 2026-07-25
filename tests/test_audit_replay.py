@@ -10,7 +10,11 @@ from agent_runtime_governance import (
     InMemoryAuditSink,
     JSONLAuditSink,
     ReplayTrace,
+    Rule,
+    RuleMiddleware,
     Runtime,
+    InvocationOptions,
+    GovernanceDenied,
 )
 
 
@@ -81,3 +85,21 @@ def test_replay_lines_are_human_readable(tmp_path) -> None:
     lines = list(ReplayTrace.from_jsonl(path, event["trace_id"]).lines())
     assert "login" in lines[0]
     assert "succeeded" in lines[-1]
+
+
+def test_denied_call_writes_one_decision_snapshot() -> None:
+    sink = InMemoryAuditSink()
+    runtime = Runtime(
+        [
+            RuleMiddleware([Rule("deny", r"\bdeny\b", "blocked")]),
+            AuditMiddleware(sink),
+        ]
+    )
+
+    @runtime.tool()
+    def work() -> None:
+        return None
+
+    with pytest.raises(GovernanceDenied):
+        runtime.invoke("work", _governance=InvocationOptions(input_text="deny this"))
+    assert len(sink.events) == 1

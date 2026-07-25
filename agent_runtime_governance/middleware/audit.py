@@ -13,9 +13,18 @@ class AuditMiddleware(ObservingMiddleware):
 
     async def process(self, context: ExecutionContext) -> ExecutionContext:
         stage = "completed" if context.status.value in {"succeeded", "failed"} else "decision"
+        if any(
+            entry.middleware == self.name and entry.data.get("stage") == stage
+            for entry in context.history
+        ):
+            return context
         updated = context.append_history(
-            HistoryEntry(self.name, "record", f"recorded {stage} snapshot")
+            HistoryEntry(
+                self.name,
+                "record",
+                f"recorded {stage} snapshot",
+                data={"stage": stage},
+            )
         )
         self.sink.write(context_event(updated, stage=stage))
         return updated
-

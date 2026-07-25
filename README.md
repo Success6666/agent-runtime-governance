@@ -98,14 +98,42 @@ Earlier denials cannot be overridden by later middleware.
 - `examples/standalone_demo.py`: framework-free pipeline
 - `examples/cli_approval_demo.py`: interactive human decision provider
 - `examples/langgraph_integration.py`: LangGraph tool-node integration
+- `examples/openai_agents_integration.py`: OpenAI Agents SDK tool integration
 - `scripts/replay.py`: print the snapshots for a trace from JSONL audit data
 
-## Non-goals for v0.1
+## Engineering controls
+
+v0.2 adds immutable pipeline composition, lifecycle hooks, Python-native policy,
+metrics, retries, timeouts, and optional OpenTelemetry export:
+
+```python
+from agent_runtime_governance import (
+    MetricsMiddleware, Pipeline, PolicyMiddleware, RetryMiddleware,
+    SimplePolicy, TimeoutMiddleware,
+)
+
+pipeline = Pipeline([
+    PolicyMiddleware(SimplePolicy(admin_only={"restart_service"})),
+    RetryMiddleware(max_attempts=2),
+    TimeoutMiddleware(5.0),
+    MetricsMiddleware(),
+])
+runtime = Runtime(pipeline)
+
+@runtime.before_tool
+def attach_region(ctx):
+    return ctx.evolve(metadata={**ctx.metadata, "region": "cn-beijing"})
+```
+
+Pipeline edits return a new `Pipeline`; a live runtime is never mutated behind
+concurrent calls. Hooks may enrich context but cannot change status or decisions.
+
+## Non-goals
 
 - Agent planning, prompting, model routing, or memory
 - Multi-agent communication or distributed execution
 - Approval UI or a hosted control plane
-- A policy language, plugin marketplace, or dynamic pipeline mutation
+- A general policy language, plugin marketplace, or mutable live pipeline
 - Production-grade time-travel debugging
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for invariants and
@@ -124,4 +152,3 @@ Python 3.10+ is supported. The core package has no runtime dependencies.
 ## License
 
 MIT
-

@@ -32,6 +32,15 @@ class ToolExecutionError(GovernanceError):
         super().__init__(f"tool {context.tool_call.name!r} failed: {cause}")
 
 
+class ExecutionControlError(GovernanceError):
+    """Internal carrier for execution middleware state and its root cause."""
+
+    def __init__(self, context: "ExecutionContext", cause: Exception) -> None:
+        self.context = context
+        self.cause = cause
+        super().__init__(str(cause))
+
+
 class RegistryError(GovernanceError):
     """Raised for invalid or duplicate tool registration."""
 
@@ -42,4 +51,3 @@ class ContextMutationError(GovernanceError):
 
 class AuditIntegrityError(GovernanceError):
     """Raised when a signed audit event fails verification."""
-
