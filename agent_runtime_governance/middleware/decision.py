@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from datetime import datetime, timedelta, timezone
+from time import monotonic
 
 from ..approval_store import ApprovalStore
 from ..context import ExecutionContext, HistoryEntry
@@ -55,7 +56,7 @@ class DecisionMiddleware(GatingMiddleware):
         )
         self._require_approver = require_approver
         self._reservation_ttl_seconds = reservation_ttl_seconds
-        self._reservations: dict[str, tuple[ApprovalRequest, str]] = {}
+        self._reservations: dict[str, tuple[ApprovalRequest, str, float]] = {}
         self._reservation_lock = threading.Lock()
 
     async def process(self, context: ExecutionContext) -> ExecutionContext:
@@ -214,13 +215,34 @@ class DecisionMiddleware(GatingMiddleware):
         self, trace_id: str, request: ApprovalRequest, token: str
     ) -> None:
         with self._reservation_lock:
-            self._reservations[trace_id] = (request, token)
+            now = monotonic()
+            expired = [
+                key
+                for key, (_, _, deadline) in self._reservations.items()
+                if deadline <= now
+            ]
+            for key in expired:
+                self._reservations.pop(key, None)
+            self._reservations[trace_id] = (
+                request,
+                token,
+                now + self._reservation_ttl_seconds,
+            )
 
     def _pop_reservation(
         self, trace_id: str
     ) -> tuple[ApprovalRequest, str] | None:
         with self._reservation_lock:
-            return self._reservations.pop(trace_id, None)
+            reservation = self._reservations.pop(trace_id, None)
+        if reservation is None:
+            return None
+        request, token, _ = reservation
+        return request, token
+
+    @property
+    def active_reservation_count(self) -> int:
+        with self._reservation_lock:
+            return len(self._reservations)
 
     async def _decide(
         self, context: ExecutionContext, request: ApprovalRequest

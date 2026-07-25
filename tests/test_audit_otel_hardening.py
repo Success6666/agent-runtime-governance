@@ -19,6 +19,7 @@ from agent_runtime_governance.context import (
 )
 from agent_runtime_governance.decisions import DecisionOutcome, DecisionRecord
 from agent_runtime_governance.errors import AuditIntegrityError
+from agent_runtime_governance.middleware.audit import AuditMiddleware
 from agent_runtime_governance.plugins.opa import OPAClient
 from agent_runtime_governance.plugins.slack import SlackWebhookNotifier
 from agent_runtime_governance.snapshots import (
@@ -28,6 +29,16 @@ from agent_runtime_governance.snapshots import (
     SQLiteSnapshotStore,
 )
 from agent_runtime_governance.telemetry import OpenTelemetryMiddleware
+
+
+class RetryAuditSink:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def write(self, event) -> None:
+        self.calls += 1
+        if self.calls == 1:
+            raise OSError("temporary audit outage")
 
 
 def make_context(**changes) -> ExecutionContext:
@@ -41,6 +52,45 @@ def make_context(**changes) -> ExecutionContext:
     if changes:
         context = context.evolve(**changes)
     return context
+
+
+@pytest.mark.asyncio
+async def test_noncritical_audit_failure_is_retried_and_denial_is_terminal() -> None:
+    sink = RetryAuditSink()
+    middleware = AuditMiddleware(sink)
+    denied = make_context(
+        status=ExecutionStatus.DENIED,
+        decision=DecisionRecord(DecisionOutcome.DENY, "blocked", "policy"),
+        risk_tier=RiskTier.LOW,
+    )
+
+    failed = await middleware.process(denied)
+    assert failed.history[-1].outcome == "error"
+    recorded = await middleware.process(failed)
+    assert sink.calls == 2
+    assert recorded.history[-1].outcome == "record"
+
+
+def test_jsonl_audit_wraps_invalid_state_json(tmp_path) -> None:
+    path = tmp_path / "audit.jsonl"
+    sink = JSONLAuditSink(path, sign_key="k")
+    sink.write({"event": 1})
+    (tmp_path / "audit.jsonl.state").write_text("{", encoding="utf-8")
+
+    with pytest.raises(AuditIntegrityError, match="invalid audit state file"):
+        sink.read_verified()
+    with pytest.raises(AuditIntegrityError, match="invalid audit state file"):
+        sink.write({"event": 2})
+
+
+def test_sqlite_audit_missing_state_row_fails_closed(tmp_path) -> None:
+    path = tmp_path / "audit.db"
+    sink = SQLiteAuditSink(path, sign_key="k")
+    with sqlite3.connect(path) as connection:
+        connection.execute("DELETE FROM audit_state")
+
+    with pytest.raises(AuditIntegrityError, match="state row is missing"):
+        sink.write({"event": 1})
 
 
 def test_jsonl_audit_hash_chain_detects_deletion_and_tamper(tmp_path) -> None:
@@ -420,7 +470,7 @@ def test_opentelemetry_uses_current_span_parent_and_cleans_failed_span() -> None
     assert tracer.spans[0].ended
     assert tracer.spans[0].exceptions
     assert tracer.spans[0].attributes["arg.status"] == "failed"
-    assert middleware._spans == {}
+    assert middleware.active_span_count == 0
 
 
 def test_opentelemetry_does_not_export_raw_error_details() -> None:

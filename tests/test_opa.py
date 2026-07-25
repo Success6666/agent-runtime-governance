@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.error import HTTPError
+
 import pytest
 
 from agent_runtime_governance import (
@@ -10,6 +14,7 @@ from agent_runtime_governance import (
     PluginManager,
     Runtime,
 )
+from agent_runtime_governance.context import ExecutionContext, ToolCall
 
 
 def runtime_with_opa(response, *, fail_closed: bool = True):
@@ -89,6 +94,47 @@ def test_opa_rejects_unsafe_endpoints(endpoint: str) -> None:
 def test_opa_rejects_unsafe_policy_paths(path: str) -> None:
     with pytest.raises(ValueError):
         OPAClient("http://localhost:8181", path)
+
+
+def test_opa_client_refuses_real_http_redirect_without_visiting_target() -> None:
+    target_hits: list[str | None] = []
+
+    class RedirectHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            self.send_response(302)
+            self.send_header(
+                "Location",
+                f"http://127.0.0.1:{self.server.server_port}/target",
+            )
+            self.end_headers()
+
+        def do_GET(self) -> None:  # noqa: N802
+            target_hits.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"result":true}')
+
+        def log_message(self, format: str, *args: object) -> None:
+            return None
+
+    server = HTTPServer(("127.0.0.1", 0), RedirectHandler)
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    try:
+        client = OPAClient(
+            f"http://127.0.0.1:{server.server_port}",
+            "agent/allow",
+            headers={"Authorization": "Bearer secret"},
+        )
+        with pytest.raises(HTTPError) as caught:
+            client.evaluate(ExecutionContext.create(ToolCall("operate")))
+        assert caught.value.code == 302
+        assert target_hits == []
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1)
+        assert not thread.is_alive()
 
 
 def test_opa_plugin_registers_real_middleware() -> None:

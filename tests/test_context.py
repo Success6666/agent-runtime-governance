@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 
 from agent_runtime_governance import (
@@ -23,6 +25,19 @@ def test_create_assigns_otel_style_identifiers() -> None:
     context = make_context()
     assert len(context.trace_id) == 32
     assert len(context.span_id) == 16
+
+
+def test_from_dict_accepts_rfc3339_utc_deadline() -> None:
+    context = ExecutionContext.create(
+        ToolCall("read_file"),
+        deadline=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    payload = context.to_dict()
+    payload["deadline"] = "2026-01-01T00:00:00Z"
+
+    restored = ExecutionContext.from_dict(payload)
+
+    assert restored.deadline == datetime(2026, 1, 1, tzinfo=timezone.utc)
     assert len(context.request_id) == 32
 
 

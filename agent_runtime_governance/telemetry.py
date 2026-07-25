@@ -22,12 +22,19 @@ class Tracer(Protocol):
 class _SpanHandle:
     span: Span
     manager: Any = None
+    status_cls: Any = None
+    status_code_cls: Any = None
     ended: bool = False
 
     def finish(self, context: ExecutionContext) -> None:
         if self.ended:
             return
-        _set_span_terminal_state(self.span, context)
+        _set_span_terminal_state(
+            self.span,
+            context,
+            status_cls=self.status_cls,
+            status_code_cls=self.status_code_cls,
+        )
         if self.manager is not None:
             self.manager.__exit__(None, None, None)
         else:
@@ -38,7 +45,13 @@ class _SpanHandle:
         if self.ended:
             return
         _record_exception(self.span, RuntimeError(description))
-        _set_status(self.span, "ERROR", description)
+        _set_status(
+            self.span,
+            "ERROR",
+            description,
+            status_cls=self.status_cls,
+            status_code_cls=self.status_code_cls,
+        )
         if self.manager is not None:
             self.manager.__exit__(None, None, None)
         else:
@@ -156,7 +169,12 @@ class OpenTelemetryMiddleware(ObservingMiddleware):
             with nullcontext():
                 yield
             return
-        with use_span(handle.span, end_on_exit=False):
+        with use_span(
+            handle.span,
+            end_on_exit=False,
+            record_exception=False,
+            set_status_on_exception=False,
+        ):
             yield
 
     def _start_span(self, context: ExecutionContext) -> _SpanHandle:
@@ -177,10 +195,13 @@ class OpenTelemetryMiddleware(ObservingMiddleware):
             try:
                 span = start_span(f"tool.{context.tool_call.name}", **kwargs)
             except TypeError:
+                if self._parent_context is None:
+                    raise
                 span = start_span(
                     f"tool.{context.tool_call.name}", attributes=attributes
                 )
-            return _SpanHandle(span=span)
+                _set_span_attribute(span, "arg.parent_context_dropped", True)
+            return self._handle(span)
         start_as_current = getattr(self._tracer, "start_as_current_span", None)
         if callable(start_as_current):
             kwargs: dict[str, Any] = {"attributes": attributes}
@@ -188,13 +209,33 @@ class OpenTelemetryMiddleware(ObservingMiddleware):
                 kwargs["context"] = self._parent_context
             manager = start_as_current(f"tool.{context.tool_call.name}", **kwargs)
             span = manager.__enter__()
-            return _SpanHandle(span=span, manager=manager)
+            return self._handle(span, manager=manager)
         raise TypeError("tracer must provide start_span or start_as_current_span")
 
+    def _handle(self, span: Span, *, manager: Any = None) -> _SpanHandle:
+        return _SpanHandle(
+            span=span,
+            manager=manager,
+            status_cls=self._status_cls,
+            status_code_cls=self._status_code_cls,
+        )
 
-def _set_span_terminal_state(span: Span, context: ExecutionContext) -> None:
+
+def _set_span_terminal_state(
+    span: Span,
+    context: ExecutionContext,
+    *,
+    status_cls: Any = None,
+    status_code_cls: Any = None,
+) -> None:
     if context.status is ExecutionStatus.SUCCEEDED:
-        _set_status(span, "OK", "succeeded")
+        _set_status(
+            span,
+            "OK",
+            "succeeded",
+            status_cls=status_cls,
+            status_code_cls=status_code_cls,
+        )
         return
     if context.status in {
         ExecutionStatus.FAILED,
@@ -207,19 +248,32 @@ def _set_span_terminal_state(span: Span, context: ExecutionContext) -> None:
                 span,
                 RuntimeError(f"tool execution ended with status {description}"),
             )
-        _set_status(span, "ERROR", description)
+        _set_status(
+            span,
+            "ERROR",
+            description,
+            status_cls=status_cls,
+            status_code_cls=status_code_cls,
+        )
 
 
-def _set_status(span: Span, code_name: str, description: str) -> None:
+def _set_status(
+    span: Span,
+    code_name: str,
+    description: str,
+    *,
+    status_cls: Any = None,
+    status_code_cls: Any = None,
+) -> None:
     setter = getattr(span, "set_status", None)
-    if not callable(setter):
+    if not callable(setter) or status_cls is None or status_code_cls is None:
         return
-    try:
-        from opentelemetry.trace import Status, StatusCode
-    except ImportError:
-        return
-    code = StatusCode.OK if code_name == "OK" else StatusCode.ERROR
-    setter(Status(code) if code is StatusCode.OK else Status(code, description=description))
+    code = status_code_cls.OK if code_name == "OK" else status_code_cls.ERROR
+    setter(
+        status_cls(code)
+        if code is status_code_cls.OK
+        else status_cls(code, description=description)
+    )
 
 
 def _record_exception(span: Span, exc: BaseException) -> None:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .context import ExecutionContext
@@ -43,9 +43,8 @@ def get_cancellation_context(
         if id(current) in seen:
             continue
         seen.add(id(current))
-        context = getattr(current, "context", None)
-        if context is not None:
-            return cast("ExecutionContext", context)
+        if isinstance(current, GovernanceCancelledError):
+            return current.context
         if current.__cause__ is not None:
             pending.append(current.__cause__)
         if current.__context__ is not None:

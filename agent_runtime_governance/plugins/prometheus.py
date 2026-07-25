@@ -84,10 +84,10 @@ class PrometheusMiddleware(ObservingMiddleware):
 
     def _record_external_failures(self, context: ExecutionContext) -> None:
         for entry in context.history:
-            if entry.outcome != "error":
+            if entry.outcome not in {"error", "critical_error"}:
                 continue
             component = _safe_label(entry.middleware)
-            reason = _safe_label(str(entry.data.get("reason") or type(entry.reason).__name__))
+            reason = _safe_label(entry.reason)
             self.external_failures.labels(component, "error", reason).inc()
 
 

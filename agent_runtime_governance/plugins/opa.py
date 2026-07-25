@@ -8,7 +8,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
 from ..context import ExecutionContext, HistoryEntry
 from ..decisions import DecisionOutcome, DecisionRecord
@@ -41,23 +41,21 @@ class OPAClient:
     ) -> None:
         parsed = urlsplit(endpoint)
         is_local = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
-        if (
-            parsed.scheme not in {"https", "http"}
-            or (
-                parsed.scheme == "http"
-                and not is_local
-                and not allow_insecure_http
+        if parsed.scheme not in {"https", "http"} or not parsed.hostname:
+            raise ValueError(
+                "OPA endpoint must be an absolute HTTP or HTTPS URL"
             )
-            or not parsed.hostname
-            or parsed.username
-            or parsed.password
-            or parsed.query
-            or parsed.fragment
-        ):
+        if parsed.scheme == "http" and not is_local and not allow_insecure_http:
             raise ValueError(
                 "OPA endpoint must use HTTPS; non-local HTTP requires "
                 "allow_insecure_http=True"
             )
+        if parsed.username or parsed.password:
+            raise ValueError("OPA endpoint must not contain embedded credentials")
+        if parsed.query:
+            raise ValueError("OPA endpoint must not contain a query string")
+        if parsed.fragment:
+            raise ValueError("OPA endpoint must not contain a fragment")
         normalized_path = policy_path.strip("/")
         if (
             not normalized_path
@@ -120,9 +118,11 @@ class OPAClient:
             },
             method="POST",
         )
-        with urlopen(
-            request, timeout=self.timeout_seconds, context=self.ssl_context
-        ) as response:
+        opener = build_opener(
+            _RejectRedirects(),
+            HTTPSHandler(context=self.ssl_context),
+        )
+        with opener.open(request, timeout=self.timeout_seconds) as response:
             if not 200 <= response.status < 300:
                 raise RuntimeError(f"OPA returned HTTP {response.status}")
             body = response.read(self.max_response_bytes + 1)
@@ -195,3 +195,8 @@ def _safe_headers(headers: Mapping[str, str]) -> dict[str, str]:
             raise ValueError("invalid header value")
         safe[str(key)] = str(value)
     return safe
+
+
+class _RejectRedirects(HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        return None

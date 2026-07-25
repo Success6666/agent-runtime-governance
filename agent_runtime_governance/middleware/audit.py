@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 
 from ..audit import AuditSink, context_event
-from ..context import ExecutionContext, HistoryEntry, RiskTier
+from ..context import ExecutionContext, ExecutionStatus, HistoryEntry, RiskTier
 from .base import ObservingMiddleware
 
 
@@ -27,11 +27,18 @@ class AuditMiddleware(ObservingMiddleware):
     async def process(self, context: ExecutionContext) -> ExecutionContext:
         stage = (
             "completed"
-            if context.status.value in {"succeeded", "failed", "unknown"}
+            if context.status in {
+                ExecutionStatus.SUCCEEDED,
+                ExecutionStatus.FAILED,
+                ExecutionStatus.DENIED,
+                ExecutionStatus.UNKNOWN,
+            }
             else "decision"
         )
         if any(
-            entry.middleware == self.name and entry.data.get("stage") == stage
+            entry.middleware == self.name
+            and entry.outcome == "record"
+            and entry.data.get("stage") == stage
             for entry in context.history
         ):
             return context

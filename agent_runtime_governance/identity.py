@@ -8,9 +8,10 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from types import MappingProxyType
 from typing import Any, Mapping, Protocol
 
+from ._serialization import freeze_mapping as _freeze_mapping
+from ._serialization import thaw as _thaw
 from ._sqlite import connect_sqlite, initialize_sqlite
 from .contracts import canonical_json_bytes
 
@@ -48,7 +49,7 @@ class VerifiedPrincipal:
         object.__setattr__(
             self,
             "claims",
-            MappingProxyType({str(key): _freeze(value) for key, value in self.claims.items()}),
+            _freeze_mapping(self.claims),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -255,7 +256,8 @@ class HMACClaimsIdentityProvider:
         normalized_permissions = frozenset(str(item) for item in permissions)
         for permission in normalized_permissions:
             _validate_identifier("identity permission", permission)
-        if not self.replay_store.claim(issuer, jti, expires_at):
+        replay_expires_at = expires_at + timedelta(seconds=self.clock_skew_seconds)
+        if not self.replay_store.claim(issuer, jti, replay_expires_at):
             raise ValueError("identity claims were already used")
         return VerifiedPrincipal(
             issuer=issuer,
@@ -319,35 +321,3 @@ def _parse_timestamp(value: str, name: str) -> datetime:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError(f"{name} must be timezone-aware")
     return parsed.astimezone(timezone.utc)
-
-
-def _json_safe(value: Any) -> Any:
-    if value is None or isinstance(value, str | int | float | bool):
-        return value
-    if isinstance(value, Mapping):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, list | tuple):
-        return [_json_safe(item) for item in value]
-    if isinstance(value, set | frozenset):
-        return sorted(_json_safe(item) for item in value)
-    return f"[UNSERIALIZABLE:{type(value).__module__}.{type(value).__qualname__}]"
-
-
-def _freeze(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return MappingProxyType({str(key): _freeze(item) for key, item in value.items()})
-    if isinstance(value, list | tuple):
-        return tuple(_freeze(item) for item in value)
-    if isinstance(value, set | frozenset):
-        return frozenset(_freeze(item) for item in value)
-    return value
-
-
-def _thaw(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {str(key): _thaw(item) for key, item in value.items()}
-    if isinstance(value, tuple | list):
-        return [_thaw(item) for item in value]
-    if isinstance(value, set | frozenset):
-        return sorted(_thaw(item) for item in value)
-    return _json_safe(value)
