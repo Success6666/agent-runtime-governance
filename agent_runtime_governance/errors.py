@@ -51,3 +51,29 @@ class ContextMutationError(GovernanceError):
 
 class AuditIntegrityError(GovernanceError):
     """Raised when a signed audit event fails verification."""
+
+
+class ContractValidationError(GovernanceError):
+    """A tool parameter or result violated its declared JSON contract."""
+
+    def __init__(self, label: str, reason: str) -> None:
+        self.label = label
+        self.reason = reason
+        super().__init__(f"{label} contract violation: {reason}")
+
+
+class AuditDeliveryError(GovernanceError):
+    """A critical audit event could not be durably delivered."""
+
+    def __init__(
+        self,
+        context: "ExecutionContext",
+        cause: BaseException,
+        *,
+        post_execution: bool,
+    ) -> None:
+        self.context = context
+        self.cause = cause
+        self.post_execution = post_execution
+        stage = "after execution" if post_execution else "before execution"
+        super().__init__(f"critical audit delivery failed {stage}: {cause}")

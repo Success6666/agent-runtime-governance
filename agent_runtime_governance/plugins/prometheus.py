@@ -32,12 +32,25 @@ class PrometheusMiddleware(ObservingMiddleware):
             ("tool", "status"),
             registry=target_registry,
         )
+        self.decisions = Counter(
+            f"{prefix}_governance_decisions_total",
+            "Runtime governance decisions with low-cardinality labels.",
+            ("status", "risk_tier", "source"),
+            registry=target_registry,
+        )
+        self.external_failures = Counter(
+            f"{prefix}_external_failures_total",
+            "External governance integration failures.",
+            ("component", "outcome", "reason"),
+            registry=target_registry,
+        )
 
     async def process(self, context: ExecutionContext) -> ExecutionContext:
         if context.status not in {
             ExecutionStatus.SUCCEEDED,
             ExecutionStatus.FAILED,
             ExecutionStatus.DENIED,
+            ExecutionStatus.UNKNOWN,
         }:
             return context
         if any(entry.middleware == self.name for entry in context.history):
@@ -48,6 +61,11 @@ class PrometheusMiddleware(ObservingMiddleware):
             context.risk_tier.name,
         )
         self.calls.labels(*labels).inc()
+        source = context.decision.source if context.decision else "runtime"
+        self.decisions.labels(
+            context.status.value, context.risk_tier.name, _safe_label(source)
+        ).inc()
+        self._record_external_failures(context)
         duration_ms = context.metadata.get("duration_ms")
         if isinstance(duration_ms, int | float):
             self.duration.labels(
@@ -56,6 +74,21 @@ class PrometheusMiddleware(ObservingMiddleware):
         return context.append_history(
             HistoryEntry(self.name, "record", "prometheus metrics recorded")
         )
+
+    def record_external_failure(
+        self, component: str, *, outcome: str = "error", reason: str = "unknown"
+    ) -> None:
+        self.external_failures.labels(
+            _safe_label(component), _safe_label(outcome), _safe_label(reason)
+        ).inc()
+
+    def _record_external_failures(self, context: ExecutionContext) -> None:
+        for entry in context.history:
+            if entry.outcome != "error":
+                continue
+            component = _safe_label(entry.middleware)
+            reason = _safe_label(str(entry.data.get("reason") or type(entry.reason).__name__))
+            self.external_failures.labels(component, "error", reason).inc()
 
 
 class PrometheusPlugin:
@@ -73,3 +106,7 @@ class PrometheusPlugin:
         builder.add_middleware(middleware)
         builder.add_service("prometheus", middleware)
 
+
+def _safe_label(value: str) -> str:
+    cleaned = "_".join(str(value).strip().lower().split())[:64]
+    return cleaned or "unknown"
