@@ -2,6 +2,21 @@
 
 All notable changes are documented here.
 
+## [0.4.0] - 2026-07-25
+
+### Added
+
+- Build-time plugin registration and trusted Python entry-point discovery.
+- Prometheus terminal metrics with bounded, non-identity labels.
+- Slack denial/failure notifications with strict webhook validation.
+- OPA policy decisions with minimal payloads and fail-closed defaults.
+- CrewAI, Agno, LlamaIndex, and Microsoft AutoGen integration examples.
+
+### Changed
+
+- Synchronous LLM reviewers, human decision callbacks, hooks, audit sinks,
+  snapshot stores, and network integrations run outside the event-loop thread.
+
 ## [0.3.0] - 2026-07-25
 
 ### Added

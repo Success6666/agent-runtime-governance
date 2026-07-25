@@ -1,0 +1,25 @@
+language: en-US
+
+reviews:
+  profile: assertive
+  request_changes_workflow: true
+  high_level_summary: true
+  review_status: true
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - main
+  path_instructions:
+    - path: "agent_runtime_governance/**"
+      instructions: >-
+        Check immutable ExecutionContext invariants, monotonic denials,
+        fail-closed security behavior, async blocking calls, secret exposure,
+        and backward compatibility of public APIs.
+    - path: "tests/**"
+      instructions: >-
+        Check that security-sensitive behavior, failure paths, and public API
+        changes have deterministic regression coverage.
+
+chat:
+  auto_reply: true

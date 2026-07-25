@@ -16,7 +16,12 @@ from .context import (
 from .decisions import DecisionOutcome, DecisionRecord
 from .errors import ExecutionControlError, GovernanceDenied, ToolExecutionError
 from .hooks import CriticalHookError, HookCallback, HookPoint, HookRegistry
-from .middleware.base import ExecutionCall, ExecutionMiddleware, Middleware, MiddlewareKind
+from .middleware.base import (
+    ExecutionCall,
+    ExecutionMiddleware,
+    Middleware,
+    MiddlewareKind,
+)
 from .pipeline import Pipeline
 from .registry import GovernedTool, ToolRegistry, ToolSpec
 

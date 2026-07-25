@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Generic, ParamSpec, TypeVar, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable, Generic, ParamSpec, TypeVar
 
 from .context import RiskTier
 from .errors import RegistryError

@@ -8,7 +8,6 @@ from agent_runtime_governance import (
     Runtime,
 )
 
-
 sink = InMemoryAuditSink()
 runtime = Runtime(
     [

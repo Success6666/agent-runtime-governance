@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from dataclasses import dataclass
@@ -124,17 +125,16 @@ class SnapshotMiddleware(ObservingMiddleware):
                 data={"stage": stage, "sequence": sequence},
             )
         )
-        self.store.write(
-            ContextSnapshot(
-                trace_id=context.trace_id,
-                sequence=sequence,
-                stage=stage,
-                context=updated,
-                created_at=datetime.now(timezone.utc).isoformat(),
-                policy_version=updated.metadata.get("policy_version"),
-                policy_digest=updated.metadata.get("policy_digest"),
-            )
+        snapshot = ContextSnapshot(
+            trace_id=context.trace_id,
+            sequence=sequence,
+            stage=stage,
+            context=updated,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            policy_version=updated.metadata.get("policy_version"),
+            policy_digest=updated.metadata.get("policy_digest"),
         )
+        await asyncio.to_thread(self.store.write, snapshot)
         if context.status in {
             ExecutionStatus.SUCCEEDED,
             ExecutionStatus.FAILED,
@@ -151,4 +151,3 @@ class SnapshotMiddleware(ObservingMiddleware):
         if context.status is ExecutionStatus.DENIED:
             return "decision"
         return "governance"
-

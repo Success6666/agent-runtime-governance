@@ -23,9 +23,9 @@ The architecture is frozen per release. New ideas enter this file before code.
 
 ## v0.4 - Integration ecosystem
 
-- Explicit plugin API and entry-point discovery
-- Prometheus, Slack, and OPA integrations
-- CrewAI, Agno, LlamaIndex, and AutoGen examples
+- [x] Explicit plugin API and entry-point discovery
+- [x] Prometheus, Slack, and OPA integrations
+- [x] CrewAI, Agno, LlamaIndex, and AutoGen examples
 
 ## Future ideas
 

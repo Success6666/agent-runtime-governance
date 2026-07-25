@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import argparse
 
-from agent_runtime_governance import JSONLSnapshotStore, ReplayDebugger, trace_to_mermaid
+from agent_runtime_governance import (
+    JSONLSnapshotStore,
+    ReplayDebugger,
+    trace_to_mermaid,
+)
 
 
 def main() -> None:

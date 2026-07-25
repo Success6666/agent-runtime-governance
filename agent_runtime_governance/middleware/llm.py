@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 from dataclasses import dataclass
 from typing import Awaitable, Callable, TypeAlias
@@ -32,7 +33,10 @@ class LLMMiddleware(GatingMiddleware):
         self._reviewer = reviewer
 
     async def process(self, context: ExecutionContext) -> ExecutionContext:
-        value = self._reviewer(context)
+        if inspect.iscoroutinefunction(self._reviewer):
+            value = await self._reviewer(context)
+        else:
+            value = await asyncio.to_thread(self._reviewer, context)
         if inspect.isawaitable(value):
             value = await value
         if isinstance(value, SemanticReview):

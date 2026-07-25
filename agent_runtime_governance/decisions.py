@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 from dataclasses import dataclass
 from enum import Enum
-from typing import Awaitable, Callable, Protocol, TYPE_CHECKING, TypeAlias
+from typing import TYPE_CHECKING, Awaitable, Callable, Protocol, TypeAlias
 
 if TYPE_CHECKING:
     from .context import ExecutionContext
@@ -53,7 +54,10 @@ class HumanDecisionProvider:
     async def decide(
         self, context: "ExecutionContext", request: ApprovalRequest
     ) -> DecisionRecord:
-        value = self._callback(context, request)
+        if inspect.iscoroutinefunction(self._callback):
+            value = await self._callback(context, request)
+        else:
+            value = await asyncio.to_thread(self._callback, context, request)
         if inspect.isawaitable(value):
             value = await value
         if isinstance(value, DecisionRecord):
@@ -69,4 +73,3 @@ class HumanDecisionProvider:
             reason="human decision",
             source="human",
         )
-

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
-from .snapshots import ContextSnapshot, SnapshotStore
+from .snapshots import SnapshotStore
 
 
 @dataclass(frozen=True, slots=True)

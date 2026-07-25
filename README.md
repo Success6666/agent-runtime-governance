@@ -1,14 +1,19 @@
 # Agent Runtime Governance
 
+[![CI](https://github.com/Success6666/agent-runtime-governance/actions/workflows/ci.yml/badge.svg)](https://github.com/Success6666/agent-runtime-governance/actions/workflows/ci.yml)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB.svg)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
+[![Release: v0.4.0](https://img.shields.io/badge/release-v0.4.0-6f42c1.svg)](https://github.com/Success6666/agent-runtime-governance/releases/tag/v0.4.0)
+
 A lightweight, framework-agnostic runtime governance framework for AI agents.
 It governs an immutable `ExecutionContext` through a deterministic middleware
 pipeline, then produces an explicit decision, an auditable execution, and a
 replayable trace.
 
-## 30-second start
+## Quick start
 
 ```bash
-pip install agent-runtime-governance
+pip install "agent-runtime-governance @ git+https://github.com/Success6666/agent-runtime-governance.git@v0.4.0"
 ```
 
 ```python
@@ -99,7 +104,15 @@ Earlier denials cannot be overridden by later middleware.
 - `examples/cli_approval_demo.py`: interactive human decision provider
 - `examples/langgraph_integration.py`: LangGraph tool-node integration
 - `examples/openai_agents_integration.py`: OpenAI Agents SDK tool integration
+- `examples/crewai_integration.py`: CrewAI decorated tool
+- `examples/agno_integration.py`: Agno function tool
+- `examples/llamaindex_integration.py`: LlamaIndex `FunctionTool`
+- `examples/autogen_integration.py`: Microsoft AutoGen `FunctionTool`
 - `scripts/replay.py`: print the snapshots for a trace from JSONL audit data
+
+Each framework adapter is intentionally an example rather than a runtime
+dependency. The governed function remains ordinary Python and can be wrapped by
+the framework's native tool interface.
 
 ## Engineering controls
 
@@ -155,6 +168,54 @@ python scripts/trace_debug.py snapshots.jsonl TRACE_ID --diff 0 1
 python scripts/trace_debug.py snapshots.jsonl TRACE_ID --mermaid
 ```
 
+## Plugins and integrations
+
+Plugins register components during construction; the built runtime remains
+immutable:
+
+```python
+from agent_runtime_governance import OPAClient, OPAPlugin, PluginManager
+
+manager = PluginManager()
+manager.load(OPAPlugin(OPAClient("http://localhost:8181", "agents/tools/allow")))
+runtime = manager.build()
+```
+
+Third-party plugins can publish the Python entry-point group
+`agent_runtime_governance.plugins`. Entry points execute Python code and must be
+treated as trusted dependencies. The project does not download plugins or
+provide a marketplace.
+
+| Integration | Extra | Behavior |
+| --- | --- | --- |
+| Prometheus | `prometheus` | Terminal status and duration; no trace/user labels |
+| Slack | none | Denial/failure notifications; official HTTPS webhooks only |
+| OPA | none | Minimal decision input; fail closed by default |
+| LangGraph | `langgraph` | Governed function in a graph node |
+| OpenAI Agents SDK | `openai-agents` | Governed async function tool |
+| CrewAI | `crewai` | Decorated governed async tool |
+| Agno | `agno` | Typed governed Python function |
+| LlamaIndex | `llamaindex` | Governed `FunctionTool` async function |
+| Microsoft AutoGen | `autogen` | Governed `FunctionTool` async function |
+
+Install only the integrations an application uses:
+
+```bash
+pip install "agent-runtime-governance[yaml,prometheus,crewai]"
+```
+
+## Releases
+
+| Version | Scope |
+| --- | --- |
+| v0.1.0 | Immutable context, registry, rule/LLM/approval/audit middleware, basic replay |
+| v0.2.0 | Hooks, Python policy, metrics, retry, timeout, and OpenTelemetry bridge |
+| v0.3.0 | Strict YAML policy, snapshots, replay diff, evaluation, and policy drift |
+| v0.4.0 | Trusted plugins, Prometheus, Slack, OPA, and six framework integrations |
+
+All four versions are preserved as immutable Git tags. See
+[CHANGELOG.md](CHANGELOG.md) for the detailed compatibility and security notes.
+
 ## Non-goals
 
 - Agent planning, prompting, model routing, or memory
@@ -165,7 +226,8 @@ python scripts/trace_debug.py snapshots.jsonl TRACE_ID --mermaid
 - Arbitrary condition evaluation, policy inheritance, or conflict resolution
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for invariants and
-[ROADMAP.md](ROADMAP.md) for the deliberately staged scope.
+[ROADMAP.md](ROADMAP.md) for the deliberately staged scope. Security reports and
+integration boundaries are documented in [SECURITY.md](SECURITY.md).
 
 ## Development
 
@@ -176,6 +238,10 @@ python -m build
 ```
 
 Python 3.10+ is supported. The core package has no runtime dependencies.
+
+Pull requests to `main` must pass every CI job, resolve CodeRabbit blocking
+reviews, and receive one approval from the code owner. Repository administrators
+retain direct-push access for controlled maintenance and release operations.
 
 ## License
 

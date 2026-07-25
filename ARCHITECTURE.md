@@ -71,3 +71,20 @@ Policy documents have an explicit version and a digest derived from canonical
 validated content. Duplicate tool rules are rejected instead of introducing an
 implicit conflict-resolution language. Drift detection compares outcomes and
 risk tiers after applying two deterministic pipelines to the same request.
+
+## Plugin boundary
+
+Plugins modify a `RuntimeBuilder`, not a running `Runtime`. Registration is
+validated transactionally and rolled back if a plugin introduces an invalid
+pipeline. Named services, audit sinks, and decision providers are exposed as
+read-only mappings after registration.
+
+Python entry points are a trusted-code mechanism. Discovery never installs or
+downloads packages. Applications must pin, review, and verify every plugin
+distribution before loading it.
+
+Network integrations send the minimum required data. OPA excludes tool
+arguments and defaults to denial on transport or schema errors. Slack excludes
+arguments, restricts endpoints to official HTTPS webhook hosts, and cannot
+interrupt execution because it is observing middleware. Prometheus labels are
+limited to registered tool name, status, and risk tier.

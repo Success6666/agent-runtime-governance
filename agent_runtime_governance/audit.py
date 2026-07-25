@@ -4,14 +4,12 @@ import hashlib
 import hmac
 import json
 import threading
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Protocol
 
 from .context import ExecutionContext
 from .errors import AuditIntegrityError
-
 
 DEFAULT_SENSITIVE_KEYS = frozenset(
     {"password", "passwd", "secret", "token", "api_key", "authorization", "cookie"}

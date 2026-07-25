@@ -1,5 +1,6 @@
 from .audit import InMemoryAuditSink, JSONLAuditSink
 from .context import ExecutionContext, ExecutionStatus, HistoryEntry, RiskTier, ToolCall
+from .debugger import DiffEntry, ReplayDebugger, diff_values
 from .decisions import (
     ApprovalRequest,
     DecisionOutcome,
@@ -14,7 +15,6 @@ from .errors import (
     RegistryError,
     ToolExecutionError,
 )
-from .debugger import DiffEntry, ReplayDebugger, diff_values
 from .evaluation import (
     DriftRecord,
     EvaluationSuite,
@@ -31,35 +31,50 @@ from .middleware import (
     DecisionMiddleware,
     ExecutionMiddleware,
     GatingMiddleware,
+    InMemoryMetrics,
     LLMMiddleware,
+    MetricsMiddleware,
+    MetricsSnapshot,
     Middleware,
     MiddlewareKind,
     MiddlewareMetadata,
-    MetricsMiddleware,
-    MetricsSnapshot,
-    InMemoryMetrics,
     ObservingMiddleware,
+    RetryMiddleware,
     Rule,
     RuleMiddleware,
-    RetryMiddleware,
     SemanticReview,
     TimeoutMiddleware,
 )
 from .pipeline import Pipeline
+from .plugins import (
+    OPAClient,
+    OPADecision,
+    OPAMiddleware,
+    OPAPlugin,
+    Plugin,
+    PluginManager,
+    PrometheusMiddleware,
+    PrometheusPlugin,
+    RegisteredPlugin,
+    RuntimeBuilder,
+    SlackNotificationMiddleware,
+    SlackPlugin,
+    SlackWebhookNotifier,
+)
 from .policy import PolicyMiddleware, SimplePolicy
 from .replay import ReplayTrace
+from .runtime import Harness, InvocationOptions, RunResult, Runtime
 from .snapshots import (
     ContextSnapshot,
     InMemorySnapshotStore,
     JSONLSnapshotStore,
     SnapshotMiddleware,
 )
-from .runtime import Harness, InvocationOptions, RunResult, Runtime
 from .telemetry import OpenTelemetryMiddleware
 from .visualization import trace_to_mermaid
 from .yaml_policy import PolicyDocument, PolicyValidationError, YAMLPolicyLoader
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "ApprovalMiddleware",
@@ -99,12 +114,21 @@ __all__ = [
     "MetricsSnapshot",
     "ObservingMiddleware",
     "OpenTelemetryMiddleware",
+    "OPAClient",
+    "OPADecision",
+    "OPAMiddleware",
+    "OPAPlugin",
     "Pipeline",
+    "Plugin",
+    "PluginManager",
     "PolicyDocument",
     "PolicyDriftDetector",
     "PolicyDriftReport",
     "PolicyMiddleware",
     "PolicyValidationError",
+    "PrometheusMiddleware",
+    "PrometheusPlugin",
+    "RegisteredPlugin",
     "RegistryError",
     "ReplayTrace",
     "ReplayDebugger",
@@ -117,9 +141,13 @@ __all__ = [
     "RetryMiddleware",
     "RunResult",
     "Runtime",
+    "RuntimeBuilder",
     "SemanticReview",
     "SimplePolicy",
     "SnapshotMiddleware",
+    "SlackNotificationMiddleware",
+    "SlackPlugin",
+    "SlackWebhookNotifier",
     "TimeoutMiddleware",
     "ToolCall",
     "ToolExecutionError",

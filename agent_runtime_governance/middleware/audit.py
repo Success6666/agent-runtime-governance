@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from ..audit import AuditSink, context_event
 from ..context import ExecutionContext, HistoryEntry
 from .base import ObservingMiddleware
@@ -27,5 +29,7 @@ class AuditMiddleware(ObservingMiddleware):
                 data={"stage": stage},
             )
         )
-        self.sink.write(context_event(updated, stage=stage))
+        await asyncio.to_thread(
+            self.sink.write, context_event(updated, stage=stage)
+        )
         return updated

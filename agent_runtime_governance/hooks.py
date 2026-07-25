@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 from dataclasses import dataclass
 from enum import Enum
@@ -64,7 +65,10 @@ class HookRegistry:
         current = context
         for registration in self._hooks[point]:
             try:
-                value = registration.callback(current)
+                if inspect.iscoroutinefunction(registration.callback):
+                    value = await registration.callback(current)
+                else:
+                    value = await asyncio.to_thread(registration.callback, current)
                 if inspect.isawaitable(value):
                     value = await value
                 if value is not None:

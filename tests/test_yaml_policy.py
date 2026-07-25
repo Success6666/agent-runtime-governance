@@ -11,7 +11,6 @@ from agent_runtime_governance import (
     YAMLPolicyLoader,
 )
 
-
 VALID_POLICY = """
 version: "1"
 policies:

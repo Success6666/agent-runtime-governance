@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-runtime-governance"
-version = "0.3.0"
+version = "0.4.0"
 description = "Framework-agnostic runtime governance for AI agents."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -27,13 +27,20 @@ dependencies = []
 dev = [
   "build>=1.2",
   "PyYAML>=6.0",
+  "prometheus-client>=0.20",
   "pytest>=8.0",
   "pytest-asyncio>=0.23",
+  "ruff>=0.12",
 ]
 langgraph = ["langgraph>=0.2"]
 openai-agents = ["openai-agents>=0.2"]
 otel = ["opentelemetry-api>=1.25"]
 yaml = ["PyYAML>=6.0"]
+prometheus = ["prometheus-client>=0.20"]
+crewai = ["crewai>=1.0"]
+agno = ["agno>=2.0"]
+llamaindex = ["llama-index-core>=0.12"]
+autogen = ["autogen-core>=0.6"]
 
 [project.urls]
 Homepage = "https://github.com/Success6666/agent-runtime-governance"
@@ -51,3 +58,9 @@ testpaths = ["tests"]
 [tool.coverage.run]
 branch = true
 source = ["agent_runtime_governance"]
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
