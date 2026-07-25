@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import asyncio
+from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     from .context import ExecutionContext
@@ -17,6 +18,39 @@ class GovernanceDenied(GovernanceError):
         self.context = context
         reason = context.decision.reason if context.decision else "denied"
         super().__init__(reason)
+
+
+class GovernanceCancelledError(asyncio.CancelledError):
+    """Cancellation carrier for the final governed context."""
+
+    def __init__(self, context: "ExecutionContext") -> None:
+        self.context = context
+        super().__init__("governed execution cancelled")
+
+
+def get_cancellation_context(
+    error: BaseException,
+) -> "ExecutionContext | None":
+    """Recover governed cancellation state across supported Python versions.
+
+    Python 3.10 re-materializes ``CancelledError`` when a cancelled task is
+    awaited, so custom attributes survive only on the chained carrier.
+    """
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        context = getattr(current, "context", None)
+        if context is not None:
+            return cast("ExecutionContext", context)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return None
 
 
 class MiddlewareExecutionError(GovernanceError):

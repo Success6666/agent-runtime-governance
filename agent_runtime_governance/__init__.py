@@ -28,10 +28,12 @@ from .errors import (
     AuditIntegrityError,
     ContextMutationError,
     ContractValidationError,
+    GovernanceCancelledError,
     GovernanceDenied,
     GovernanceError,
     RegistryError,
     ToolExecutionError,
+    get_cancellation_context,
 )
 from .evaluation import (
     DriftRecord,
@@ -153,7 +155,9 @@ __all__ = [
     "EvaluationSuite",
     "GatingMiddleware",
     "GovernanceDenied",
+    "GovernanceCancelledError",
     "GovernanceError",
+    "get_cancellation_context",
     "Harness",
     "HistoryEntry",
     "HookPoint",

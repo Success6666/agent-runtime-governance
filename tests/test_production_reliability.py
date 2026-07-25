@@ -12,6 +12,7 @@ from agent_runtime_governance.errors import (
     ContractValidationError,
     GovernanceDenied,
     ToolExecutionError,
+    get_cancellation_context,
 )
 from agent_runtime_governance.hooks import HookPoint
 from agent_runtime_governance.middleware import AuditMiddleware, GatingMiddleware
@@ -221,8 +222,10 @@ async def test_cancellation_propagates_and_marks_context_unknown() -> None:
     task.cancel()
     with pytest.raises(asyncio.CancelledError) as caught:
         await task
-    assert caught.value.context.status is ExecutionStatus.UNKNOWN
-    assert any(entry.outcome == "cancelled" for entry in caught.value.context.history)
+    context = get_cancellation_context(caught.value)
+    assert context is not None
+    assert context.status is ExecutionStatus.UNKNOWN
+    assert any(entry.outcome == "cancelled" for entry in context.history)
 
 
 @pytest.mark.asyncio
