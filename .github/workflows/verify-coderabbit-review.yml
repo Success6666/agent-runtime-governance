@@ -1,0 +1,39 @@
+name: Verify CodeRabbit review
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+concurrency:
+  group: coderabbit-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  verify-coderabbit-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const verifyCodeRabbitReview = require(
+              "./.github/scripts/verify-coderabbit-review.cjs"
+            );
+            await verifyCodeRabbitReview({
+              github,
+              context,
+              core,
+              maxAttempts: 40,
+              intervalMs: 15000,
+            });

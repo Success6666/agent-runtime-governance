@@ -3,7 +3,7 @@
 [![CI](https://github.com/Success6666/agent-runtime-governance/actions/workflows/ci.yml/badge.svg)](https://github.com/Success6666/agent-runtime-governance/actions/workflows/ci.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
-[![Release: v0.4.1](https://img.shields.io/badge/release-v0.4.1-6f42c1.svg)](https://github.com/Success6666/agent-runtime-governance/releases/tag/v0.4.1)
+[![Release: v0.4.2](https://img.shields.io/badge/release-v0.4.2-6f42c1.svg)](https://github.com/Success6666/agent-runtime-governance/releases/tag/v0.4.2)
 
 A lightweight, framework-agnostic runtime governance framework for AI agents.
 It governs an immutable `ExecutionContext` through a deterministic middleware
@@ -13,7 +13,7 @@ replayable trace.
 ## Quick start
 
 ```bash
-pip install "agent-runtime-governance @ git+https://github.com/Success6666/agent-runtime-governance.git@v0.4.1"
+pip install "agent-runtime-governance @ git+https://github.com/Success6666/agent-runtime-governance.git@v0.4.2"
 ```
 
 ```python
@@ -213,6 +213,7 @@ pip install "agent-runtime-governance[yaml,prometheus,crewai]"
 | v0.3.0 | Strict YAML policy, snapshots, replay diff, evaluation, and policy drift |
 | v0.4.0 | Trusted plugins, Prometheus, Slack, OPA, and six framework integrations |
 | v0.4.1 | Mandatory linked issues and merge-policy verification |
+| v0.4.2 | Fail-closed CodeRabbit review verification for the current commit |
 
 All four versions are preserved as immutable Git tags. See
 [CHANGELOG.md](CHANGELOG.md) for the detailed compatibility and security notes.
@@ -243,9 +244,11 @@ Python 3.10+ is supported. The core package has no runtime dependencies.
 Pull requests must link an existing issue in this repository with a closing
 keyword such as `Fixes #123`. A repository workflow closes unlinked pull
 requests automatically. Pull requests to `main` must also pass every CI job and
-the CodeRabbit status, resolve CodeRabbit blocking reviews, and receive one
-approval from the code owner. Repository administrators retain direct-push
-access for controlled maintenance and release operations.
+the CodeRabbit status, receive a verified CodeRabbit approval for the current
+head commit, resolve blocking reviews, and receive one approval from the code
+owner. A skipped, rate-limited, stale, or missing CodeRabbit review fails closed.
+Repository administrators retain direct-push access for controlled maintenance
+and release operations.
 
 ## License
 
