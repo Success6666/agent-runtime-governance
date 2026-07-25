@@ -3,10 +3,10 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .coverage
+coverage.xml
 htmlcov/
 build/
 dist/
 .venv/
 audit.log
 *.log
-
