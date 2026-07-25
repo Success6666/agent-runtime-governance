@@ -15,7 +15,11 @@ from agent_runtime_governance.errors import (
     get_cancellation_context,
 )
 from agent_runtime_governance.hooks import HookPoint
-from agent_runtime_governance.middleware import AuditMiddleware, GatingMiddleware
+from agent_runtime_governance.middleware import (
+    AuditMiddleware,
+    GatingMiddleware,
+    ObservingMiddleware,
+)
 from agent_runtime_governance.registry import SQLiteIdempotencyStore
 from agent_runtime_governance.resilience import (
     CapacityExceededError,
@@ -184,7 +188,25 @@ async def test_absolute_deadline_applies_to_hooks() -> None:
 
 @pytest.mark.asyncio
 async def test_runtime_bulkhead_rejects_excess_concurrency() -> None:
+    sink = InMemoryAuditSink()
+
+    class FailureRecorder(ObservingMiddleware):
+        name = "failure-recorder"
+
+        def __init__(self) -> None:
+            self.failures: list[tuple[str, str, str]] = []
+
+        async def process(self, context):
+            return context
+
+        def record_external_failure(
+            self, component: str, *, outcome: str, reason: str
+        ) -> None:
+            self.failures.append((component, outcome, reason))
+
+    recorder = FailureRecorder()
     runtime = Runtime(
+        [recorder, AuditMiddleware(sink)],
         limits=RuntimeLimits(
             max_in_flight=1,
             admission_timeout_seconds=0.01,
@@ -201,8 +223,19 @@ async def test_runtime_bulkhead_rejects_excess_concurrency() -> None:
 
     first = asyncio.create_task(hold.ainvoke())
     await started.wait()
-    with pytest.raises(CapacityExceededError):
+    with pytest.raises(CapacityExceededError) as caught:
         await hold.ainvoke()
+    rejected = caught.value.context
+    assert rejected.status is ExecutionStatus.FAILED
+    assert any(entry.middleware == "admission" for entry in rejected.history)
+    assert recorder.failures == [
+        ("admission", "reject", "capacity_exceeded")
+    ]
+    assert any(
+        event["trace_id"] == rejected.trace_id
+        and event["status"] == ExecutionStatus.FAILED.value
+        for event in sink.events
+    )
     release.set()
     await first
 

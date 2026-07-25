@@ -24,6 +24,16 @@ latency, and peak traced memory for:
 - rule plus OPA plus audit plus OpenTelemetry;
 - ten pass-through gating middleware.
 
+The output also records mean and p50/p95/p99 admission wait latency while
+multiple tasks contend for a single FIFO runtime permit. The default zero-hold
+case yields once per owner to isolate admission handoff and scheduling from
+tool latency. This
+isolates bulkhead scheduling behavior from tool and middleware latency.
+
+The v0.5 release evidence is committed as
+`results/v0.5.0-windows-python312.json`. Treat it as a regression baseline for
+the recorded environment, not as a general service-level objective.
+
 Results are not treated as universal performance claims. Compare runs on the
 same pinned environment and investigate regressions in both tail latency and
 memory before release.

@@ -23,7 +23,7 @@ from agent_runtime_governance.middleware import (
     RuleMiddleware,
 )
 from agent_runtime_governance.plugins.opa import OPAClient, OPAMiddleware
-from agent_runtime_governance.resilience import RuntimeLimits
+from agent_runtime_governance.resilience import RuntimeBulkhead, RuntimeLimits
 from agent_runtime_governance.runtime import Runtime
 from agent_runtime_governance.telemetry import OpenTelemetryMiddleware
 
@@ -39,6 +39,16 @@ class Measurement:
     p95_ms: float
     p99_ms: float
     peak_memory_kib: float
+
+
+@dataclass(frozen=True, slots=True)
+class AdmissionContentionMeasurement:
+    waiters: int
+    permit_hold_ms: float
+    mean_wait_ms: float
+    p50_wait_ms: float
+    p95_wait_ms: float
+    p99_wait_ms: float
 
 
 class NullAuditSink(AuditSink):
@@ -177,6 +187,45 @@ async def run_matrix(
     return measurements
 
 
+async def measure_admission_contention(
+    *, waiters: int, permit_hold_seconds: float = 0.0
+) -> AdmissionContentionMeasurement:
+    bulkhead = RuntimeBulkhead(1)
+    initial = await bulkhead.acquire(1)
+    latencies: list[float] = []
+
+    async def contend() -> None:
+        started = perf_counter()
+        lease = await bulkhead.acquire(max(5.0, waiters * permit_hold_seconds * 2))
+        latencies.append((perf_counter() - started) * 1000)
+        try:
+            await asyncio.sleep(max(0.0, permit_hold_seconds))
+        finally:
+            lease.release()
+
+    tasks = [asyncio.create_task(contend()) for _ in range(waiters)]
+    await asyncio.sleep(0)
+    initial.release()
+    await asyncio.gather(*tasks)
+    ordered = sorted(latencies)
+    return AdmissionContentionMeasurement(
+        waiters=waiters,
+        permit_hold_ms=permit_hold_seconds * 1000,
+        mean_wait_ms=statistics.fmean(latencies),
+        p50_wait_ms=_percentile(ordered, 0.50),
+        p95_wait_ms=_percentile(ordered, 0.95),
+        p99_wait_ms=_percentile(ordered, 0.99),
+    )
+
+
+async def run_benchmarks(
+    request_counts: Iterable[int], concurrency: int
+) -> tuple[list[Measurement], AdmissionContentionMeasurement]:
+    measurements = await run_matrix(request_counts, concurrency)
+    admission = await measure_admission_contention(waiters=max(10, concurrency))
+    return measurements, admission
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Measure governance layer latency, throughput, and peak allocations."
@@ -195,7 +244,7 @@ def main() -> int:
     if args.concurrency < 1:
         parser.error("concurrency must be positive")
 
-    measurements = asyncio.run(run_matrix(counts, args.concurrency))
+    measurements, admission = asyncio.run(run_benchmarks(counts, args.concurrency))
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "environment": {
@@ -205,6 +254,7 @@ def main() -> int:
             "cpu_count": os.cpu_count(),
         },
         "measurements": [asdict(item) for item in measurements],
+        "admission_contention": asdict(admission),
     }
     encoded = json.dumps(payload, indent=2, ensure_ascii=True)
     print(encoded)

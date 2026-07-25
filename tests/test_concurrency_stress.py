@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import multiprocessing
+import time
 from pathlib import Path
 
 import pytest
@@ -66,6 +67,8 @@ def _idempotency_contender(path: str, start, results) -> None:
         claim.future.result()
     except Exception as exc:
         results.put(type(exc).__name__)
+    else:
+        results.put("replayed")
 
 
 def _approval_contender(path: str, request_data: dict, outcome: str, start, results) -> None:
@@ -99,6 +102,39 @@ def _identity_replay_contender(path: str, start, results) -> None:
         datetime.now(timezone.utc) + timedelta(minutes=1),
     )
     results.put(claimed)
+
+
+def _sleep_worker(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _join_all(workers, *, timeout: float = 30.0) -> None:
+    deadline = time.monotonic() + timeout
+    for process in workers:
+        process.join(timeout=max(0.0, deadline - time.monotonic()))
+    still_alive = [process for process in workers if process.is_alive()]
+    for process in still_alive:
+        process.terminate()
+    for process in still_alive:
+        process.join(timeout=5)
+    assert not [process.pid for process in workers if process.is_alive()], (
+        "worker processes remained alive after termination"
+    )
+    failures = {
+        process.pid: process.exitcode
+        for process in workers
+        if process.exitcode != 0
+    }
+    assert not failures, f"worker processes failed with exit codes: {failures}"
+
+
+def test_join_all_terminates_timed_out_workers() -> None:
+    context = multiprocessing.get_context("spawn")
+    worker = context.Process(target=_sleep_worker, args=(60,))
+    worker.start()
+    with pytest.raises(AssertionError, match="exit codes"):
+        _join_all([worker], timeout=0.05)
+    assert not worker.is_alive()
 
 
 @pytest.mark.asyncio
@@ -148,9 +184,7 @@ def test_jsonl_audit_chain_is_consistent_across_processes(tmp_path: Path) -> Non
     ]
     for process in workers:
         process.start()
-    for process in workers:
-        process.join(timeout=30)
-        assert process.exitcode == 0
+    _join_all(workers)
 
     events = JSONLAuditSink(path, sign_key="multiprocess-test").read_verified()
     assert len(events) == 100
@@ -169,9 +203,7 @@ def test_sqlite_audit_chain_is_consistent_across_processes(tmp_path: Path) -> No
     ]
     for process in workers:
         process.start()
-    for process in workers:
-        process.join(timeout=30)
-        assert process.exitcode == 0
+    _join_all(workers)
 
     events = SQLiteAuditSink(path, sign_key="multiprocess-test").read_verified()
     assert len(events) == 100
@@ -200,9 +232,7 @@ def test_snapshot_sequence_is_atomic_across_processes(
     ]
     for process in workers:
         process.start()
-    for process in workers:
-        process.join(timeout=30)
-        assert process.exitcode == 0
+    _join_all(workers)
 
     store_class = (
         JSONLSnapshotStore if store_type == "jsonl" else SQLiteSnapshotStore
@@ -226,9 +256,7 @@ def test_sqlite_idempotency_has_one_owner_across_processes(tmp_path: Path) -> No
     for process in workers:
         process.start()
     start.set()
-    for process in workers:
-        process.join(timeout=30)
-        assert process.exitcode == 0
+    _join_all(workers)
     outcomes = [results.get(timeout=2) for _ in workers]
     assert outcomes.count("owner") == 1
     assert outcomes.count("IdempotencyInProgressError") == 3
@@ -260,9 +288,7 @@ def test_sqlite_approval_accepts_one_decision_across_processes(
     for process in workers:
         process.start()
     start.set()
-    for process in workers:
-        process.join(timeout=30)
-        assert process.exitcode == 0
+    _join_all(workers)
     outcomes = [results.get(timeout=2) for _ in workers]
     assert outcomes.count("decided") == 1
     assert outcomes.count("ValueError") == 1
@@ -282,9 +308,7 @@ def test_sqlite_identity_replay_has_one_winner_across_processes(
     for process in workers:
         process.start()
     start.set()
-    for process in workers:
-        process.join(timeout=30)
-        assert process.exitcode == 0
+    _join_all(workers)
     outcomes = [results.get(timeout=2) for _ in workers]
     assert outcomes.count(True) == 1
     assert outcomes.count(False) == 3

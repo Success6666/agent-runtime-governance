@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import sys
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -25,6 +26,11 @@ from agent_runtime_governance.decisions import (
     ApprovalRequest,
     DecisionOutcome,
     DecisionRecord,
+    HumanDecisionProvider,
+)
+from agent_runtime_governance.errors import (
+    GovernanceCancelledError,
+    get_cancellation_context,
 )
 from agent_runtime_governance.identity import (
     HMACClaimsIdentityProvider,
@@ -34,6 +40,7 @@ from agent_runtime_governance.identity import (
     VerifiedPrincipal,
 )
 from agent_runtime_governance.middleware.decision import DecisionMiddleware
+from agent_runtime_governance.plugins import opa as opa_module
 from agent_runtime_governance.plugins.core import PluginManager, RuntimeBuilder
 from agent_runtime_governance.plugins.opa import (
     OPAClient,
@@ -247,6 +254,39 @@ def test_hmac_provider_accepts_audience_list_and_single_permission() -> None:
         HMACClaimsIdentityProvider.sign_claims(claims, HMAC_KEY)
     )
     assert principal.permissions == frozenset({"file:write"})
+
+
+def test_identity_replay_retention_includes_clock_skew_window() -> None:
+    now = datetime.now(timezone.utc)
+    claims = _claims(
+        iat=(now - timedelta(seconds=60)).timestamp(),
+        nbf=(now - timedelta(seconds=60)).timestamp(),
+        exp=(now - timedelta(seconds=5)).timestamp(),
+    )
+    envelope = HMACClaimsIdentityProvider.sign_claims(claims, HMAC_KEY)
+    provider = HMACClaimsIdentityProvider(
+        HMAC_KEY,
+        expected_issuer="gateway",
+        expected_audience="agent-runtime",
+        clock_skew_seconds=30,
+    )
+
+    assert provider.verify(envelope).subject == "alice"
+    with pytest.raises(ValueError, match="already used"):
+        provider.verify(envelope)
+
+
+def test_cancellation_context_rejects_arbitrary_exception_attributes() -> None:
+    context = _context()
+    arbitrary = RuntimeError("not governed")
+    arbitrary.context = context  # type: ignore[attr-defined]
+    assert get_cancellation_context(arbitrary) is None
+
+    carrier = GovernanceCancelledError(context)
+    try:
+        raise asyncio.CancelledError() from carrier
+    except asyncio.CancelledError as rematerialized:
+        assert get_cancellation_context(rematerialized) is context
 
 
 @pytest.mark.parametrize(
@@ -492,17 +532,64 @@ async def test_decision_middleware_handles_human_pending_and_missing_approver() 
     assert optional.decision.outcome is DecisionOutcome.ALLOW
 
 
+@pytest.mark.asyncio
+async def test_human_provider_applies_configured_approver_to_full_record() -> None:
+    provider = HumanDecisionProvider(
+        lambda context, request: DecisionRecord(
+            DecisionOutcome.ALLOW, "approved", "human"
+        ),
+        approver="operator-1",
+    )
+    decision = await provider.decide(_context(approval=True), _request())
+    assert decision.approver == "operator-1"
+
+
+@pytest.mark.asyncio
+async def test_decision_middleware_prunes_expired_local_reservations() -> None:
+    class Provider:
+        async def decide(self, context, request):
+            return DecisionRecord(
+                DecisionOutcome.ALLOW,
+                "approved",
+                "human",
+                approver="operator",
+            )
+
+    middleware = DecisionMiddleware(
+        Provider(),
+        store=InMemoryApprovalStore(),
+        reservation_ttl_seconds=0.001,
+    )
+    first = await middleware.process(_context(approval=True))
+    assert first.decision.outcome is DecisionOutcome.ALLOW
+    assert middleware.active_reservation_count == 1
+    await asyncio.sleep(0.01)
+    second_context = ExecutionContext.create(
+        ToolCall("delete_file"),
+        request_id="request-second",
+        risk_tier=RiskTier.HIGH,
+        requires_approval=True,
+    )
+    second = await middleware.process(second_context)
+    assert second.decision.outcome is DecisionOutcome.ALLOW
+    assert middleware.active_reservation_count == 1
+
+
 def test_runtime_builder_applies_all_runtime_dependencies() -> None:
     principal = VerifiedPrincipal("gateway", "alice", "tenant-a")
     identity = StaticIdentityProvider(principal)
     idempotency = InMemoryIdempotencyStore()
     limits = RuntimeLimits(max_in_flight=2)
-    with ThreadPoolExecutor(max_workers=1) as executor:
+    with (
+        ThreadPoolExecutor(max_workers=1) as executor,
+        ThreadPoolExecutor(max_workers=1) as idempotency_executor,
+    ):
         builder = RuntimeBuilder()
         assert builder.with_identity(identity) is builder
         assert builder.with_idempotency_store(idempotency) is builder
         assert builder.with_limits(limits) is builder
         assert builder.with_sync_executor(executor) is builder
+        assert builder.with_idempotency_executor(idempotency_executor) is builder
         runtime = builder.build()
         assert runtime is not None
         runtime.close()
@@ -568,6 +655,11 @@ def test_opa_client_rejects_invalid_limits_and_headers() -> None:
         OPAClient(
             "https://opa.example.com", "agent/allow", headers={"Bad:Name": "value"}
         )
+
+
+def test_opa_redirect_handler_refuses_all_redirects() -> None:
+    handler = opa_module._RejectRedirects()
+    assert handler.redirect_request(None, None, 307, "redirect", {}, "https://other") is None
     with pytest.raises(ValueError, match="header value"):
         OPAClient(
             "https://opa.example.com", "agent/allow", headers={"X-Token": "bad\nvalue"}
@@ -666,3 +758,13 @@ async def test_prometheus_middleware_records_failures_once_and_skips_non_termina
     metrics = generate_latest(registry).decode("utf-8")
     assert 'component="opa"' in metrics
     assert 'component="slack"' in metrics
+
+    critical = ExecutionContext.create(ToolCall("critical")).append_history(
+        HistoryEntry("audit", "critical_error", "critical observer failure")
+    ).evolve(status=ExecutionStatus.UNKNOWN)
+    await middleware.process(critical)
+    metrics = generate_latest(registry).decode("utf-8")
+    assert (
+        'component="audit",outcome="error",reason="critical_observer_failure"'
+        in metrics
+    )
