@@ -20,6 +20,7 @@ from agent_runtime_governance import (
     TimeoutMiddleware,
     ToolExecutionError,
 )
+from agent_runtime_governance.registry import ExecutionMode
 
 
 def register(runtime: Runtime):
@@ -80,7 +81,7 @@ async def test_retry_recovers_transient_failure() -> None:
     attempts = 0
     runtime = Runtime([RetryMiddleware(max_attempts=3, retry_on=(ConnectionError,))])
 
-    @runtime.tool()
+    @runtime.tool(execution_mode=ExecutionMode.READ_ONLY)
     def flaky() -> str:
         nonlocal attempts
         attempts += 1
@@ -97,7 +98,7 @@ async def test_retry_recovers_transient_failure() -> None:
 def test_retry_exhaustion_preserves_attempt_history() -> None:
     runtime = Runtime([RetryMiddleware(max_attempts=2, retry_on=(ConnectionError,))])
 
-    @runtime.tool()
+    @runtime.tool(execution_mode=ExecutionMode.READ_ONLY)
     def fail() -> None:
         raise ConnectionError("offline")
 

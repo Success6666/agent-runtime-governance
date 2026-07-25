@@ -4,6 +4,7 @@ import pytest
 from prometheus_client import CollectorRegistry, generate_latest
 
 from agent_runtime_governance import (
+    ExecutionMode,
     GovernanceDenied,
     InvocationOptions,
     PrometheusMiddleware,
@@ -12,6 +13,7 @@ from agent_runtime_governance import (
     Runtime,
     SlackNotificationMiddleware,
     SlackWebhookNotifier,
+    ToolExecutionError,
 )
 
 
@@ -47,6 +49,20 @@ def test_prometheus_records_denial_once() -> None:
         runtime.invoke("work", _governance=InvocationOptions(input_text="deny"))
     output = generate_latest(registry).decode()
     assert 'deny_arg_tool_calls_total{risk_tier="LOW",status="denied",tool="work"} 1.0' in output
+
+
+def test_prometheus_records_unknown_mutating_outcome() -> None:
+    registry = CollectorRegistry()
+    runtime = Runtime([PrometheusMiddleware(registry=registry, prefix="unknown_arg")])
+
+    @runtime.tool(execution_mode=ExecutionMode.MUTATING)
+    def work() -> bool:
+        raise RuntimeError("write may have happened")
+
+    with pytest.raises(ToolExecutionError):
+        work()
+    output = generate_latest(registry).decode()
+    assert 'unknown_arg_tool_calls_total{risk_tier="LOW",status="unknown",tool="work"} 1.0' in output
 
 
 @pytest.mark.parametrize(
@@ -87,6 +103,26 @@ def test_slack_notification_contains_no_tool_arguments() -> None:
     assert len(payloads) == 1
     assert "top-secret-password" not in payloads[0]["text"]
     assert "login" in payloads[0]["text"]
+
+
+def test_slack_notification_does_not_expose_policy_reason() -> None:
+    payloads: list[dict] = []
+    secret = "credential=prod-secret"
+    runtime = Runtime(
+        [
+            RuleMiddleware([Rule("deny", r"\bdeny\b", secret)]),
+            SlackNotificationMiddleware(payloads.append),
+        ]
+    )
+
+    @runtime.tool()
+    def work() -> bool:
+        return True
+
+    with pytest.raises(GovernanceDenied):
+        runtime.invoke("work", _governance=InvocationOptions(input_text="deny"))
+    assert secret not in payloads[0]["text"]
+    assert "reason=governance_denied" in payloads[0]["text"]
 
 
 def test_slack_default_does_not_notify_success() -> None:
