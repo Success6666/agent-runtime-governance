@@ -249,7 +249,8 @@ multi-host deployments.
 The 2026-07-26 release candidate was validated on Windows 11 with Python 3.12,
 Docker Engine 29.4.2, and Kind 0.31.0:
 
-- 251 tests passed with 83.68% branch coverage; the enforced floor is 80%;
+- 314 tests passed with 87.99% branch coverage; the enforced floor is 80%, and
+  Codecov reported 82.11% of the pull-request diff hit against an 80% target;
 - 13 repository-policy tests passed;
 - real OPA HTTP allow/deny, OTLP HTTP export to an OpenTelemetry Collector,
   Prometheus scraping, and a Kind 1.34.3 control-plane readiness check passed;
