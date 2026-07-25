@@ -26,9 +26,8 @@ latency, and peak traced memory for:
 
 The output also records mean and p50/p95/p99 admission wait latency while
 multiple tasks contend for a single FIFO runtime permit. The default zero-hold
-case yields once per owner to isolate admission handoff and scheduling from
-tool latency. This
-isolates bulkhead scheduling behavior from tool and middleware latency.
+case yields once per owner, isolating bulkhead scheduling behavior from tool
+and middleware latency.
 
 The v0.5 release evidence is committed as
 `results/v0.5.0-windows-python312.json`. Treat it as a regression baseline for

@@ -252,12 +252,12 @@ multi-host deployments.
 
 ### v0.5 pre-release verification record
 
-The 2026-07-26 release candidate was validated on Windows 11 with Python 3.12,
+The release candidate was validated on 2026-07-25 (UTC) on Windows 11 with Python 3.12,
 Docker Engine 29.4.2, and Kind 0.31.0:
 
-- 336 tests passed with 88.34% branch coverage on Python 3.12; the enforced floor
+- 345 tests passed with 88.45% branch coverage on Python 3.12; the enforced floor
   is 80%;
-- the same 336-test suite passed in clean Linux containers on Python 3.10.18
+- the same 345-test suite passed in clean Linux containers on Python 3.10.18
   and Python 3.13.5;
 - 13 repository-policy tests passed;
 - real OPA HTTP allow/deny, OTLP HTTP export to an OpenTelemetry Collector,

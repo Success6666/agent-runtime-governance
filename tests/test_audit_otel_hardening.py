@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import warnings
 from contextlib import contextmanager
 
 import pytest
@@ -28,7 +29,7 @@ from agent_runtime_governance.snapshots import (
     SnapshotMiddleware,
     SQLiteSnapshotStore,
 )
-from agent_runtime_governance.telemetry import OpenTelemetryMiddleware
+from agent_runtime_governance.telemetry import OpenTelemetryMiddleware, _set_status
 
 
 class RetryAuditSink:
@@ -419,6 +420,39 @@ class FakeSpan:
 
     def end(self) -> None:
         self.ended = True
+
+
+def test_opentelemetry_uses_status_types_exposed_by_injected_span() -> None:
+    class StatusCode:
+        OK = object()
+        ERROR = object()
+
+    class Status:
+        def __init__(self, code, description=None) -> None:
+            self.code = code
+            self.description = description
+
+    span = FakeSpan()
+    span.Status = Status
+    span.StatusCode = StatusCode
+
+    _set_status(span, "ERROR", "failed")
+
+    assert span.statuses[0].code is StatusCode.ERROR
+    assert span.statuses[0].description == "failed"
+
+
+def test_opentelemetry_warns_once_when_injected_status_types_are_missing(
+    monkeypatch,
+) -> None:
+    import agent_runtime_governance.telemetry as telemetry
+
+    monkeypatch.setattr(telemetry, "_STATUS_WARNING_EMITTED", False)
+    with pytest.warns(RuntimeWarning, match="terminal status was not exported"):
+        _set_status(FakeSpan(), "ERROR", "failed")
+    with warnings.catch_warnings(record=True) as repeated:
+        _set_status(FakeSpan(), "ERROR", "failed")
+    assert not repeated
 
 
 class FakeSpanManager:
