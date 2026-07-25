@@ -6,9 +6,7 @@ import json
 import shutil
 import subprocess
 import time
-from http.client import RemoteDisconnected
 from pathlib import Path
-from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 from prometheus_client import CollectorRegistry, start_http_server
@@ -259,7 +257,7 @@ def wait_http(url: str, *, expected_status: int, timeout: float = 30.0) -> None:
             with urlopen(request, timeout=2.0) as response:
                 if response.status == expected_status:
                     return
-        except (RemoteDisconnected, URLError):
+        except OSError:
             time.sleep(0.25)
     raise TimeoutError(f"timed out waiting for {url}")
 
