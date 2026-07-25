@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-runtime-governance"
+version = "0.1.0"
+description = "Framework-agnostic runtime governance for AI agents."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Li Zhengda" }]
+keywords = ["agents", "runtime", "governance", "audit", "approval", "replay"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2",
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+]
+langgraph = ["langgraph>=0.2"]
+
+[project.urls]
+Homepage = "https://github.com/Success6666/agent-runtime-governance"
+Repository = "https://github.com/Success6666/agent-runtime-governance"
+Issues = "https://github.com/Success6666/agent-runtime-governance/issues"
+
+[tool.setuptools.packages.find]
+include = ["agent_runtime_governance*"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["agent_runtime_governance"]
+
