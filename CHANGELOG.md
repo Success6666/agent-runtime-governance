@@ -45,6 +45,16 @@ All notable changes are documented here.
   avoiding startup lock races while retaining normal concurrent access.
 - Cancellation context recovery now works across Python 3.10-3.13 without
   relying on version-specific `CancelledError` attribute preservation.
+- Approval reservations that expire locally now deny at the execution boundary
+  instead of allowing a request without an authoritative store commit.
+- Idempotency ledger operations now have a dedicated timeout and capacity
+  boundary; overrunning adapters fail closed without unbounded executor queues.
+- Failures while settling an already-denied idempotent request preserve the
+  monotonic denial instead of raising a context mutation error.
+- Context serialization rejects non-string mapping keys and deterministically
+  handles heterogeneous sets without silently changing approval payloads.
+- Injected OpenTelemetry tracers can expose compatible status types directly;
+  otherwise a one-time warning makes terminal-status degradation visible.
 
 ### Changed
 

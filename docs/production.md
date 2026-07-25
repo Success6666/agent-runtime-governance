@@ -34,6 +34,12 @@ cancellation cannot stop arbitrary synchronous Python or an already dispatched
 external side effect. When a mutating operation may have started, the terminal
 state is `UNKNOWN`.
 
+Custom idempotency stores must bound every lock, network, and database wait so
+each method returns within `RuntimeLimits.idempotency_operation_timeout_seconds`.
+The runtime also applies that boundary and permanently fails closed for new
+idempotent work after an overrun, because Python cannot safely terminate a
+blocked worker thread. Restart only after diagnosing or replacing the adapter.
+
 Call `get_cancellation_context(error)` in a `CancelledError` handler to recover
 the finalized governance state on every supported Python version. Python 3.10
 re-materializes task cancellation exceptions and therefore cannot guarantee
@@ -64,6 +70,11 @@ Verification proves tampering or truncation only when the chain anchor and key
 are protected separately. Back up databases, chain state, and keys according to
 the same recovery point objective. Test restore and `verify()` before every
 release that changes persistence code.
+
+Configure `sign_key` for snapshot stores when tamper evidence is required. In
+unsigned mode the snapshot sequence state uses only a recomputable
+`state_hash`; anyone able to rewrite the state file can forge it, so unsigned
+state must not be treated as tamper-proof.
 
 Redaction is enabled by default for request text, tool arguments, results,
 errors, decision reasons, and known secret keys. Add domain-specific sensitive
@@ -98,8 +109,11 @@ python -m venv /tmp/arg-dependency-audit
 /tmp/arg-dependency-audit/bin/python -m pip install ".[otel,yaml,prometheus]"
 python -m venv /tmp/arg-pip-audit-tool
 /tmp/arg-pip-audit-tool/bin/python -m pip install "pip-audit==2.10.1"
-/tmp/arg-pip-audit-tool/bin/pip-audit \
-  --path /tmp/arg-dependency-audit/lib/python3.13/site-packages
+AUDIT_SITE_PACKAGES=$(
+  /tmp/arg-dependency-audit/bin/python -c \
+    'import sysconfig; print(sysconfig.get_paths()["purelib"])'
+)
+/tmp/arg-pip-audit-tool/bin/pip-audit --path "$AUDIT_SITE_PACKAGES"
 python integration/production_smoke.py --skip-kind
 python integration/production_smoke.py
 python -m build

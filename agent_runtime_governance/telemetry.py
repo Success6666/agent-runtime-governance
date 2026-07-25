@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import threading
+import warnings
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from .context import ExecutionContext, ExecutionStatus, HistoryEntry
 from .middleware.base import ObservingMiddleware
+
+_STATUS_WARNING_LOCK = threading.Lock()
+_STATUS_WARNING_EMITTED = False
 
 
 class Span(Protocol):
@@ -87,6 +91,12 @@ class OpenTelemetryMiddleware(ObservingMiddleware):
                 Status = StatusCode = None  # type: ignore[assignment]
             self._status_cls = Status
             self._status_code_cls = StatusCode
+        self._status_cls = self._status_cls or _exposed_type(
+            tracer, "Status", "status_cls"
+        )
+        self._status_code_cls = self._status_code_cls or _exposed_type(
+            tracer, "StatusCode", "status_code_cls"
+        )
         self._tracer = tracer
         self._parent_context = parent_context
         self._spans: dict[str, _SpanHandle] = {}
@@ -216,8 +226,10 @@ class OpenTelemetryMiddleware(ObservingMiddleware):
         return _SpanHandle(
             span=span,
             manager=manager,
-            status_cls=self._status_cls,
-            status_code_cls=self._status_code_cls,
+            status_cls=self._status_cls
+            or _exposed_type(span, "Status", "status_cls"),
+            status_code_cls=self._status_code_cls
+            or _exposed_type(span, "StatusCode", "status_code_cls"),
         )
 
 
@@ -266,13 +278,43 @@ def _set_status(
     status_code_cls: Any = None,
 ) -> None:
     setter = getattr(span, "set_status", None)
-    if not callable(setter) or status_cls is None or status_code_cls is None:
+    if not callable(setter):
+        return
+    status_cls = status_cls or _exposed_type(span, "Status", "status_cls")
+    status_code_cls = status_code_cls or _exposed_type(
+        span, "StatusCode", "status_code_cls"
+    )
+    if status_cls is None or status_code_cls is None:
+        _warn_missing_status_types_once()
         return
     code = status_code_cls.OK if code_name == "OK" else status_code_cls.ERROR
     setter(
         status_cls(code)
         if code is status_code_cls.OK
         else status_cls(code, description=description)
+    )
+
+
+def _exposed_type(owner: Any, *names: str) -> Any:
+    for candidate in (owner, type(owner)):
+        for name in names:
+            value = getattr(candidate, name, None)
+            if value is not None:
+                return value
+    return None
+
+
+def _warn_missing_status_types_once() -> None:
+    global _STATUS_WARNING_EMITTED
+    with _STATUS_WARNING_LOCK:
+        if _STATUS_WARNING_EMITTED:
+            return
+        _STATUS_WARNING_EMITTED = True
+    warnings.warn(
+        "injected OpenTelemetry span exposes set_status but no compatible "
+        "Status and StatusCode types; terminal status was not exported",
+        RuntimeWarning,
+        stacklevel=3,
     )
 
 
