@@ -201,6 +201,7 @@ class JSONLSnapshotStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = FileLock(str(self.path) + ".lock", timeout=lock_timeout)
+        self._state_path = Path(str(self.path) + ".state")
         self._codec = _SnapshotCodec(
             sign_key=sign_key,
             redact=redact_sensitive,
@@ -211,18 +212,17 @@ class JSONLSnapshotStore:
 
     def write(self, snapshot: ContextSnapshot) -> None:
         with self._lock:
-            snapshots = self._read_all_unlocked()
-            if any(
-                item.trace_id == snapshot.trace_id and item.sequence == snapshot.sequence
-                for item in snapshots
-            ):
+            state = self._load_sequence_state_unlocked()
+            last_sequence = int(state["sequences"].get(snapshot.trace_id, -1))
+            if snapshot.sequence <= last_sequence:
                 snapshot = replace(
                     snapshot,
-                    sequence=_next_sequence(
-                        item for item in snapshots if item.trace_id == snapshot.trace_id
-                    ),
+                    sequence=last_sequence + 1,
                 )
-            self._append_unlocked(snapshot)
+            file_size = self._append_unlocked(snapshot)
+            state["sequences"][snapshot.trace_id] = snapshot.sequence
+            state["file_size"] = file_size
+            self._write_sequence_state_unlocked(state)
 
     def write_context(
         self,
@@ -235,8 +235,8 @@ class JSONLSnapshotStore:
         policy_digest: str | None,
     ) -> ContextSnapshot:
         with self._lock:
-            snapshots = self._read_all_unlocked()
-            sequence = _next_sequence(item for item in snapshots if item.trace_id == trace_id)
+            state = self._load_sequence_state_unlocked()
+            sequence = int(state["sequences"].get(trace_id, -1)) + 1
             context = _context_with_sequence(context, stage, sequence)
             snapshot = ContextSnapshot(
                 trace_id=trace_id,
@@ -247,7 +247,10 @@ class JSONLSnapshotStore:
                 policy_version=policy_version,
                 policy_digest=policy_digest,
             )
-            self._append_unlocked(snapshot)
+            file_size = self._append_unlocked(snapshot)
+            state["sequences"][trace_id] = sequence
+            state["file_size"] = file_size
+            self._write_sequence_state_unlocked(state)
             return snapshot
 
     def read_trace(self, trace_id: str) -> tuple[ContextSnapshot, ...]:
@@ -257,7 +260,7 @@ class JSONLSnapshotStore:
             ]
         return tuple(sorted(snapshots, key=lambda item: item.sequence))
 
-    def _append_unlocked(self, snapshot: ContextSnapshot) -> None:
+    def _append_unlocked(self, snapshot: ContextSnapshot) -> int:
         line = json.dumps(
             self._codec.encode(snapshot),
             ensure_ascii=True,
@@ -268,6 +271,110 @@ class JSONLSnapshotStore:
             stream.write(line + "\n")
             stream.flush()
             os.fsync(stream.fileno())
+        return self.path.stat().st_size
+
+    def _load_sequence_state_unlocked(self) -> dict[str, Any]:
+        actual_size = self.path.stat().st_size if self.path.exists() else 0
+        if not self._state_path.exists():
+            if actual_size == 0:
+                return {"schema_version": 1, "file_size": 0, "sequences": {}}
+            return self._rebuild_sequence_state_unlocked(actual_size)
+        try:
+            raw = json.loads(self._state_path.read_text(encoding="utf-8"))
+            state = self._verify_sequence_state(raw)
+        except AuditIntegrityError:
+            raise
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise AuditIntegrityError("invalid snapshot state file") from exc
+        recorded_size = int(state["file_size"])
+        if actual_size < recorded_size:
+            raise AuditIntegrityError("snapshot log was truncated")
+        if actual_size > recorded_size:
+            return self._rebuild_sequence_state_unlocked(actual_size)
+        return state
+
+    def _rebuild_sequence_state_unlocked(
+        self, actual_size: int
+    ) -> dict[str, Any]:
+        sequences: dict[str, int] = {}
+        for snapshot in self._read_all_unlocked():
+            previous = sequences.get(snapshot.trace_id, -1)
+            if snapshot.sequence <= previous:
+                raise AuditIntegrityError(
+                    f"snapshot sequence is not increasing for trace {snapshot.trace_id!r}"
+                )
+            sequences[snapshot.trace_id] = snapshot.sequence
+        state: dict[str, Any] = {
+            "schema_version": 1,
+            "file_size": actual_size,
+            "sequences": sequences,
+        }
+        self._write_sequence_state_unlocked(state)
+        return state
+
+    def _verify_sequence_state(self, raw: Any) -> dict[str, Any]:
+        if not isinstance(raw, dict):
+            raise AuditIntegrityError("snapshot state must be an object")
+        payload = dict(raw)
+        signature = payload.pop("state_signature", None)
+        recorded_hash = payload.pop("state_hash", None)
+        expected_hash = _snapshot_hash(payload)
+        if not isinstance(recorded_hash, str) or not hmac.compare_digest(
+            recorded_hash, expected_hash
+        ):
+            raise AuditIntegrityError("invalid snapshot state hash")
+        if self._codec.key is not None:
+            expected_signature = _snapshot_signature(
+                {**payload, "state_hash": recorded_hash},
+                self._codec.key,
+            )
+            if not isinstance(signature, str) or not hmac.compare_digest(
+                signature, expected_signature
+            ):
+                raise AuditIntegrityError("invalid snapshot state signature")
+        if payload.get("schema_version") != 1:
+            raise AuditIntegrityError("unsupported snapshot state schema")
+        file_size = payload.get("file_size")
+        sequences = payload.get("sequences")
+        if not isinstance(file_size, int) or isinstance(file_size, bool) or file_size < 0:
+            raise AuditIntegrityError("snapshot state file size is invalid")
+        if not isinstance(sequences, dict) or any(
+            not isinstance(trace_id, str)
+            or not trace_id
+            or not isinstance(sequence, int)
+            or isinstance(sequence, bool)
+            or sequence < 0
+            for trace_id, sequence in sequences.items()
+        ):
+            raise AuditIntegrityError("snapshot state sequences are invalid")
+        return payload
+
+    def _write_sequence_state_unlocked(self, state: Mapping[str, Any]) -> None:
+        payload = dict(state)
+        payload["sequences"] = dict(state["sequences"])
+        payload["state_hash"] = _snapshot_hash(payload)
+        if self._codec.key is not None:
+            payload["state_signature"] = _snapshot_signature(payload, self._codec.key)
+        temporary = self._state_path.with_name(
+            f"{self._state_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+                stream.write(
+                    json.dumps(
+                        payload,
+                        ensure_ascii=True,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self._state_path)
+            _fsync_directory(self._state_path.parent)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _read_all_unlocked(self) -> list[ContextSnapshot]:
         if not self.path.exists():
@@ -542,3 +649,13 @@ def _snapshot_signature(payload: Mapping[str, Any], key: bytes) -> str:
         payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     return hmac.new(key, encoded, hashlib.sha256).hexdigest()
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)

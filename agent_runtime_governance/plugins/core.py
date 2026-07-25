@@ -43,6 +43,7 @@ class RuntimeBuilder:
         require_verified_identity: bool = False,
         limits: RuntimeLimits | None = None,
         sync_executor: Executor | None = None,
+        idempotency_executor: Executor | None = None,
     ) -> None:
         self._middlewares: list[Middleware] = []
         self._hooks: list[tuple[HookPoint, HookCallback, bool]] = []
@@ -55,6 +56,7 @@ class RuntimeBuilder:
             "require_verified_identity": require_verified_identity,
             "limits": limits,
             "sync_executor": sync_executor,
+            "idempotency_executor": idempotency_executor,
         }
 
     def with_identity(
@@ -79,6 +81,10 @@ class RuntimeBuilder:
 
     def with_sync_executor(self, executor: Executor) -> "RuntimeBuilder":
         self._runtime_options["sync_executor"] = executor
+        return self
+
+    def with_idempotency_executor(self, executor: Executor) -> "RuntimeBuilder":
+        self._runtime_options["idempotency_executor"] = executor
         return self
 
     def add_middleware(self, middleware: Middleware) -> "RuntimeBuilder":

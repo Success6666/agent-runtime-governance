@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from enum import Enum, IntEnum
 
 import pytest
 
@@ -10,6 +11,7 @@ from agent_runtime_governance.contracts import (
     bind_arguments,
     canonical_json_bytes,
     materialize_call,
+    normalize_json,
     validate_instance,
 )
 from agent_runtime_governance.errors import ContractValidationError, RegistryError
@@ -17,9 +19,27 @@ from agent_runtime_governance.registry import (
     IdempotencyConflictError,
     IdempotencyInProgressError,
     IdempotencyOutcomeUnknownError,
+    InMemoryIdempotencyStore,
     SQLiteIdempotencyStore,
     ToolSpec,
 )
+
+
+class IntegerCode(IntEnum):
+    OK = 1
+
+
+class TextCode(str, Enum):
+    OK = "ok"
+
+
+def test_primitive_backed_enums_normalize_to_scalar_values() -> None:
+    normalized = normalize_json(
+        {"integer": IntegerCode.OK, "text": TextCode.OK}
+    )
+    assert normalized == {"integer": 1, "text": "ok"}
+    assert type(normalized["integer"]) is int
+    assert type(normalized["text"]) is str
 
 
 def test_json_schema_is_checked_at_registration() -> None:
@@ -105,6 +125,43 @@ def test_canonicalization_never_calls_untrusted_repr() -> None:
 
     with pytest.raises(ContractValidationError, match="unsupported value type"):
         canonical_json_bytes({"secret": Secret()}, label="parameters")
+
+
+def test_in_memory_idempotency_evicts_terminal_entries_by_lru() -> None:
+    store = InMemoryIdempotencyStore(
+        max_completed_entries=2,
+        completed_ttl_seconds=60,
+    )
+    first = store.acquire("tenant/tool", "first", "a" * 64)
+    second = store.acquire("tenant/tool", "second", "b" * 64)
+    store.complete(first, 1)
+    store.complete(second, 2)
+
+    assert store.acquire("tenant/tool", "first", "a" * 64).future.result() == 1
+    third = store.acquire("tenant/tool", "third", "c" * 64)
+    store.complete(third, 3)
+
+    assert store.acquire("tenant/tool", "first", "a" * 64).owner is False
+    assert store.acquire("tenant/tool", "second", "b" * 64).owner is True
+
+
+def test_in_memory_idempotency_evicts_terminal_entries_after_idle_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = {"value": 100.0}
+    monkeypatch.setattr(
+        "agent_runtime_governance.registry.monotonic",
+        lambda: clock["value"],
+    )
+    store = InMemoryIdempotencyStore(completed_ttl_seconds=5)
+    claim = store.acquire("tenant/tool", "request", "a" * 64)
+    store.mark_unknown(claim, RuntimeError("uncertain"))
+    retained = store.acquire("tenant/tool", "request", "a" * 64)
+    with pytest.raises(IdempotencyOutcomeUnknownError):
+        retained.future.result()
+
+    clock["value"] += 6
+    assert store.acquire("tenant/tool", "request", "a" * 64).owner is True
 
 
 def test_sqlite_idempotency_survives_restart(tmp_path) -> None:

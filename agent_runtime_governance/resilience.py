@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -129,18 +130,90 @@ class RuntimeBulkhead:
     def __init__(self, capacity: int) -> None:
         if capacity < 1:
             raise ValueError("capacity must be at least one")
-        self._semaphore = threading.BoundedSemaphore(capacity)
+        self._capacity = capacity
+        self._available = capacity
+        self._lock = threading.Lock()
+        self._waiters: deque[_BulkheadWaiter] = deque()
 
     async def acquire(self, timeout_seconds: float) -> "BulkheadLease":
-        deadline = monotonic() + timeout_seconds
-        while not self._semaphore.acquire(blocking=False):
-            remaining = deadline - monotonic()
-            if remaining <= 0:
-                raise CapacityExceededError(
-                    f"runtime capacity was not available within {timeout_seconds:.3f}s"
-                )
-            await asyncio.sleep(min(0.01, remaining))
-        return BulkheadLease(self._semaphore)
+        if timeout_seconds <= 0:
+            raise CapacityExceededError(
+                f"runtime capacity was not available within {timeout_seconds:.3f}s"
+            )
+        loop = asyncio.get_running_loop()
+        waiter = _BulkheadWaiter(loop=loop, future=loop.create_future())
+        if self._acquire_or_enqueue(waiter):
+            return BulkheadLease(self._release)
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(waiter.future),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            self._withdraw(waiter, state="timed_out")
+            raise CapacityExceededError(
+                f"runtime capacity was not available within {timeout_seconds:.3f}s"
+            ) from exc
+        except BaseException:
+            self._withdraw(waiter, state="cancelled")
+            raise
+        return BulkheadLease(self._release)
+
+    def _acquire_or_enqueue(self, waiter: "_BulkheadWaiter") -> bool:
+        with self._lock:
+            if self._available <= 0 or self._waiters:
+                self._waiters.append(waiter)
+                return False
+            self._available -= 1
+            waiter.state = "granted"
+            return True
+
+    def _withdraw(self, waiter: "_BulkheadWaiter", *, state: str) -> None:
+        with self._lock:
+            if waiter.state == "waiting":
+                try:
+                    self._waiters.remove(waiter)
+                except ValueError:
+                    pass
+            elif waiter.state == "granted":
+                self._available += 1
+            else:
+                return
+            waiter.state = state
+            if not waiter.future.done():
+                waiter.future.cancel()
+            self._grant_next_locked()
+
+    def _release(self) -> None:
+        with self._lock:
+            if self._available >= self._capacity:
+                raise RuntimeError("bulkhead permit released too many times")
+            self._available += 1
+            self._grant_next_locked()
+
+    def _grant_next_locked(self) -> None:
+        while self._available > 0 and self._waiters:
+            waiter = self._waiters.popleft()
+            if waiter.state != "waiting":
+                continue
+            waiter.state = "granted"
+            self._available -= 1
+            try:
+                waiter.loop.call_soon_threadsafe(self._deliver, waiter)
+            except RuntimeError:
+                waiter.state = "cancelled"
+                self._available += 1
+
+    def _deliver(self, waiter: "_BulkheadWaiter") -> None:
+        with self._lock:
+            if waiter.state != "granted":
+                return
+            if waiter.future.done():
+                waiter.state = "cancelled"
+                self._available += 1
+                self._grant_next_locked()
+                return
+            waiter.future.set_result(None)
 
     @asynccontextmanager
     async def slot(self, timeout_seconds: float) -> AsyncIterator[None]:
@@ -154,8 +227,8 @@ class RuntimeBulkhead:
 class BulkheadLease:
     """An idempotently releasable capacity reservation."""
 
-    def __init__(self, semaphore: threading.BoundedSemaphore) -> None:
-        self._semaphore = semaphore
+    def __init__(self, release_callback: Callable[[], None]) -> None:
+        self._release_callback = release_callback
         self._released = False
         self._lock = threading.Lock()
 
@@ -164,7 +237,14 @@ class BulkheadLease:
             if self._released:
                 return
             self._released = True
-            self._semaphore.release()
+            self._release_callback()
+
+
+@dataclass(slots=True)
+class _BulkheadWaiter:
+    loop: asyncio.AbstractEventLoop
+    future: asyncio.Future[None]
+    state: str = "waiting"
 
 
 async def await_stage(

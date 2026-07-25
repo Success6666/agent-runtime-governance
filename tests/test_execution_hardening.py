@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -29,6 +31,11 @@ from agent_runtime_governance.errors import (
 from agent_runtime_governance.hooks import HookPoint
 from agent_runtime_governance.resilience import StageTimeoutError, await_stage
 
+LEASE_TIMING_SCALE = max(
+    1.0,
+    float(os.environ.get("ARG_TEST_LEASE_TIMING_SCALE", "4.0")),
+)
+
 
 class SlowAcquireStore(InMemoryIdempotencyStore):
     def __init__(self) -> None:
@@ -46,6 +53,33 @@ class SlowAcquireStore(InMemoryIdempotencyStore):
         self.marked_unknown.set()
 
 
+class ThreadRecordingStore(InMemoryIdempotencyStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.acquire_thread: str | None = None
+
+    def acquire(self, namespace: str, key: str, fingerprint: str):
+        self.acquire_thread = threading.current_thread().name
+        return super().acquire(namespace, key, fingerprint)
+
+
+@pytest.mark.asyncio
+async def test_idempotency_bookkeeping_uses_dedicated_executor() -> None:
+    store = ThreadRecordingStore()
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="user-tool") as tools:
+        runtime = Runtime(idempotency_store=store, sync_executor=tools)
+
+        @runtime.tool(execution_mode=ExecutionMode.IDEMPOTENT)
+        async def update() -> str:
+            return "ok"
+
+        assert await update.ainvoke(
+            _governance=InvocationOptions(idempotency_key="request-1")
+        ) == "ok"
+        assert store.acquire_thread is not None
+        assert store.acquire_thread.startswith("arg-idempotency")
+        runtime.close()
+
 class FailingCompletionStore(InMemoryIdempotencyStore):
     def complete(self, claim, result) -> None:
         raise OSError("idempotency database unavailable")
@@ -62,7 +96,7 @@ class FailingRenewalStore(InMemoryIdempotencyStore):
                 claim.owner,
                 claim.future,
                 "renewal-owner",
-                0.03,
+                0.03 * LEASE_TIMING_SCALE,
             )
         return claim
 
@@ -584,7 +618,7 @@ async def test_sqlite_idempotency_lease_is_renewed_during_long_execution(
 ) -> None:
     store = SQLiteIdempotencyStore(
         tmp_path / "leases.db",
-        lease_seconds=0.06,
+        lease_seconds=0.06 * LEASE_TIMING_SCALE,
     )
     runtime = Runtime(idempotency_store=store)
     started = asyncio.Event()
@@ -592,13 +626,13 @@ async def test_sqlite_idempotency_lease_is_renewed_during_long_execution(
     @runtime.tool(execution_mode=ExecutionMode.IDEMPOTENT)
     async def write() -> str:
         started.set()
-        await asyncio.sleep(0.16)
+        await asyncio.sleep(0.16 * LEASE_TIMING_SCALE)
         return "ok"
 
     options = InvocationOptions(idempotency_key="long-operation")
     owner = asyncio.create_task(write.ainvoke(_governance=options))
     await started.wait()
-    await asyncio.sleep(0.09)
+    await asyncio.sleep(0.09 * LEASE_TIMING_SCALE)
     with pytest.raises(ToolExecutionError) as caught:
         await write.ainvoke(_governance=options)
     assert caught.value.context.status is ExecutionStatus.UNKNOWN
@@ -627,7 +661,7 @@ async def test_idempotency_renewal_failure_reports_unknown() -> None:
 
     @runtime.tool(execution_mode=ExecutionMode.IDEMPOTENT)
     async def write() -> str:
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.05 * LEASE_TIMING_SCALE)
         return "committed"
 
     with pytest.raises(ToolExecutionError) as caught:

@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from collections import OrderedDict
 from concurrent.futures import Future
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
+from time import monotonic
 from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
@@ -111,10 +113,27 @@ class _IdempotencyEntry:
 
 
 class InMemoryIdempotencyStore:
-    """Thread-safe process-local idempotency coordination and success cache."""
+    """Thread-safe process-local coordination with a bounded terminal cache.
 
-    def __init__(self) -> None:
+    Completed and unknown outcomes are retained with idle-TTL and LRU bounds.
+    In-flight claims are never evicted. Use :class:`SQLiteIdempotencyStore` when
+    outcomes must survive process restarts or cache eviction.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_completed_entries: int = 10_000,
+        completed_ttl_seconds: float = 3_600.0,
+    ) -> None:
+        if max_completed_entries < 1:
+            raise ValueError("max_completed_entries must be at least one")
+        if completed_ttl_seconds <= 0:
+            raise ValueError("completed_ttl_seconds must be positive")
+        self.max_completed_entries = max_completed_entries
+        self.completed_ttl_seconds = completed_ttl_seconds
         self._entries: dict[tuple[str, str], _IdempotencyEntry] = {}
+        self._completed: OrderedDict[tuple[str, str], float] = OrderedDict()
         self._lock = Lock()
 
     def acquire(
@@ -122,6 +141,7 @@ class InMemoryIdempotencyStore:
     ) -> IdempotencyClaim:
         storage_key = (namespace, key)
         with self._lock:
+            self._evict_completed(monotonic())
             entry = self._entries.get(storage_key)
             if entry is None:
                 entry = _IdempotencyEntry(fingerprint, Future())
@@ -131,6 +151,8 @@ class InMemoryIdempotencyStore:
                 raise IdempotencyConflictError(
                     "idempotency key was already used with different parameters"
                 )
+            if entry.future.done():
+                self._remember_completed(storage_key, monotonic())
             return IdempotencyClaim(namespace, key, fingerprint, False, entry.future)
 
     def complete(self, claim: IdempotencyClaim, result: Any) -> None:
@@ -139,6 +161,8 @@ class InMemoryIdempotencyStore:
         with self._lock:
             if not claim.future.done():
                 claim.future.set_result(_clone_json(result))
+            self._remember_completed((claim.namespace, claim.key), monotonic())
+            self._evict_completed(monotonic())
 
     def fail(self, claim: IdempotencyClaim, error: BaseException) -> None:
         if not claim.owner:
@@ -148,6 +172,7 @@ class InMemoryIdempotencyStore:
             entry = self._entries.get(storage_key)
             if entry is not None and entry.future is claim.future:
                 self._entries.pop(storage_key)
+                self._completed.pop(storage_key, None)
             if not claim.future.done():
                 claim.future.set_exception(error)
                 claim.future.exception()
@@ -159,10 +184,32 @@ class InMemoryIdempotencyStore:
             if not claim.future.done():
                 claim.future.set_exception(IdempotencyOutcomeUnknownError(str(error)))
                 claim.future.exception()
+            self._remember_completed((claim.namespace, claim.key), monotonic())
+            self._evict_completed(monotonic())
 
     def renew(self, claim: IdempotencyClaim) -> None:
         if not claim.owner:
             raise RuntimeError("only an idempotency owner can renew a claim")
+
+    def _remember_completed(
+        self, storage_key: tuple[str, str], now: float
+    ) -> None:
+        self._completed[storage_key] = now
+        self._completed.move_to_end(storage_key)
+
+    def _evict_completed(self, now: float) -> None:
+        cutoff = now - self.completed_ttl_seconds
+        while self._completed:
+            storage_key, touched_at = next(iter(self._completed.items()))
+            if (
+                touched_at > cutoff
+                and len(self._completed) <= self.max_completed_entries
+            ):
+                break
+            self._completed.popitem(last=False)
+            entry = self._entries.get(storage_key)
+            if entry is not None and entry.future.done():
+                self._entries.pop(storage_key, None)
 
 
 class SQLiteIdempotencyStore:

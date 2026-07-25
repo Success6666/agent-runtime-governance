@@ -8,6 +8,7 @@ from contextlib import ExitStack, contextmanager
 from contextvars import copy_context
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import partial
 from time import perf_counter
 from typing import Any, Callable, Iterable, Mapping, ParamSpec, TypeVar
 
@@ -54,7 +55,13 @@ from .registry import (
     ToolRegistry,
     ToolSpec,
 )
-from .resilience import RuntimeBulkhead, RuntimeLimits, StageTimeoutError, await_stage
+from .resilience import (
+    CapacityExceededError,
+    RuntimeBulkhead,
+    RuntimeLimits,
+    StageTimeoutError,
+    await_stage,
+)
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -104,6 +111,7 @@ class Runtime:
         require_verified_identity: bool = False,
         limits: RuntimeLimits | None = None,
         sync_executor: Executor | None = None,
+        idempotency_executor: Executor | None = None,
     ) -> None:
         self.pipeline = pipeline if isinstance(pipeline, Pipeline) else Pipeline(pipeline)
         self.hooks = hooks or HookRegistry()
@@ -120,11 +128,18 @@ class Runtime:
             max_workers=self.limits.max_in_flight,
             thread_name_prefix="arg-tool",
         )
+        self._owns_idempotency_executor = idempotency_executor is None
+        self._idempotency_executor = idempotency_executor or ThreadPoolExecutor(
+            max_workers=min(4, self.limits.max_in_flight),
+            thread_name_prefix="arg-idempotency",
+        )
         self._closed = False
 
     def close(self, *, wait: bool = True) -> None:
         """Stop accepting work and release the owned synchronous executor."""
         self._closed = True
+        if self._owns_idempotency_executor:
+            self._idempotency_executor.shutdown(wait=wait, cancel_futures=True)
         if self._owns_sync_executor:
             self._sync_executor.shutdown(wait=wait, cancel_futures=True)
 
@@ -223,13 +238,24 @@ class Runtime:
         if self._closed:
             raise RuntimeError("runtime is closed")
         options = _governance or InvocationOptions()
-        admission_timeout = self._bounded_timeout(
-            options.deadline, self.limits.admission_timeout_seconds, "admission"
-        )
-        async with self._bulkhead.slot(admission_timeout):
-            return await self._arun_admitted(
-                name, *args, _governance=options, **kwargs
+        spec = self.registry.get(name)
+        try:
+            admission_timeout = self._bounded_timeout(
+                options.deadline, self.limits.admission_timeout_seconds, "admission"
             )
+            async with self._bulkhead.slot(admission_timeout):
+                return await self._arun_admitted(
+                    name, *args, _governance=options, **kwargs
+                )
+        except (CapacityExceededError, StageTimeoutError) as exc:
+            await self._record_admission_failure(
+                spec,
+                args,
+                kwargs,
+                options,
+                exc,
+            )
+            raise
 
     async def _arun_admitted(
         self,
@@ -660,6 +686,87 @@ class Runtime:
             )
         )
 
+    async def _record_admission_failure(
+        self,
+        spec: ToolSpec[Any, Any],
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        options: InvocationOptions,
+        error: CapacityExceededError | StageTimeoutError,
+    ) -> None:
+        metadata = {
+            key: value
+            for key, value in (options.metadata or {}).items()
+            if key
+            not in {
+                "identity_verified",
+                "identity_error",
+                "identity_issuer",
+                "identity_subject",
+                "identity_source",
+                "identity_verified_at",
+            }
+        }
+        identity_pending = self.identity_provider is not None or self.require_verified_identity
+        if identity_pending:
+            metadata.update(
+                {
+                    "identity_verified": False,
+                    "identity_error": "request rejected before identity verification",
+                }
+            )
+        reason = (
+            "capacity_exceeded"
+            if isinstance(error, CapacityExceededError)
+            else "deadline_exceeded"
+        )
+        context = ExecutionContext.create(
+            ToolCall(name=spec.name, args=args, kwargs=kwargs),
+            input_text=options.input_text,
+            request_id=options.request_id,
+            user=None if identity_pending else options.user,
+            tenant=None if identity_pending else options.tenant,
+            permissions=frozenset() if identity_pending else options.permissions,
+            task_id=options.task_id,
+            conversation_id=options.conversation_id,
+            execution_mode=spec.execution_mode,
+            idempotency_key=options.idempotency_key,
+            deadline=options.deadline,
+            risk_tier=spec.risk,
+            requires_approval=spec.requires_approval,
+            metadata=metadata,
+        ).evolve(
+            status=ExecutionStatus.FAILED,
+            error=f"{type(error).__name__}: {error}",
+        )
+        context = context.append_history(
+            HistoryEntry(
+                "admission",
+                "reject",
+                reason,
+                data={"error_type": type(error).__name__},
+            )
+        )
+        for middleware in self.pipeline:
+            if middleware.kind is not MiddlewareKind.OBSERVING:
+                continue
+            recorder = getattr(middleware, "record_external_failure", None)
+            if not callable(recorder):
+                continue
+            try:
+                recorder("admission", outcome="reject", reason=reason)
+            except Exception:
+                continue
+        try:
+            context = await self._run_observers(
+                context,
+                post=True,
+                ignore_deadline=True,
+            )
+        except AuditDeliveryError as audit_error:
+            context = audit_error.context
+        error.context = context
+
     async def _verify_identity(
         self, options: InvocationOptions
     ) -> tuple[VerifiedPrincipal | None, str | None]:
@@ -857,7 +964,7 @@ class Runtime:
         fingerprint: str,
         deadline: datetime | None,
     ) -> IdempotencyClaim:
-        future = self._sync_executor.submit(
+        future = self._idempotency_executor.submit(
             self.idempotency_store.acquire,
             namespace,
             key,
@@ -902,11 +1009,16 @@ class Runtime:
         except BaseException:
             pass
 
-    @staticmethod
     async def _run_critical_store_operation(
-        function: Callable[..., Any], *args: Any
+        self, function: Callable[..., Any], *args: Any
     ) -> Any:
-        task = asyncio.create_task(asyncio.to_thread(function, *args))
+        loop = asyncio.get_running_loop()
+        task = asyncio.ensure_future(
+            loop.run_in_executor(
+                self._idempotency_executor,
+                partial(function, *args),
+            )
+        )
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
@@ -945,7 +1057,10 @@ class Runtime:
             interval = max(0.001, min(30.0, claim.lease_seconds / 3))
             while True:
                 await asyncio.sleep(interval)
-                await asyncio.to_thread(self.idempotency_store.renew, claim)
+                await self._run_critical_store_operation(
+                    self.idempotency_store.renew,
+                    claim,
+                )
 
         return asyncio.create_task(
             heartbeat(),

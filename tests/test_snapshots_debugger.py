@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
+import pytest
+
 from agent_runtime_governance import (
     InMemorySnapshotStore,
     JSONLSnapshotStore,
@@ -9,6 +13,7 @@ from agent_runtime_governance import (
     diff_values,
     trace_to_mermaid,
 )
+from agent_runtime_governance.errors import AuditIntegrityError
 
 
 def run_with_snapshots(store):
@@ -38,6 +43,65 @@ def test_jsonl_snapshot_store_round_trip(tmp_path) -> None:
     restored = store.read_trace(result.context.trace_id)
     assert len(restored) == 2
     assert restored[-1].context.to_dict() == result.context.to_dict()
+
+
+def test_jsonl_snapshot_append_uses_durable_sequence_state(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "snapshots.jsonl"
+    store = JSONLSnapshotStore(path, redact_sensitive=False)
+    run_with_snapshots(store)
+
+    def unexpected_scan():
+        raise AssertionError("steady-state append must not rescan the JSONL file")
+
+    monkeypatch.setattr(store, "_read_all_unlocked", unexpected_scan)
+    run_with_snapshots(store)
+    assert path.with_name(path.name + ".state").exists()
+
+
+def test_jsonl_snapshot_state_recovers_forward_after_interrupted_commit(
+    tmp_path,
+) -> None:
+    path = tmp_path / "snapshots.jsonl"
+    store = JSONLSnapshotStore(path, redact_sensitive=False)
+    result = run_with_snapshots(store)
+    state_path = path.with_name(path.name + ".state")
+    state_path.unlink()
+
+    restarted = JSONLSnapshotStore(path, redact_sensitive=False)
+    snapshot = restarted.write_context(
+        trace_id=result.context.trace_id,
+        stage="recovered",
+        context=result.context,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        policy_version=None,
+        policy_digest=None,
+    )
+    assert snapshot.sequence == 2
+    assert [item.sequence for item in restarted.read_trace(result.context.trace_id)] == [
+        0,
+        1,
+        2,
+    ]
+
+
+def test_jsonl_snapshot_state_rejects_log_truncation(tmp_path) -> None:
+    path = tmp_path / "snapshots.jsonl"
+    store = JSONLSnapshotStore(path, redact_sensitive=False)
+    result = run_with_snapshots(store)
+    path.write_bytes(path.read_bytes()[:-1])
+
+    restarted = JSONLSnapshotStore(path, redact_sensitive=False)
+    with pytest.raises(AuditIntegrityError, match="truncated"):
+        restarted.write_context(
+            trace_id=result.context.trace_id,
+            stage="rejected",
+            context=result.context,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            policy_version=None,
+            policy_digest=None,
+        )
 
 
 def test_debugger_timeline_is_ordered() -> None:
