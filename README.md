@@ -6,7 +6,6 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB.svg)](https://www.python.org/)
 [![PyPI](https://img.shields.io/pypi/v/agent-runtime-governance.svg)](https://pypi.org/project/agent-runtime-governance/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
-[![Release: v0.5.0](https://img.shields.io/badge/release-v0.5.0-6f42c1.svg)](https://github.com/Success6666/agent-runtime-governance/releases/tag/v0.5.0)
 
 A lightweight, framework-agnostic runtime governance framework for AI agents.
 It governs an immutable `ExecutionContext` through a deterministic middleware
@@ -25,10 +24,16 @@ from pathlib import Path
 from agent_runtime_governance import ExecutionMode, Runtime
 
 runtime = Runtime()
+WORKSPACE_ROOT = Path.cwd().resolve()
 
 @runtime.tool(execution_mode=ExecutionMode.READ_ONLY)
 def read_file(path: str) -> str:
-    return Path(path).read_text(encoding="utf-8")
+    candidate = (WORKSPACE_ROOT / path).resolve()
+    try:
+        candidate.relative_to(WORKSPACE_ROOT)
+    except ValueError as exc:
+        raise ValueError("path must remain inside the workspace") from exc
+    return candidate.read_text(encoding="utf-8")
 
 print(read_file("README.md"))
 ```
@@ -230,8 +235,9 @@ v0.5 focuses on production behavior instead of adding a new agent framework:
 - bounded concurrency, external integration circuit breakers, and fault tests.
 
 The production smoke suite starts real Docker services for OPA and the
-OpenTelemetry Collector, exports through OTLP HTTP, scrapes a real Prometheus
-`/metrics` endpoint, and can run a local Kind smoke with a pinned node image:
+OpenTelemetry Collector, exports through OTLP HTTP, scrapes a real HTTP
+`/metrics` exposition endpoint, and can run a local Kind smoke with a pinned
+node image:
 
 ```bash
 python integration/production_smoke.py --skip-kind
@@ -244,21 +250,24 @@ Production deployments must configure a trusted identity provider with
 stores coordinate processes on one host and require a distributed adapter for
 multi-host deployments.
 
-### v0.5 verification baseline
+### v0.5 pre-release verification record
 
 The 2026-07-26 release candidate was validated on Windows 11 with Python 3.12,
 Docker Engine 29.4.2, and Kind 0.31.0:
 
-- 314 tests passed with 87.99% branch coverage; the enforced floor is 80%, and
-  Codecov reported 82.11% of the pull-request diff hit against an 80% target;
+- 336 tests passed with 88.34% branch coverage on Python 3.12; the enforced floor
+  is 80%;
+- the same 336-test suite passed in clean Linux containers on Python 3.10.18
+  and Python 3.13.5;
 - 13 repository-policy tests passed;
 - real OPA HTTP allow/deny, OTLP HTTP export to an OpenTelemetry Collector,
   Prometheus scraping, and a Kind 1.34.3 control-plane readiness check passed;
 - the wheel and source distribution installed and imported from separate clean
   virtual environments; and
-- an isolated wheel environment with the OTel, YAML, and Prometheus extras had
-  no known dependency vulnerabilities reported by `pip-audit` 2.10.1 at the
-  time of the run.
+- an isolated environment with the OTel, YAML, and Prometheus extras had no
+  known dependency vulnerabilities reported by `pip-audit` 2.10.1 at the time
+  of the run; the unpublished root distribution was reported as unavailable on
+  PyPI and was not treated as an audited third-party dependency.
 
 These are point-in-time verification results, not a latency SLA or a guarantee
 against future advisories. CI repeats the test matrix, policy checks, dependency
@@ -270,6 +279,12 @@ OpenTelemetry, and 10-middleware pipelines:
 ```bash
 python benchmarks/benchmark_runtime.py --requests 100,500,1000 --concurrency 100
 ```
+
+The committed Windows/Python 3.12 measurement is available in
+[`benchmarks/results/v0.5.0-windows-python312.json`](benchmarks/results/v0.5.0-windows-python312.json).
+Its 100-waiter, zero-hold FIFO admission test measured 2.93 ms p99 wait time.
+This point-in-time result is regression evidence for that machine, not a
+cross-platform latency SLA.
 
 ## Releases
 
@@ -283,7 +298,7 @@ python benchmarks/benchmark_runtime.py --requests 100,500,1000 --concurrency 100
 | v0.4.2 | Fail-closed CodeRabbit review verification for the current commit |
 | v0.5.0 | Production reliability: idempotency, identity, durable approvals, audit, deadlines, cancellation, contracts, real integration smoke |
 
-All versions are preserved as immutable Git tags. See
+Released versions are preserved as immutable Git tags. See
 [CHANGELOG.md](CHANGELOG.md) for the detailed compatibility and security notes.
 
 ## Non-goals

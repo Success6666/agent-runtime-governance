@@ -72,8 +72,10 @@ only for isolated test data.
 
 ## External services
 
-- OPA is fail closed and validates response shape and size. Use TLS and a
-  circuit breaker; alert on transport, schema, and latency failures.
+- OPA is fail closed and validates response shape and size. Use TLS and enable
+  circuit breaking explicitly by passing a positive `failure_threshold` to
+  `OPAClient`; the default value `0` leaves circuit breaking disabled. Alert on
+  transport, schema, and latency failures.
 - OpenTelemetry export is observing and should not carry raw arguments or
   identity claims. v0.5 verifies in-process async/thread context propagation and
   OTLP export. `ExecutionContext.trace_id` and `span_id` are governance IDs, not
@@ -93,8 +95,11 @@ ruff check .
 pytest --cov=agent_runtime_governance --cov-report=term-missing
 python -m venv /tmp/arg-dependency-audit
 /tmp/arg-dependency-audit/bin/python -m pip install --upgrade "pip>=26.1.2"
-/tmp/arg-dependency-audit/bin/python -m pip install ".[otel,yaml,prometheus]" "pip-audit==2.10.1"
-/tmp/arg-dependency-audit/bin/python -m pip_audit
+/tmp/arg-dependency-audit/bin/python -m pip install ".[otel,yaml,prometheus]"
+python -m venv /tmp/arg-pip-audit-tool
+/tmp/arg-pip-audit-tool/bin/python -m pip install "pip-audit==2.10.1"
+/tmp/arg-pip-audit-tool/bin/pip-audit \
+  --path /tmp/arg-dependency-audit/lib/python3.13/site-packages
 python integration/production_smoke.py --skip-kind
 python integration/production_smoke.py
 python -m build
