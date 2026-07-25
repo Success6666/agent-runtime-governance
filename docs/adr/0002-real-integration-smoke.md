@@ -15,7 +15,8 @@ boundaries.
 - `integration/production_smoke.py` starts pinned Docker images for OPA and the
   OpenTelemetry Collector.
 - The smoke test exercises the SDK against real OPA HTTP decisions, real OTLP
-  HTTP export, and a real Prometheus `/metrics` endpoint.
+  HTTP export, and a real HTTP `/metrics` exposition endpoint served by the
+  Prometheus client library.
 - Kubernetes is validated as an example smoke with `kind` and a pinned node
   image. The SDK does not claim to be a Kubernetes controller or control plane.
 - CI runs the Docker smoke without Kind. Local release verification can run the

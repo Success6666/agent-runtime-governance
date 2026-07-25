@@ -63,7 +63,7 @@ def run_opa_smoke(keep_containers: bool) -> None:
         "--name",
         name,
         "--publish",
-        "8181:8181",
+        "127.0.0.1:8181:8181",
         "--read-only",
         "--cap-drop=ALL",
         "--security-opt",
@@ -124,9 +124,9 @@ def run_otel_smoke(keep_containers: bool) -> None:
         "--name",
         name,
         "--publish",
-        "4318:4318",
+        "127.0.0.1:4318:4318",
         "--publish",
-        "13133:13133",
+        "127.0.0.1:13133:13133",
         "--read-only",
         "--cap-drop=ALL",
         "--security-opt",
@@ -176,7 +176,7 @@ def run_prometheus_smoke() -> None:
         return "pong"
 
     assert ping() == "pong"
-    start_http_server(19091, registry=registry)
+    start_http_server(19091, addr="127.0.0.1", registry=registry)
     body = read_url("http://127.0.0.1:19091/metrics").decode("utf-8")
     expected = 'arg_smoke_tool_calls_total{risk_tier="LOW",status="succeeded",tool="ping"} 1.0'
     if expected not in body:
@@ -258,7 +258,8 @@ def wait_http(url: str, *, expected_status: int, timeout: float = 30.0) -> None:
                 if response.status == expected_status:
                     return
         except OSError:
-            time.sleep(0.25)
+            pass
+        time.sleep(0.25)
     raise TimeoutError(f"timed out waiting for {url}")
 
 

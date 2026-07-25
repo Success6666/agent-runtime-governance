@@ -57,13 +57,26 @@ jobs:
       - run: python -m pip install --upgrade "pip>=26.1.2"
       - run: python -m pip install -e ".[dev,otel]"
       - run: pytest --cov=agent_runtime_governance --cov-report=xml --cov-report=term-missing
-      - name: Upload coverage
-        if: matrix.python-version == '3.13'
+      - name: Upload coverage for trusted runs
+        if: >-
+          matrix.python-version == '3.13' &&
+          (github.event_name != 'pull_request' ||
+          github.event.pull_request.head.repo.full_name == github.repository)
         uses: codecov/codecov-action@04b047e8bb82a0c002c8312c1c880fbc6a999d45 # v5
         with:
           files: coverage.xml
           fail_ci_if_error: true
           use_oidc: true
+      - name: Upload coverage for fork pull requests
+        if: >-
+          matrix.python-version == '3.13' &&
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name != github.repository
+        uses: codecov/codecov-action@04b047e8bb82a0c002c8312c1c880fbc6a999d45 # v5
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+          use_oidc: false
 
   build:
     runs-on: ubuntu-latest
