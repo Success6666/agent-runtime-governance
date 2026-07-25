@@ -16,6 +16,7 @@ from typing import Any, Mapping, Protocol, runtime_checkable
 
 from filelock import FileLock
 
+from ._sqlite import connect_sqlite, initialize_sqlite
 from .audit import DEFAULT_SENSITIVE_KEYS, redact_sensitive_data
 from .context import ExecutionContext, ExecutionStatus, HistoryEntry
 from .errors import AuditIntegrityError
@@ -385,7 +386,7 @@ class SQLiteSnapshotStore:
         return tuple(snapshots)
 
     def _initialize(self) -> None:
-        with self._connect() as connection:
+        with initialize_sqlite(self.path, self.timeout_seconds) as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS snapshots (
@@ -421,13 +422,7 @@ class SQLiteSnapshotStore:
         return int(row[0])
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(
-            self.path, timeout=self.timeout_seconds, isolation_level=None
-        )
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA synchronous=FULL")
-        connection.execute(f"PRAGMA busy_timeout={int(self.timeout_seconds * 1000)}")
-        return connection
+        return connect_sqlite(self.path, self.timeout_seconds)
 
 
 class SnapshotMiddleware(ObservingMiddleware):

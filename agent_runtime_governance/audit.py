@@ -15,6 +15,7 @@ from typing import Any, Protocol
 
 from filelock import FileLock
 
+from ._sqlite import connect_sqlite, initialize_sqlite
 from .context import ExecutionContext
 from .errors import AuditIntegrityError
 
@@ -593,7 +594,7 @@ class SQLiteAuditSink:
         return events
 
     def _initialize(self) -> None:
-        with self._connect() as connection:
+        with initialize_sqlite(self.path, self.timeout_seconds) as connection:
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS audit_events (
@@ -614,13 +615,7 @@ class SQLiteAuditSink:
             )
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(
-            self.path, timeout=self.timeout_seconds, isolation_level=None
-        )
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA synchronous=FULL")
-        connection.execute(f"PRAGMA busy_timeout={int(self.timeout_seconds * 1000)}")
-        return connection
+        return connect_sqlite(self.path, self.timeout_seconds)
 
 
 def context_event(context: ExecutionContext, *, stage: str) -> dict[str, Any]:
