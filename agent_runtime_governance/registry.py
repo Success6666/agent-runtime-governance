@@ -21,6 +21,7 @@ from typing import (
     TypeVar,
 )
 
+from ._sqlite import connect_sqlite, initialize_sqlite
 from .context import ExecutionMode, RiskTier
 from .contracts import canonical_json_bytes, validate_schema
 from .errors import RegistryError
@@ -386,7 +387,7 @@ class SQLiteIdempotencyStore:
             connection.commit()
 
     def _initialize(self) -> None:
-        with self._connect() as connection:
+        with initialize_sqlite(self.path, self.timeout_seconds) as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS idempotency_records (
@@ -415,13 +416,7 @@ class SQLiteIdempotencyStore:
             )
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(
-            self.path, timeout=self.timeout_seconds, isolation_level=None
-        )
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA synchronous=FULL")
-        connection.execute(f"PRAGMA busy_timeout={int(self.timeout_seconds * 1000)}")
-        return connection
+        return connect_sqlite(self.path, self.timeout_seconds)
 
     @classmethod
     def _validate_identifier(cls, label: str, value: str) -> None:
