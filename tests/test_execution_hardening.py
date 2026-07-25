@@ -10,6 +10,9 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from agent_runtime_governance import (
+    DecisionOutcome,
+    DecisionRecord,
+    GatingMiddleware,
     InMemoryIdempotencyStore,
     InvocationOptions,
     RetryMiddleware,
@@ -80,6 +83,7 @@ async def test_idempotency_bookkeeping_uses_dedicated_executor() -> None:
         assert store.acquire_thread.startswith("arg-idempotency")
         runtime.close()
 
+
 class FailingCompletionStore(InMemoryIdempotencyStore):
     def complete(self, claim, result) -> None:
         raise OSError("idempotency database unavailable")
@@ -102,6 +106,35 @@ class FailingRenewalStore(InMemoryIdempotencyStore):
 
     def renew(self, claim) -> None:
         raise OSError("idempotency lease renewal unavailable")
+
+
+class FailingFailureStore(InMemoryIdempotencyStore):
+    def fail(self, claim, error: BaseException) -> None:
+        raise OSError("idempotency failure record unavailable")
+
+
+class BlockingCompletionStore(InMemoryIdempotencyStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def complete(self, claim, result) -> None:
+        self.entered.set()
+        self.release.wait(1)
+        super().complete(claim, result)
+
+
+class DenyAtExecutionBoundary(GatingMiddleware):
+    name = "deny-at-boundary"
+
+    async def process(self, context: ExecutionContext) -> ExecutionContext:
+        return context
+
+    async def commit_approval(self, context: ExecutionContext) -> ExecutionContext:
+        return context.with_decision(
+            DecisionRecord(DecisionOutcome.DENY, "boundary denied", self.name)
+        )
 
 
 def test_default_mutating_tool_is_not_retried() -> None:
@@ -251,6 +284,11 @@ async def test_idempotency_acquire_honors_absolute_deadline() -> None:
     assert caught.value.context.status is ExecutionStatus.UNKNOWN
     assert await asyncio.to_thread(store.marked_unknown.wait, 1)
     assert executions == 0
+    await asyncio.sleep(0.01)
+    assert await write.ainvoke(
+        _governance=InvocationOptions(idempotency_key="after-request-deadline")
+    ) is None
+    assert executions == 1
 
 
 @pytest.mark.asyncio
@@ -653,6 +691,71 @@ async def test_idempotency_completion_failure_reports_unknown() -> None:
         )
     assert caught.value.context.status is ExecutionStatus.UNKNOWN
     assert "database unavailable" in (caught.value.context.error or "")
+
+
+@pytest.mark.asyncio
+async def test_post_claim_denial_preserves_denied_context_when_ledger_fails() -> None:
+    executions = 0
+    runtime = Runtime(
+        [DenyAtExecutionBoundary()],
+        idempotency_store=FailingFailureStore(),
+    )
+
+    @runtime.tool(execution_mode=ExecutionMode.IDEMPOTENT)
+    def write() -> None:
+        nonlocal executions
+        executions += 1
+
+    with pytest.raises(ToolExecutionError) as caught:
+        await write.ainvoke(
+            _governance=InvocationOptions(idempotency_key="post-claim-denial")
+        )
+
+    assert caught.value.context.status is ExecutionStatus.DENIED
+    assert caught.value.context.denied
+    assert any(
+        entry.middleware == "idempotency" and entry.outcome == "unknown"
+        for entry in caught.value.context.history
+    )
+    assert executions == 0
+
+
+@pytest.mark.asyncio
+async def test_store_operation_timeout_poisons_idempotency_channel() -> None:
+    store = BlockingCompletionStore()
+    runtime = Runtime(
+        idempotency_store=store,
+        limits=RuntimeLimits(idempotency_operation_timeout_seconds=0.02),
+    )
+    executions = 0
+
+    @runtime.tool(execution_mode=ExecutionMode.IDEMPOTENT)
+    def write() -> str:
+        nonlocal executions
+        executions += 1
+        return "committed"
+
+    try:
+        started = time.perf_counter()
+        with pytest.raises(ToolExecutionError) as first:
+            await write.ainvoke(
+                _governance=InvocationOptions(idempotency_key="blocked-completion")
+            )
+        assert time.perf_counter() - started < 0.2
+        assert first.value.context.status is ExecutionStatus.UNKNOWN
+        assert store.entered.is_set()
+
+        started = time.perf_counter()
+        with pytest.raises(ToolExecutionError) as second:
+            await write.ainvoke(
+                _governance=InvocationOptions(idempotency_key="after-poison")
+            )
+        assert time.perf_counter() - started < 0.1
+        assert "disabled after" in (second.value.context.error or "")
+        assert executions == 1
+    finally:
+        store.release.set()
+        runtime.close()
 
 
 @pytest.mark.asyncio

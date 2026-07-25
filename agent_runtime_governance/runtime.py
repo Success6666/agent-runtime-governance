@@ -9,6 +9,7 @@ from contextvars import copy_context
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
+from threading import Lock
 from time import perf_counter
 from typing import Any, Callable, Iterable, Mapping, ParamSpec, TypeVar
 
@@ -133,6 +134,12 @@ class Runtime:
             max_workers=min(4, self.limits.max_in_flight),
             thread_name_prefix="arg-idempotency",
         )
+        self._idempotency_bulkhead = RuntimeBulkhead(
+            min(4, self.limits.max_in_flight)
+        )
+        self._idempotency_poison_lock = Lock()
+        self._idempotency_poison: BaseException | None = None
+        self._idempotency_draining = 0
         self._closed = False
 
     def close(self, *, wait: bool = True) -> None:
@@ -964,12 +971,32 @@ class Runtime:
         fingerprint: str,
         deadline: datetime | None,
     ) -> IdempotencyClaim:
-        future = self._idempotency_executor.submit(
-            self.idempotency_store.acquire,
-            namespace,
-            key,
-            fingerprint,
+        self._raise_if_idempotency_store_poisoned()
+        timeout = self._bounded_timeout(
+            deadline,
+            self.limits.idempotency_operation_timeout_seconds,
+            "idempotency acquire",
         )
+        lease = await self._idempotency_bulkhead.acquire(timeout)
+        try:
+            timeout = self._bounded_timeout(
+                deadline,
+                self.limits.idempotency_operation_timeout_seconds,
+                "idempotency acquire",
+            )
+            poison_on_timeout = (
+                timeout >= self.limits.idempotency_operation_timeout_seconds
+            )
+            future = self._idempotency_executor.submit(
+                self.idempotency_store.acquire,
+                namespace,
+                key,
+                fingerprint,
+            )
+        except BaseException:
+            lease.release()
+            raise
+        wrapped = asyncio.wrap_future(future)
 
         def settle_orphaned_claim(completed) -> None:
             try:
@@ -986,21 +1013,45 @@ class Runtime:
             except BaseException:
                 return
 
+        def finish_orphaned_claim(completed, *, resume: bool) -> None:
+            try:
+                settle_orphaned_claim(completed)
+            finally:
+                lease.release()
+                if resume:
+                    self._resume_idempotency_store()
+
         try:
-            timeout = self._bounded_timeout(
-                deadline,
-                self.limits.execution_timeout_seconds,
-                "idempotency acquire",
+            done, _ = await asyncio.wait({wrapped}, timeout=timeout)
+            if wrapped in done:
+                return wrapped.result()
+            exc = StageTimeoutError("idempotency acquire", timeout)
+            if poison_on_timeout:
+                self._poison_idempotency_store(exc)
+            else:
+                self._suspend_idempotency_store()
+            future.add_done_callback(
+                lambda completed: finish_orphaned_claim(
+                    completed, resume=not poison_on_timeout
+                )
             )
-            return await await_stage(
-                asyncio.shield(asyncio.wrap_future(future)),
-                stage="idempotency acquire",
-                timeout_seconds=timeout,
-                cancellation_grace_seconds=self.limits.cancellation_grace_seconds,
-            )
-        except BaseException:
-            future.add_done_callback(settle_orphaned_claim)
+            wrapped.add_done_callback(self._consume_background_result)
+            raise exc
+        except StageTimeoutError:
             raise
+        except BaseException:
+            if not wrapped.done():
+                self._suspend_idempotency_store()
+                future.add_done_callback(
+                    lambda completed: finish_orphaned_claim(completed, resume=True)
+                )
+                wrapped.add_done_callback(self._consume_background_result)
+            else:
+                lease.release()
+            raise
+        finally:
+            if wrapped.done():
+                lease.release()
 
     @staticmethod
     def _consume_background_result(task: asyncio.Task[Any]) -> None:
@@ -1010,20 +1061,84 @@ class Runtime:
             pass
 
     async def _run_critical_store_operation(
-        self, function: Callable[..., Any], *args: Any
+        self,
+        function: Callable[..., Any],
+        *args: Any,
+        deadline: datetime | None = None,
+        stage: str = "idempotency store operation",
     ) -> Any:
-        loop = asyncio.get_running_loop()
-        task = asyncio.ensure_future(
-            loop.run_in_executor(
-                self._idempotency_executor,
-                partial(function, *args),
-            )
+        self._raise_if_idempotency_store_poisoned()
+        timeout = self._bounded_timeout(
+            deadline,
+            self.limits.idempotency_operation_timeout_seconds,
+            stage,
         )
+        lease = await self._idempotency_bulkhead.acquire(timeout)
         try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            await task
+            timeout = self._bounded_timeout(
+                deadline,
+                self.limits.idempotency_operation_timeout_seconds,
+                stage,
+            )
+            poison_on_timeout = (
+                timeout >= self.limits.idempotency_operation_timeout_seconds
+            )
+            loop = asyncio.get_running_loop()
+            future = self._idempotency_executor.submit(partial(function, *args))
+        except BaseException:
+            lease.release()
             raise
+        task = asyncio.wrap_future(future, loop=loop)
+        started = perf_counter()
+        deferred_release = False
+
+        def finish_detached_operation(_completed, *, resume: bool) -> None:
+            lease.release()
+            if resume:
+                self._resume_idempotency_store()
+
+        try:
+            done, _ = await asyncio.wait({task}, timeout=timeout)
+            if task in done:
+                return task.result()
+            exc = StageTimeoutError(stage, timeout)
+            if poison_on_timeout:
+                self._poison_idempotency_store(exc)
+            else:
+                self._suspend_idempotency_store()
+            deferred_release = True
+            future.add_done_callback(
+                lambda completed: finish_detached_operation(
+                    completed, resume=not poison_on_timeout
+                )
+            )
+            task.add_done_callback(self._consume_background_result)
+            raise exc
+        except asyncio.CancelledError:
+            remaining = max(0.0, timeout - (perf_counter() - started))
+            try:
+                done, _ = await asyncio.wait({task}, timeout=remaining)
+            except asyncio.CancelledError:
+                done = set()
+            if task in done:
+                self._consume_background_result(task)
+            else:
+                exc = StageTimeoutError(stage, timeout)
+                if poison_on_timeout:
+                    self._poison_idempotency_store(exc)
+                else:
+                    self._suspend_idempotency_store()
+                deferred_release = True
+                future.add_done_callback(
+                    lambda completed: finish_detached_operation(
+                        completed, resume=not poison_on_timeout
+                    )
+                )
+                task.add_done_callback(self._consume_background_result)
+            raise
+        finally:
+            if not deferred_release:
+                lease.release()
 
     async def _finish_idempotency(
         self,
@@ -1036,15 +1151,27 @@ class Runtime:
             return
         if error is None:
             await self._run_critical_store_operation(
-                self.idempotency_store.complete, claim, value
+                self.idempotency_store.complete,
+                claim,
+                value,
+                deadline=context.deadline,
+                stage="idempotency complete",
             )
         elif context.status is ExecutionStatus.UNKNOWN:
             await self._run_critical_store_operation(
-                self.idempotency_store.mark_unknown, claim, error
+                self.idempotency_store.mark_unknown,
+                claim,
+                error,
+                deadline=context.deadline,
+                stage="idempotency mark unknown",
             )
         else:
             await self._run_critical_store_operation(
-                self.idempotency_store.fail, claim, error
+                self.idempotency_store.fail,
+                claim,
+                error,
+                deadline=context.deadline,
+                stage="idempotency fail",
             )
 
     def _start_idempotency_heartbeat(
@@ -1060,6 +1187,7 @@ class Runtime:
                 await self._run_critical_store_operation(
                     self.idempotency_store.renew,
                     claim,
+                    stage="idempotency renew",
                 )
 
         return asyncio.create_task(
@@ -1094,17 +1222,19 @@ class Runtime:
         context: ExecutionContext,
         error: BaseException | None,
         value: Any = None,
-        ) -> ExecutionContext:
+    ) -> ExecutionContext:
         try:
             await self._finish_idempotency(claim, context, error, value)
         except Exception as settlement_error:
-            return context.evolve(
-                status=ExecutionStatus.UNKNOWN,
-                error=(
+            changes: dict[str, Any] = {
+                "error": (
                     f"{type(settlement_error).__name__}: idempotency ledger "
                     "could not record the final outcome"
-                ),
-            ).append_history(
+                )
+            }
+            if not context.denied:
+                changes["status"] = ExecutionStatus.UNKNOWN
+            return context.evolve(**changes).append_history(
                 HistoryEntry(
                     "idempotency",
                     "unknown",
@@ -1112,6 +1242,35 @@ class Runtime:
                 )
             )
         return context
+
+    def _raise_if_idempotency_store_poisoned(self) -> None:
+        with self._idempotency_poison_lock:
+            cause = self._idempotency_poison
+            draining = self._idempotency_draining
+        if cause is not None:
+            raise IdempotencyOutcomeUnknownError(
+                "idempotency store was disabled after an operation exceeded its "
+                "bounded execution contract"
+            ) from cause
+        if draining:
+            raise IdempotencyOutcomeUnknownError(
+                "idempotency store has a detached operation still draining"
+            )
+
+    def _poison_idempotency_store(self, cause: BaseException) -> None:
+        with self._idempotency_poison_lock:
+            if self._idempotency_poison is None:
+                self._idempotency_poison = cause
+
+    def _suspend_idempotency_store(self) -> None:
+        with self._idempotency_poison_lock:
+            if self._idempotency_poison is None:
+                self._idempotency_draining += 1
+
+    def _resume_idempotency_store(self) -> None:
+        with self._idempotency_poison_lock:
+            if self._idempotency_draining > 0:
+                self._idempotency_draining -= 1
 
     async def _run_pre_pipeline(
         self, context: ExecutionContext, *, replayable_only: bool = False
@@ -1454,11 +1613,13 @@ class Runtime:
             or uncertain
             else ExecutionStatus.FAILED
         )
-        return context.evolve(
-            status=status,
-            error=f"{type(exc).__name__}: {exc}",
-            metadata=metadata,
-        ).append_history(
+        changes: dict[str, Any] = {
+            "error": f"{type(exc).__name__}: {exc}",
+            "metadata": metadata,
+        }
+        if not context.denied:
+            changes["status"] = status
+        return context.evolve(**changes).append_history(
             HistoryEntry(
                 "executor",
                 "unknown" if status is ExecutionStatus.UNKNOWN else "failed",

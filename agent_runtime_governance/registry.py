@@ -93,6 +93,15 @@ class IdempotencyClaim:
 
 
 class IdempotencyStore(Protocol):
+    """Blocking idempotency adapter contract.
+
+    Implementations must bound every blocking operation, including network and
+    lock waits, so it returns within the runtime's configured
+    ``idempotency_operation_timeout_seconds``. Python cannot safely terminate a
+    blocked worker thread; the runtime therefore fails closed and poisons the
+    adapter after an operation exceeds that boundary.
+    """
+
     def acquire(
         self, namespace: str, key: str, fingerprint: str
     ) -> IdempotencyClaim: ...
