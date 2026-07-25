@@ -55,6 +55,8 @@ All notable changes are documented here.
   handles heterogeneous sets without silently changing approval payloads.
 - Injected OpenTelemetry tracers can expose compatible status types directly;
   otherwise a one-time warning makes terminal-status degradation visible.
+- CodeRabbit thread acknowledgements no longer overwrite the latest decisive
+  approval or change-request verdict for the same pull-request head.
 
 ### Changed
 

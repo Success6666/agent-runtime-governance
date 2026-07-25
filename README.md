@@ -259,7 +259,7 @@ Docker Engine 29.4.2, and Kind 0.31.0:
   is 80%;
 - the same 345-test suite passed in clean Linux containers on Python 3.10.18
   and Python 3.13.5;
-- 13 repository-policy tests passed;
+- 15 repository-policy tests passed;
 - real OPA HTTP allow/deny, OTLP HTTP export to an OpenTelemetry Collector,
   Prometheus scraping, and a Kind 1.34.3 control-plane readiness check passed;
 - the wheel and source distribution installed and imported from separate clean
