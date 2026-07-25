@@ -39,6 +39,7 @@ class InMemoryMetrics:
 class MetricsMiddleware(ObservingMiddleware):
     name = "metrics"
     priority = 900
+    replayable = False
 
     def __init__(self, collector: InMemoryMetrics | None = None) -> None:
         self.collector = collector or InMemoryMetrics()

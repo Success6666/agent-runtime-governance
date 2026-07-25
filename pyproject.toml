@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-runtime-governance"
-version = "0.2.0"
+version = "0.3.0"
 description = "Framework-agnostic runtime governance for AI agents."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -26,12 +26,14 @@ dependencies = []
 [project.optional-dependencies]
 dev = [
   "build>=1.2",
+  "PyYAML>=6.0",
   "pytest>=8.0",
   "pytest-asyncio>=0.23",
 ]
 langgraph = ["langgraph>=0.2"]
 openai-agents = ["openai-agents>=0.2"]
 otel = ["opentelemetry-api>=1.25"]
+yaml = ["PyYAML>=6.0"]
 
 [project.urls]
 Homepage = "https://github.com/Success6666/agent-runtime-governance"

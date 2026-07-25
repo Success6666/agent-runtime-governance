@@ -60,3 +60,14 @@ Audit events contain the context snapshot before execution and after completion.
 The JSONL sink can redact known secret keys and HMAC-sign each record. v0.1
 replay intentionally only loads and prints these snapshots; it does not execute
 tools again.
+
+v0.3 adds a separate snapshot store for debugger and regression workflows.
+Replay rebuilds the original request identity and runs only middleware whose
+metadata declares it replayable. External model review, human interaction,
+metrics, retries, audit, and telemetry are never invoked by deterministic
+replay.
+
+Policy documents have an explicit version and a digest derived from canonical
+validated content. Duplicate tool rules are rejected instead of introducing an
+implicit conflict-resolution language. Drift detection compares outcomes and
+risk tiers after applying two deterministic pipelines to the same request.

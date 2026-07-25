@@ -214,6 +214,34 @@ class ExecutionContext:
             "error": self.error,
         }
 
+    def reset_for_replay(
+        self,
+        *,
+        risk_tier: RiskTier | None = None,
+        requires_approval: bool | None = None,
+    ) -> "ExecutionContext":
+        """Return the original request identity with governance state cleared."""
+        return ExecutionContext(
+            trace_id=self.trace_id,
+            span_id=self.span_id,
+            parent_span_id=self.parent_span_id,
+            request_id=self.request_id,
+            task_id=self.task_id,
+            conversation_id=self.conversation_id,
+            user=self.user,
+            tenant=self.tenant,
+            permissions=self.permissions,
+            input_text=self.input_text,
+            tool_call=self.tool_call,
+            risk_tier=risk_tier or self.risk_tier,
+            requires_approval=(
+                self.requires_approval
+                if requires_approval is None
+                else requires_approval
+            ),
+            metadata={},
+        )
+
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "ExecutionContext":
         decision_data = data.get("decision")

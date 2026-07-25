@@ -17,9 +17,9 @@ The architecture is frozen per release. New ideas enter this file before code.
 
 ## v0.3 - Replay and policy evolution
 
-- Versioned YAML policies
-- Context snapshots, replay diff, and a text debugger
-- Regression evaluation, policy drift detection, trace visualization
+- [x] Versioned YAML policies
+- [x] Context snapshots, replay diff, and a text debugger
+- [x] Regression evaluation, policy drift detection, trace visualization
 
 ## v0.4 - Integration ecosystem
 

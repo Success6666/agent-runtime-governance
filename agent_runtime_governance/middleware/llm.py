@@ -26,6 +26,7 @@ class LLMMiddleware(GatingMiddleware):
     """Model-agnostic semantic review delegated to an application callback."""
 
     name = "llm"
+    replayable = False
 
     def __init__(self, reviewer: Reviewer) -> None:
         self._reviewer = reviewer

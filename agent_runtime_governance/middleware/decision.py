@@ -7,6 +7,7 @@ from .base import GatingMiddleware
 
 class DecisionMiddleware(GatingMiddleware):
     name = "decision"
+    replayable = False
 
     def __init__(self, provider: DecisionProvider) -> None:
         self._provider = provider
@@ -29,10 +30,14 @@ class DecisionMiddleware(GatingMiddleware):
         decision = await self._provider.decide(context, request)
         if decision.outcome is DecisionOutcome.REQUIRE_HUMAN:
             raise ValueError("human decision provider must return allow or deny")
-        return context.with_decision(decision).append_history(
+        updated = context.with_decision(decision)
+        if decision.outcome is DecisionOutcome.ALLOW:
+            updated = updated.evolve(
+                metadata={**updated.metadata, "approval_granted": True}
+            )
+        return updated.append_history(
             HistoryEntry(self.name, decision.outcome.value, decision.reason)
         )
 
 
 ApprovalMiddleware = DecisionMiddleware
-

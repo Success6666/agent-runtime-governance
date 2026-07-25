@@ -128,6 +128,33 @@ def attach_region(ctx):
 Pipeline edits return a new `Pipeline`; a live runtime is never mutated behind
 concurrent calls. Hooks may enrich context but cannot change status or decisions.
 
+## Policies, snapshots, and regression
+
+Load a strict versioned policy with a deterministic digest:
+
+```python
+from agent_runtime_governance import Runtime, YAMLPolicyLoader
+
+document = YAMLPolicyLoader.load("examples/policy.yaml")
+runtime = Runtime([document.middleware()])
+print(document.version, document.digest)
+```
+
+Duplicate tool entries, unknown fields, invalid risks, and unsafe YAML tags are
+rejected. YAML remains a configuration format over the deliberately small
+`SimplePolicy` model; it is not a general policy language.
+
+`SnapshotMiddleware` records immutable lifecycle snapshots. `ReplayDebugger`
+prints timelines and field-level diffs, while `EvaluationSuite` runs governance
+without executing tools. `PolicyDriftDetector` reapplies deterministic policy to
+the same recorded request identity and reports decision or risk changes.
+
+```bash
+python scripts/trace_debug.py snapshots.jsonl TRACE_ID
+python scripts/trace_debug.py snapshots.jsonl TRACE_ID --diff 0 1
+python scripts/trace_debug.py snapshots.jsonl TRACE_ID --mermaid
+```
+
 ## Non-goals
 
 - Agent planning, prompting, model routing, or memory
@@ -135,6 +162,7 @@ concurrent calls. Hooks may enrich context but cannot change status or decisions
 - Approval UI or a hosted control plane
 - A general policy language, plugin marketplace, or mutable live pipeline
 - Production-grade time-travel debugging
+- Arbitrary condition evaluation, policy inheritance, or conflict resolution
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for invariants and
 [ROADMAP.md](ROADMAP.md) for the deliberately staged scope.

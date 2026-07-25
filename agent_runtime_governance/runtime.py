@@ -122,18 +122,11 @@ class Runtime:
         **kwargs: Any,
     ) -> RunResult:
         spec = self.registry.get(name)
-        options = _governance or InvocationOptions()
-        context = ExecutionContext.create(
-            ToolCall(name=name, args=args, kwargs=kwargs),
-            input_text=options.input_text,
-            user=options.user,
-            tenant=options.tenant,
-            permissions=options.permissions,
-            task_id=options.task_id,
-            conversation_id=options.conversation_id,
-            risk_tier=spec.risk,
-            requires_approval=spec.requires_approval,
-            metadata=options.metadata,
+        context = self._create_context(
+            spec,
+            args,
+            kwargs,
+            _governance,
         )
         context = await self._emit_hook(
             HookPoint.BEFORE_PIPELINE, context, allow_critical=True
@@ -142,6 +135,7 @@ class Runtime:
         context = await self._emit_hook(
             HookPoint.AFTER_PIPELINE, context, allow_critical=True
         )
+        context = self._enforce_required_approval(context)
         if context.denied:
             context = await self._run_observers(context, post=True)
             raise GovernanceDenied(context)
@@ -214,9 +208,60 @@ class Runtime:
         context = await self._run_observers(context, post=True)
         return RunResult(value=value, context=context)
 
-    async def _run_pre_pipeline(self, context: ExecutionContext) -> ExecutionContext:
+    async def apreview(
+        self,
+        name: str,
+        *args: Any,
+        _governance: InvocationOptions | None = None,
+        replayable_only: bool = True,
+        **kwargs: Any,
+    ) -> ExecutionContext:
+        """Evaluate governance without executing the tool."""
+        spec = self.registry.get(name)
+        context = self._create_context(spec, args, kwargs, _governance)
+        context = await self._run_pre_pipeline(
+            context, replayable_only=replayable_only
+        )
+        return self._enforce_required_approval(context)
+
+    async def areplay(self, context: ExecutionContext) -> ExecutionContext:
+        """Reapply deterministic middleware to a recorded request identity."""
+        spec = self.registry.get(context.tool_call.name)
+        clean = context.reset_for_replay(
+            risk_tier=spec.risk,
+            requires_approval=spec.requires_approval,
+        )
+        replayed = await self._run_pre_pipeline(clean, replayable_only=True)
+        return self._enforce_required_approval(replayed)
+
+    def _create_context(
+        self,
+        spec: ToolSpec[Any, Any],
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        options_value: InvocationOptions | None,
+    ) -> ExecutionContext:
+        options = options_value or InvocationOptions()
+        return ExecutionContext.create(
+            ToolCall(name=spec.name, args=args, kwargs=kwargs),
+            input_text=options.input_text,
+            user=options.user,
+            tenant=options.tenant,
+            permissions=options.permissions,
+            task_id=options.task_id,
+            conversation_id=options.conversation_id,
+            risk_tier=spec.risk,
+            requires_approval=spec.requires_approval,
+            metadata=options.metadata,
+        )
+
+    async def _run_pre_pipeline(
+        self, context: ExecutionContext, *, replayable_only: bool = False
+    ) -> ExecutionContext:
         for middleware in self.pipeline:
             if middleware.kind is MiddlewareKind.EXECUTION:
+                continue
+            if replayable_only and not middleware.metadata.replayable:
                 continue
             if context.denied and middleware.kind is MiddlewareKind.GATING:
                 continue
@@ -246,6 +291,23 @@ class Runtime:
                 )
         if not context.denied:
             context = context.evolve(status=ExecutionStatus.ALLOWED)
+        return context
+
+    @staticmethod
+    def _enforce_required_approval(context: ExecutionContext) -> ExecutionContext:
+        if (
+            context.requires_approval
+            and not context.denied
+            and context.metadata.get("approval_granted") is not True
+        ):
+            decision = DecisionRecord(
+                DecisionOutcome.DENY,
+                "required human decision was not granted",
+                "runtime",
+            )
+            return context.with_decision(decision).append_history(
+                HistoryEntry("runtime", "deny", decision.reason)
+            )
         return context
 
     async def _run_observers(

@@ -39,20 +39,30 @@ class PolicyMiddleware(GatingMiddleware):
     name = "policy"
     priority = 20
 
-    def __init__(self, policy: SimplePolicy) -> None:
+    def __init__(
+        self,
+        policy: SimplePolicy,
+        *,
+        version: str | None = None,
+        digest: str | None = None,
+    ) -> None:
         self.policy = policy
+        self.version = version
+        self.digest = digest
 
     async def process(self, context: ExecutionContext) -> ExecutionContext:
         tool = context.tool_call.name
-        if tool in self.policy.denied_tools:
-            return self._deny(context, "tool denied by policy")
-        if tool in self.policy.admin_only and "admin" not in context.permissions:
-            return self._deny(context, "admin permission required")
-        required = self.policy.required_permissions.get(tool, frozenset())
-        missing = required.difference(context.permissions)
-        if missing:
-            return self._deny(
-                context, f"missing permissions: {', '.join(sorted(missing))}"
+        policy_metadata = {
+            key: value
+            for key, value in {
+                "policy_version": self.version,
+                "policy_digest": self.digest,
+            }.items()
+            if value is not None
+        }
+        if policy_metadata:
+            context = context.evolve(
+                metadata={**context.metadata, **policy_metadata}
             )
         changes: dict[str, object] = {}
         if tool in self.policy.approval_tools:
@@ -60,11 +70,40 @@ class PolicyMiddleware(GatingMiddleware):
         if tool in self.policy.risk_overrides:
             changes["risk_tier"] = self.policy.risk_overrides[tool]
         updated = context.evolve(**changes) if changes else context
+        if tool in self.policy.denied_tools:
+            return self._deny(updated, "tool denied by policy")
+        if tool in self.policy.admin_only and "admin" not in updated.permissions:
+            return self._deny(updated, "admin permission required")
+        required = self.policy.required_permissions.get(tool, frozenset())
+        missing = required.difference(updated.permissions)
+        if missing:
+            return self._deny(
+                updated, f"missing permissions: {', '.join(sorted(missing))}"
+            )
         return updated.append_history(
-            HistoryEntry(self.name, "allow", "python policy allowed")
+            HistoryEntry(
+                self.name,
+                "allow",
+                "python policy allowed",
+                data=policy_metadata,
+            )
         )
 
     def _deny(self, context: ExecutionContext, reason: str) -> ExecutionContext:
         return context.with_decision(
             DecisionRecord(DecisionOutcome.DENY, reason, self.name)
-        ).append_history(HistoryEntry(self.name, "deny", reason))
+        ).append_history(
+            HistoryEntry(
+                self.name,
+                "deny",
+                reason,
+                data={
+                    key: value
+                    for key, value in {
+                        "policy_version": self.version,
+                        "policy_digest": self.digest,
+                    }.items()
+                    if value is not None
+                },
+            )
+        )

@@ -7,6 +7,7 @@ from .base import ObservingMiddleware
 
 class AuditMiddleware(ObservingMiddleware):
     name = "audit"
+    replayable = False
 
     def __init__(self, sink: AuditSink) -> None:
         self.sink = sink

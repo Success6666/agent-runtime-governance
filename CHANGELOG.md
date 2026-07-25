@@ -2,6 +2,22 @@
 
 All notable changes are documented here.
 
+## [0.3.0] - 2026-07-25
+
+### Added
+
+- Strict, versioned YAML policy documents with stable SHA-256 digests.
+- Context snapshot stores, structured replay diffs, and a text debugger.
+- Regression evaluation and policy drift detection over recorded requests.
+- Mermaid trace rendering for lightweight visualization.
+
+### Fixed
+
+- Tool calls that require approval now fail closed when no explicit human
+  decision was granted.
+- Deterministic replay skips LLM, human decision, audit, metrics, and other
+  non-replayable middleware.
+
 ## [0.2.0] - 2026-07-25
 
 ### Added

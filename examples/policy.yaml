@@ -1,0 +1,14 @@
+version: "2026-07-25.1"
+policies:
+  - tool: read_file
+    effect: allow
+    required_permissions: [file:read]
+    risk: low
+  - tool: restart_service
+    effect: allow
+    approval: required
+    admin_only: true
+    risk: high
+  - tool: wipe_cluster
+    effect: deny
+    risk: critical
