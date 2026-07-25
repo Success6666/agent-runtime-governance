@@ -253,9 +253,9 @@ class JSONLAuditSink:
                 self._validate_state_shape(state)
                 events = self._read_verified_unlocked(state)
                 return self._reconcile_appended_tail(events, state)
-            except (AuditIntegrityError, ValueError, TypeError, KeyError):
+            except AuditIntegrityError:
                 raise
-            except (OSError, json.JSONDecodeError) as exc:
+            except (OSError, ValueError, TypeError, KeyError) as exc:
                 raise AuditIntegrityError("invalid audit state file") from exc
         if any(self._segment_paths()):
             raise AuditIntegrityError(
@@ -290,9 +290,9 @@ class JSONLAuditSink:
                 # complete events but before atomically replacing the state file.
                 return self._load_or_rebuild_state()
             raise AuditIntegrityError("audit tail does not match durable state")
-        except (AuditIntegrityError, ValueError, TypeError, KeyError):
+        except AuditIntegrityError:
             raise
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError, TypeError, KeyError) as exc:
             raise AuditIntegrityError("invalid audit state file") from exc
 
     def _reconcile_appended_tail(
@@ -535,7 +535,8 @@ class SQLiteAuditSink:
             row = connection.execute(
                 "SELECT last_sequence, last_hash FROM audit_state WHERE id = 1"
             ).fetchone()
-            assert row is not None
+            if row is None:
+                raise AuditIntegrityError("audit state row is missing")
             sequence = int(row[0]) + 1
             payload = self._codec.prepare(
                 event, sequence=sequence, prev_hash=str(row[1])

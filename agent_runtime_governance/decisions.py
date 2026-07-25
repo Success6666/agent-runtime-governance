@@ -4,13 +4,14 @@ import asyncio
 import hashlib
 import inspect
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
-from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Protocol, TypeAlias
 from uuid import uuid4
 
+from ._serialization import freeze_mapping as _freeze_mapping
+from ._serialization import thaw as _thaw
 from .contracts import canonical_json_bytes
 
 if TYPE_CHECKING:
@@ -190,9 +191,7 @@ class ApprovalRequest:
             expires = _parse_datetime(self.expires_at)
             if expires <= issued:
                 raise ValueError("approval request expiry must follow issuance")
-        frozen = MappingProxyType(
-            {str(key): _freeze(value) for key, value in self.arguments.items()}
-        )
+        frozen = _freeze_mapping(self.arguments)
         object.__setattr__(self, "arguments", frozen)
         computed_digest = digest_arguments(frozen)
         if not self.arguments_digest:
@@ -277,7 +276,7 @@ class HumanDecisionProvider:
         if inspect.isawaitable(value):
             value = await value
         if isinstance(value, DecisionRecord):
-            return value
+            return value if value.approver else replace(value, approver=self._approver)
         if isinstance(value, bool):
             outcome = DecisionOutcome.ALLOW if value else DecisionOutcome.DENY
         elif isinstance(value, DecisionOutcome):
@@ -353,35 +352,3 @@ def _reject_mismatch(name: str, decision_value: str | None, request_value: str |
 
 def _optional_str(value: Any) -> str | None:
     return None if value is None else str(value)
-
-
-def _json_safe(value: Any) -> Any:
-    if value is None or isinstance(value, str | int | float | bool):
-        return value
-    if isinstance(value, Mapping):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, list | tuple):
-        return [_json_safe(item) for item in value]
-    if isinstance(value, set | frozenset):
-        return sorted(_json_safe(item) for item in value)
-    return f"[UNSERIALIZABLE:{type(value).__module__}.{type(value).__qualname__}]"
-
-
-def _freeze(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return MappingProxyType({str(key): _freeze(item) for key, item in value.items()})
-    if isinstance(value, list | tuple):
-        return tuple(_freeze(item) for item in value)
-    if isinstance(value, set | frozenset):
-        return frozenset(_freeze(item) for item in value)
-    return value
-
-
-def _thaw(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {str(key): _thaw(item) for key, item in value.items()}
-    if isinstance(value, tuple | list):
-        return [_thaw(item) for item in value]
-    if isinstance(value, set | frozenset):
-        return sorted(_thaw(item) for item in value)
-    return _json_safe(value)

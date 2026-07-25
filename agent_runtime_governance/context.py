@@ -3,10 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum, IntEnum
-from types import MappingProxyType
 from typing import Any, Mapping
 from uuid import uuid4
 
+from ._serialization import freeze as _freeze
+from ._serialization import freeze_mapping as _freeze_mapping
+from ._serialization import json_safe as _json_safe
+from ._serialization import thaw as _thaw
 from .decisions import DecisionOutcome, DecisionRecord
 from .errors import ContextMutationError
 
@@ -291,7 +294,9 @@ class ExecutionContext:
             execution_mode=ExecutionMode(data.get("execution_mode", "mutating")),
             idempotency_key=data.get("idempotency_key"),
             deadline=(
-                datetime.fromisoformat(str(data["deadline"]))
+                datetime.fromisoformat(
+                    str(data["deadline"]).replace("Z", "+00:00")
+                )
                 if data.get("deadline")
                 else None
             ),
@@ -319,37 +324,3 @@ class ExecutionContext:
             result=data.get("result"),
             error=data.get("error"),
         )
-
-
-def _freeze_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
-    return MappingProxyType({str(key): _freeze(item) for key, item in value.items()})
-
-
-def _freeze(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return _freeze_mapping(value)
-    if isinstance(value, list | tuple):
-        return tuple(_freeze(item) for item in value)
-    if isinstance(value, set | frozenset):
-        return frozenset(_freeze(item) for item in value)
-    return value
-
-
-def _thaw(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {key: _thaw(item) for key, item in value.items()}
-    if isinstance(value, tuple | list):
-        return [_thaw(item) for item in value]
-    if isinstance(value, set | frozenset):
-        return sorted(_thaw(item) for item in value)
-    return _json_safe(value)
-
-
-def _json_safe(value: Any) -> Any:
-    if value is None or isinstance(value, str | int | float | bool):
-        return value
-    if isinstance(value, Enum):
-        return value.value
-    if isinstance(value, Mapping | list | tuple | set | frozenset):
-        return _thaw(value)
-    return f"[UNSERIALIZABLE:{type(value).__module__}.{type(value).__qualname__}]"

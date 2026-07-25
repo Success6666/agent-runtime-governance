@@ -86,14 +86,14 @@ def normalize_json(value: Any, *, path: str = "$", depth: int = 0) -> Any:
     """Return deterministic JSON data without invoking arbitrary object repr hooks."""
     if depth > 100:
         raise ContractValidationError(path, "maximum nesting depth exceeded")
+    if isinstance(value, Enum):
+        return normalize_json(value.value, path=path, depth=depth + 1)
     if value is None or isinstance(value, str | bool | int):
         return value
     if isinstance(value, float):
         if not math.isfinite(value):
             raise ContractValidationError(path, "non-finite numbers are not valid JSON")
         return value
-    if isinstance(value, Enum):
-        return normalize_json(value.value, path=path, depth=depth + 1)
     if isinstance(value, Mapping):
         result: dict[str, Any] = {}
         for key, item in value.items():

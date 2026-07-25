@@ -293,26 +293,24 @@ def test_static_identity_provider_is_trusted_boundary_only() -> None:
     ("changes", "message"),
     [
         ({"exp": 0}, "expired"),
-        (
-            {
-                "nbf": (datetime.now(timezone.utc) + timedelta(minutes=1)).timestamp()
-            },
-            "not active",
-        ),
+        ({"nbf_offset_seconds": 60}, "not active"),
         ({"audience": "different-runtime"}, "audience"),
-        (
-            {
-                "exp": (
-                    datetime.now(timezone.utc) + timedelta(minutes=10)
-                ).timestamp()
-            },
-            "lifetime",
-        ),
+        ({"exp_offset_seconds": 600}, "lifetime"),
     ],
 )
 def test_hmac_identity_rejects_invalid_time_and_audience(
     changes: dict[str, object], message: str
 ) -> None:
+    changes = dict(changes)
+    now = datetime.now(timezone.utc)
+    if "nbf_offset_seconds" in changes:
+        changes["nbf"] = (
+            now + timedelta(seconds=int(changes.pop("nbf_offset_seconds")))
+        ).timestamp()
+    if "exp_offset_seconds" in changes:
+        changes["exp"] = (
+            now + timedelta(seconds=int(changes.pop("exp_offset_seconds")))
+        ).timestamp()
     claims = identity_claims(**changes)
     envelope = HMACClaimsIdentityProvider.sign_claims(claims, HMAC_KEY)
     provider = HMACClaimsIdentityProvider(
@@ -545,8 +543,7 @@ def test_approval_is_not_consumed_when_pre_execute_hook_denies(tmp_path) -> None
 def test_sqlite_approval_lock_contention_fails_closed(tmp_path) -> None:
     path = tmp_path / "approval-lock.db"
     store = SQLiteApprovalStore(path, timeout_seconds=0.01)
-    blocker = sqlite3.connect(path, timeout=0.01, isolation_level=None)
-    blocker.execute("BEGIN IMMEDIATE")
+    blocker: sqlite3.Connection | None = None
     calls: list[str] = []
     runtime = Runtime([DecisionMiddleware(store=store)])
 
@@ -555,11 +552,16 @@ def test_sqlite_approval_lock_contention_fails_closed(tmp_path) -> None:
         calls.append("executed")
 
     try:
+        blocker = sqlite3.connect(path, timeout=0.01, isolation_level=None)
+        blocker.execute("BEGIN IMMEDIATE")
         with pytest.raises(GovernanceDenied, match="failed closed"):
             operate(_governance=InvocationOptions(request_id="locked-approval"))
     finally:
-        blocker.rollback()
-        blocker.close()
+        if blocker is not None:
+            blocker.rollback()
+            blocker.close()
+        runtime.close()
+        store.close()
     assert calls == []
 
 
