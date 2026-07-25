@@ -238,7 +238,7 @@ class DecisionMiddleware(GatingMiddleware):
                     source=self.name,
                 )
             return decision.bind_to(request)
-        except TimeoutError:
+        except (asyncio.TimeoutError, TimeoutError):
             return denial_for_request(
                 request, "decision provider timed out", source=self.name
             )

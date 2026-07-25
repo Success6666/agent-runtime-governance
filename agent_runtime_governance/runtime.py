@@ -30,6 +30,7 @@ from .errors import (
     AuditDeliveryError,
     ContractValidationError,
     ExecutionControlError,
+    GovernanceCancelledError,
     GovernanceDenied,
     ToolExecutionError,
 )
@@ -274,10 +275,12 @@ class Runtime:
             context = await self._emit_hook(
                 HookPoint.BEFORE_PIPELINE, context, allow_critical=True
             )
-            context = await self._run_pre_pipeline(context)
-            context = await self._emit_hook(
-                HookPoint.AFTER_PIPELINE, context, allow_critical=True
-            )
+            if not context.denied:
+                context = await self._run_pre_pipeline(context)
+            if not context.denied:
+                context = await self._emit_hook(
+                    HookPoint.AFTER_PIPELINE, context, allow_critical=True
+                )
             context = self._enforce_required_approval(context)
             if context.denied:
                 context = await self._release_approvals(context)
@@ -301,8 +304,7 @@ class Runtime:
             context = await self._handle_cancellation(
                 context, started, uncertain=False
             )
-            setattr(exc, "context", context)
-            raise
+            raise GovernanceCancelledError(context) from exc
         claim: IdempotencyClaim | None = None
         heartbeat_task: asyncio.Task[None] | None = None
         tool_returned = False
@@ -472,8 +474,7 @@ class Runtime:
                 uncertain=execution_started,
                 claim=claim,
             )
-            setattr(exc, "context", context)
-            raise
+            raise GovernanceCancelledError(context) from exc
         except Exception as exc:
             if not execution_started:
                 context = await self._release_approvals(context)
@@ -511,8 +512,7 @@ class Runtime:
             context = await self._run_observers(context, post=True)
         except asyncio.CancelledError as exc:
             context = await self._handle_cancellation(context, started, uncertain=True)
-            setattr(exc, "context", context)
-            raise
+            raise GovernanceCancelledError(context) from exc
         return RunResult(value=value, context=context)
 
     async def apreview(
@@ -540,12 +540,14 @@ class Runtime:
             context = await self._emit_hook(
                 HookPoint.BEFORE_PIPELINE, context, allow_critical=True
             )
-            context = await self._run_pre_pipeline(
-                context, replayable_only=replayable_only
-            )
-            context = await self._emit_hook(
-                HookPoint.AFTER_PIPELINE, context, allow_critical=True
-            )
+            if not context.denied:
+                context = await self._run_pre_pipeline(
+                    context, replayable_only=replayable_only
+                )
+            if not context.denied:
+                context = await self._emit_hook(
+                    HookPoint.AFTER_PIPELINE, context, allow_critical=True
+                )
             context = self._enforce_required_approval(context)
             return await self._release_approvals(context)
         except asyncio.CancelledError as exc:
@@ -553,8 +555,7 @@ class Runtime:
             context = await self._handle_cancellation(
                 context, started, uncertain=False
             )
-            setattr(exc, "context", context)
-            raise
+            raise GovernanceCancelledError(context) from exc
 
     async def areplay(self, context: ExecutionContext) -> ExecutionContext:
         """Reapply deterministic middleware to a recorded request identity."""

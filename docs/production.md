@@ -34,6 +34,11 @@ cancellation cannot stop arbitrary synchronous Python or an already dispatched
 external side effect. When a mutating operation may have started, the terminal
 state is `UNKNOWN`.
 
+Call `get_cancellation_context(error)` in a `CancelledError` handler to recover
+the finalized governance state on every supported Python version. Python 3.10
+re-materializes task cancellation exceptions and therefore cannot guarantee
+that custom attributes remain directly attached to the caught exception.
+
 Never automatically retry `UNKNOWN`. Reconcile the external system using the
 trace ID, request ID, tool name, and idempotency key. After confirming the
 outcome, close the operational incident or write a new compensating action with

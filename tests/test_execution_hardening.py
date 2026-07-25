@@ -21,7 +21,11 @@ from agent_runtime_governance.context import (
     ExecutionStatus,
     ToolCall,
 )
-from agent_runtime_governance.errors import GovernanceDenied, ToolExecutionError
+from agent_runtime_governance.errors import (
+    GovernanceDenied,
+    ToolExecutionError,
+    get_cancellation_context,
+)
 from agent_runtime_governance.hooks import HookPoint
 from agent_runtime_governance.resilience import StageTimeoutError, await_stage
 
@@ -408,8 +412,10 @@ async def test_after_execute_cancellation_preserves_unknown_context() -> None:
     task.cancel()
     with pytest.raises(asyncio.CancelledError) as caught:
         await task
-    assert caught.value.context.status is ExecutionStatus.UNKNOWN
-    assert any(item.outcome == "cancelled" for item in caught.value.context.history)
+    context = get_cancellation_context(caught.value)
+    assert context is not None
+    assert context.status is ExecutionStatus.UNKNOWN
+    assert any(item.outcome == "cancelled" for item in context.history)
 
 
 @pytest.mark.asyncio
