@@ -1,9 +1,12 @@
 # Agent Runtime Governance
 
 [![CI](https://github.com/Success6666/agent-runtime-governance/actions/workflows/ci.yml/badge.svg)](https://github.com/Success6666/agent-runtime-governance/actions/workflows/ci.yml)
+[![Integration](https://github.com/Success6666/agent-runtime-governance/actions/workflows/integration.yml/badge.svg)](https://github.com/Success6666/agent-runtime-governance/actions/workflows/integration.yml)
+[![codecov](https://codecov.io/gh/Success6666/agent-runtime-governance/branch/main/graph/badge.svg)](https://codecov.io/gh/Success6666/agent-runtime-governance)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB.svg)](https://www.python.org/)
+[![PyPI](https://img.shields.io/pypi/v/agent-runtime-governance.svg)](https://pypi.org/project/agent-runtime-governance/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
-[![Release: v0.4.2](https://img.shields.io/badge/release-v0.4.2-6f42c1.svg)](https://github.com/Success6666/agent-runtime-governance/releases/tag/v0.4.2)
+[![Release: v0.5.0](https://img.shields.io/badge/release-v0.5.0-6f42c1.svg)](https://github.com/Success6666/agent-runtime-governance/releases/tag/v0.5.0)
 
 A lightweight, framework-agnostic runtime governance framework for AI agents.
 It governs an immutable `ExecutionContext` through a deterministic middleware
@@ -13,17 +16,19 @@ replayable trace.
 ## Quick start
 
 ```bash
-pip install "agent-runtime-governance @ git+https://github.com/Success6666/agent-runtime-governance.git@v0.4.2"
+pip install agent-runtime-governance
 ```
 
 ```python
-from agent_runtime_governance import Runtime
+from pathlib import Path
+
+from agent_runtime_governance import ExecutionMode, Runtime
 
 runtime = Runtime()
 
-@runtime.tool()
+@runtime.tool(execution_mode=ExecutionMode.READ_ONLY)
 def read_file(path: str) -> str:
-    return open(path, encoding="utf-8").read()
+    return Path(path).read_text(encoding="utf-8")
 
 print(read_file("README.md"))
 ```
@@ -31,6 +36,8 @@ print(read_file("README.md"))
 Add deterministic rules, semantic review, human decisions, and signed audit:
 
 ```python
+import os
+
 from agent_runtime_governance import (
     ApprovalMiddleware, AuditMiddleware, HumanDecisionProvider,
     InvocationOptions, JSONLAuditSink, LLMMiddleware, RiskTier,
@@ -41,7 +48,9 @@ runtime = Runtime([
     RuleMiddleware([Rule("explicit-wipe", r"\bwipe\s+all\b", "bulk wipe is forbidden")]),
     LLMMiddleware(lambda ctx: True),
     ApprovalMiddleware(HumanDecisionProvider(lambda ctx, request: True)),
-    AuditMiddleware(JSONLAuditSink("audit.log", sign_key="replace-me")),
+    AuditMiddleware(
+        JSONLAuditSink("audit.log", sign_key=os.environ["ARG_AUDIT_HMAC_KEY"])
+    ),
 ])
 
 @runtime.tool(risk=RiskTier.HIGH, requires_approval=True)
@@ -84,8 +93,10 @@ Explicit Decision -> Tool Executor -> Final Audit Snapshot
 ```
 
 Gating middleware may stop execution and fails closed. Observing middleware
-cannot grant permission and its failure does not interrupt an allowed tool.
-Earlier denials cannot be overridden by later middleware.
+cannot grant permission and normally cannot interrupt an allowed tool. An audit
+sink explicitly configured as critical is the exception: failed delivery stops
+the call because an unaudited privileged action is not allowed. Earlier denials
+cannot be overridden by later middleware.
 
 ## Design principles
 
@@ -204,6 +215,61 @@ Install only the integrations an application uses:
 pip install "agent-runtime-governance[yaml,prometheus,crewai]"
 ```
 
+## Production reliability
+
+v0.5 focuses on production behavior instead of adding a new agent framework:
+
+- idempotent tool execution with mandatory keys and in-memory or SQLite stores;
+- durable approval recovery with leased reserve/commit/release transitions;
+- absolute deadline propagation through admission, middleware, identity, tools,
+  and idempotency waits;
+- cancellation handling that records mutating in-flight work as `UNKNOWN`;
+- trusted HMAC identity envelopes with replay protection;
+- contract validation for parameters, results, and payload size limits;
+- reliable JSONL and SQLite audit sinks with hash-chain verification;
+- bounded concurrency, external integration circuit breakers, and fault tests.
+
+The production smoke suite starts real Docker services for OPA and the
+OpenTelemetry Collector, exports through OTLP HTTP, scrapes a real Prometheus
+`/metrics` endpoint, and can run a local Kind smoke with a pinned node image:
+
+```bash
+python integration/production_smoke.py --skip-kind
+python integration/production_smoke.py
+```
+
+Production deployments must configure a trusted identity provider with
+`require_verified_identity=True`; caller-supplied `user`, `tenant`, and
+`permissions` fields are compatibility inputs, not a trust boundary. SQLite
+stores coordinate processes on one host and require a distributed adapter for
+multi-host deployments.
+
+### v0.5 verification baseline
+
+The 2026-07-26 release candidate was validated on Windows 11 with Python 3.12,
+Docker Engine 29.4.2, and Kind 0.31.0:
+
+- 251 tests passed with 83.74% branch coverage; the enforced floor is 80%;
+- 13 repository-policy tests passed;
+- real OPA HTTP allow/deny, OTLP HTTP export to an OpenTelemetry Collector,
+  Prometheus scraping, and a Kind 1.34.3 control-plane readiness check passed;
+- the wheel and source distribution installed and imported from separate clean
+  virtual environments; and
+- an isolated wheel environment with the OTel, YAML, and Prometheus extras had
+  no known dependency vulnerabilities reported by `pip-audit` 2.10.1 at the
+  time of the run.
+
+These are point-in-time verification results, not a latency SLA or a guarantee
+against future advisories. CI repeats the test matrix, policy checks, dependency
+audit, and Docker integration smoke from clean runners.
+
+Benchmarks measure incremental runtime overhead for baseline, Rule, OPA, Audit,
+OpenTelemetry, and 10-middleware pipelines:
+
+```bash
+python benchmarks/benchmark_runtime.py --requests 100,500,1000 --concurrency 100
+```
+
 ## Releases
 
 | Version | Scope |
@@ -214,8 +280,9 @@ pip install "agent-runtime-governance[yaml,prometheus,crewai]"
 | v0.4.0 | Trusted plugins, Prometheus, Slack, OPA, and six framework integrations |
 | v0.4.1 | Mandatory linked issues and merge-policy verification |
 | v0.4.2 | Fail-closed CodeRabbit review verification for the current commit |
+| v0.5.0 | Production reliability: idempotency, identity, durable approvals, audit, deadlines, cancellation, contracts, real integration smoke |
 
-All four versions are preserved as immutable Git tags. See
+All versions are preserved as immutable Git tags. See
 [CHANGELOG.md](CHANGELOG.md) for the detailed compatibility and security notes.
 
 ## Non-goals
@@ -230,16 +297,22 @@ All four versions are preserved as immutable Git tags. See
 See [ARCHITECTURE.md](ARCHITECTURE.md) for invariants and
 [ROADMAP.md](ROADMAP.md) for the deliberately staged scope. Security reports and
 integration boundaries are documented in [SECURITY.md](SECURITY.md).
+Contributor workflow and plugin contribution rules are documented in
+[CONTRIBUTING.md](CONTRIBUTING.md). Production configuration and recovery are
+covered in [docs/production.md](docs/production.md), and the release procedure
+is defined in [RELEASING.md](RELEASING.md).
 
 ## Development
 
 ```bash
 python -m pip install -e ".[dev]"
 pytest
+python integration/production_smoke.py --skip-kind
 python -m build
 ```
 
-Python 3.10+ is supported. The core package has no runtime dependencies.
+Python 3.10+ is supported. The core package depends on `filelock` and
+`jsonschema`; optional integrations are installed via extras.
 
 Pull requests must link an existing issue in this repository with a closing
 keyword such as `Fixes #123`. A repository workflow closes unlinked pull
@@ -247,8 +320,8 @@ requests automatically. Pull requests to `main` must also pass every CI job and
 the CodeRabbit status, receive a verified CodeRabbit approval for the current
 head commit, resolve blocking reviews, and receive one approval from the code
 owner. A skipped, rate-limited, stale, or missing CodeRabbit review fails closed.
-Repository administrators retain direct-push access for controlled maintenance
-and release operations.
+Maintainers use the same issue and pull request flow as external contributors;
+direct pushes to `main` are disabled for administrators as well.
 
 ## License
 

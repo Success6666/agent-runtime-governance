@@ -2,6 +2,60 @@
 
 All notable changes are documented here.
 
+## [0.5.0] - 2026-07-26
+
+### Added
+
+- Idempotent execution modes with in-memory and SQLite ledgers, lease renewal,
+  result reuse, conflict detection, and explicit `UNKNOWN` recovery state.
+- Persistent approval stores, trusted HMAC identity providers, and replay
+  protection for short-lived identity envelopes.
+- Absolute deadline propagation, runtime bulkheads, cancellation handling,
+  synchronous tool context propagation, and contract validation for parameters,
+  results, and payload size limits.
+- Reliable JSONL and SQLite audit/snapshot stores with hash-chain verification,
+  redaction, and critical fail-closed delivery.
+- Docker-backed production smoke tests for real OPA HTTP decisions, real OTLP
+  HTTP export to an OpenTelemetry Collector, Prometheus `/metrics` scraping,
+  and optional Kind example deployment.
+- Fault, property, concurrency, benchmark, security, release, dependency-review,
+  CodeQL, PyPI publish, and provenance verification assets.
+
+### Fixed
+
+- OpenTelemetry spans now propagate correctly into synchronous tool threads
+  without leaking cross-task context managers.
+- Slack notifications no longer forward raw policy or user-supplied denial
+  reasons.
+- Prometheus records `unknown` terminal outcomes so uncertain mutating writes
+  are visible in metrics.
+- Idempotency acquisition cancellation no longer waits on slow storage I/O and
+  orphaned owner claims are settled as `UNKNOWN`.
+- Idempotent tools without a key are now denied before execution, and absolute
+  deadlines bound slow ledger acquisition.
+- Tool execution now consumes the same isolated parameter snapshot used by
+  contract validation, approval binding, and idempotency fingerprints.
+- Durable approvals use leased reservation and commit transitions so later
+  gates or critical pre-execution hooks cannot consume an unused approval.
+- Uncooperative asynchronous tools retain execution capacity until the real
+  task exits, preventing cancellation from bypassing the runtime bulkhead.
+- OPA smoke policy fixtures use Rego v1 syntax and service readiness tolerates
+  transient connection resets without hiding terminal failures.
+
+### Changed
+
+- Raised the `filelock` runtime floor to 3.20.3 so supported installations do
+  not retain releases affected by known security advisories.
+- Raised the isolated build backend floor to `setuptools` 83.0.0 and upgraded
+  CI/release installers to `pip` 26.1.2 or newer.
+- Maintainers must use issue-linked pull requests; administrator direct pushes
+  to `main` are no longer part of the project workflow.
+- Release verification now checks both wheel and sdist distributions and
+  verifies GitHub artifact attestations against the expected release workflow
+  and tag ref before PyPI publishing.
+- Release artifacts are built only when the tag commit belongs to protected
+  `main`, after tests, dependency audit, and Docker integration smoke rerun.
+
 ## [0.4.2] - 2026-07-25
 
 ### Added
