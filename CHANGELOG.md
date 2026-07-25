@@ -41,6 +41,10 @@ All notable changes are documented here.
   task exits, preventing cancellation from bypassing the runtime bulkhead.
 - OPA smoke policy fixtures use Rego v1 syntax and service readiness tolerates
   transient connection resets without hiding terminal failures.
+- SQLite-backed stores serialize one-time WAL initialization across processes,
+  avoiding startup lock races while retaining normal concurrent access.
+- Cancellation context recovery now works across Python 3.10-3.13 without
+  relying on version-specific `CancelledError` attribute preservation.
 
 ### Changed
 
