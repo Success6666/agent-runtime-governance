@@ -10,7 +10,7 @@ It governs an immutable `ExecutionContext` through a deterministic middleware
 pipeline, then produces an explicit decision, an auditable execution, and a
 replayable trace.
 
-## 快速启动
+## Quick start
 
 ```bash
 pip install "agent-runtime-governance @ git+https://github.com/Success6666/agent-runtime-governance.git@v0.4.1"
