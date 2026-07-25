@@ -105,6 +105,7 @@ class RuntimeLimits:
     observer_timeout_seconds: float = 5.0
     hook_timeout_seconds: float = 5.0
     execution_timeout_seconds: float = 30.0
+    idempotency_operation_timeout_seconds: float = 30.0
     admission_timeout_seconds: float = 1.0
     cancellation_grace_seconds: float = 0.25
     max_in_flight: int = 128
@@ -115,6 +116,7 @@ class RuntimeLimits:
             "observer_timeout_seconds",
             "hook_timeout_seconds",
             "execution_timeout_seconds",
+            "idempotency_operation_timeout_seconds",
             "admission_timeout_seconds",
             "cancellation_grace_seconds",
         ):
