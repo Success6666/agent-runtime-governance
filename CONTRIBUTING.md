@@ -18,6 +18,12 @@ merge only after required checks and review are complete.
 Unlinked pull requests are closed automatically. Administrators are protected by
 the same branch rules as everyone else.
 
+GitHub prohibits pull request authors from approving their own changes. While
+the repository has one maintainer, merges therefore rely on the linked issue,
+all required CI/security checks, a current CodeRabbit approval, and resolved
+review threads without a human approval count. Add one required code-owner and
+last-push approval as soon as a second maintainer is available.
+
 ## Local validation
 
 ```bash

@@ -318,10 +318,13 @@ Pull requests must link an existing issue in this repository with a closing
 keyword such as `Fixes #123`. A repository workflow closes unlinked pull
 requests automatically. Pull requests to `main` must also pass every CI job and
 the CodeRabbit status, receive a verified CodeRabbit approval for the current
-head commit, resolve blocking reviews, and receive one approval from the code
-owner. A skipped, rate-limited, stale, or missing CodeRabbit review fails closed.
-Maintainers use the same issue and pull request flow as external contributors;
-direct pushes to `main` are disabled for administrators as well.
+head commit, and resolve blocking reviews. A skipped, rate-limited, stale, or
+missing CodeRabbit review fails closed. GitHub does not allow a pull request
+author to approve their own change, so the single-maintainer phase has no human
+approval count; one code-owner approval and last-push approval become mandatory
+when a second maintainer is added. Maintainers still use the same issue and pull
+request flow as external contributors, and administrators cannot push directly
+to `main` or bypass protection.
 
 ## License
 

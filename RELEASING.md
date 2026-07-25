@@ -5,6 +5,10 @@ push release commits directly to `main`; version and changelog changes use the
 same issue, pull request, CI, CodeRabbit, and merge process as every other
 change.
 
+During the single-maintainer phase, GitHub cannot accept self-approval. Release
+pull requests still require every status and CodeRabbit gate; a human code-owner
+approval becomes mandatory when a second maintainer is added.
+
 ## One-time PyPI setup
 
 1. Create the `agent-runtime-governance` project on PyPI or configure a pending
