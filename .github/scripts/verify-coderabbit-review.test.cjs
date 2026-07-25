@@ -150,6 +150,34 @@ test("uses the latest current-head review", () => {
   assert.equal(latest.state, "APPROVED");
 });
 
+test("ignores thread replies submitted after a current-head approval", async () => {
+  const state = harness({
+    reviews: [
+      review("APPROVED", "current-sha", "2026-07-25T00:01:00Z"),
+      review("COMMENTED", "current-sha", "2026-07-25T00:02:00Z"),
+    ],
+  });
+
+  await verifyCodeRabbitReview(state);
+
+  assert.equal(state.failures.length, 0);
+  assert.match(state.info[0], /approved/);
+});
+
+test("a later change request overrides a current-head approval", async () => {
+  const state = harness({
+    reviews: [
+      review("APPROVED", "current-sha", "2026-07-25T00:01:00Z"),
+      review("COMMENTED", "current-sha", "2026-07-25T00:02:00Z"),
+      review("CHANGES_REQUESTED", "current-sha", "2026-07-25T00:03:00Z"),
+    ],
+  });
+
+  await verifyCodeRabbitReview(state);
+
+  assert.match(state.failures[0], /requested changes/);
+});
+
 test("fails immediately when the PR was already closed", async () => {
   const state = harness({ pullState: "closed" });
 
