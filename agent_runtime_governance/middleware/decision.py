@@ -156,8 +156,29 @@ class DecisionMiddleware(GatingMiddleware):
 
     async def commit_approval(self, context: ExecutionContext) -> ExecutionContext:
         reservation = self._pop_reservation(context.trace_id)
-        if reservation is None or self._store is None:
+        if self._store is None:
             return context
+        if reservation is None:
+            if not context.metadata.get("approval_granted"):
+                return context
+            decision = DecisionRecord(
+                DecisionOutcome.DENY,
+                "approval reservation was unavailable at the execution boundary",
+                self.name,
+                request_id=_metadata_text(context, "approval_request_id"),
+                tool_name=context.tool_call.name,
+                subject=context.user,
+                tenant=context.tenant,
+                identity_issuer=_metadata_text(context, "identity_issuer"),
+            )
+            return context.with_decision(decision).append_history(
+                HistoryEntry(
+                    self.name,
+                    "deny",
+                    decision.reason,
+                    data={"request_id": decision.request_id},
+                )
+            )
         request, token = reservation
         try:
             decision = await asyncio.to_thread(self._store.commit, request, token)

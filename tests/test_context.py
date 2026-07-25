@@ -14,6 +14,7 @@ from agent_runtime_governance import (
     RiskTier,
     ToolCall,
 )
+from agent_runtime_governance._serialization import thaw
 
 
 def make_context(**changes: object) -> ExecutionContext:
@@ -55,6 +56,34 @@ def test_context_freezes_tool_arguments() -> None:
     call = ToolCall("x", kwargs={"options": {"force": False}})
     with pytest.raises(TypeError):
         call.kwargs["options"]["force"] = True  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: ToolCall("x", kwargs={1: "integer", "1": "string"}),
+        lambda: ExecutionContext.create(ToolCall("x"), metadata={1: "invalid"}),
+        lambda: HistoryEntry("test", "allow", data={1: "invalid"}),
+    ],
+)
+def test_context_rejects_non_string_mapping_keys(factory) -> None:
+    with pytest.raises(TypeError, match="mapping keys must be strings"):
+        factory()
+
+
+def test_thaw_rejects_non_string_mapping_keys() -> None:
+    with pytest.raises(TypeError, match="mapping keys must be strings"):
+        thaw({1: "invalid"})
+
+
+def test_context_serializes_heterogeneous_sets_deterministically() -> None:
+    context = ExecutionContext.create(
+        ToolCall("x"),
+        metadata={"mixed": {1, "x"}},
+    )
+
+    assert context.to_dict()["metadata"]["mixed"] == [1, "x"]
+    assert context.to_dict() == context.to_dict()
 
 
 @pytest.mark.parametrize("field", ["trace_id", "user", "tenant", "tool_call", "input_text"])
