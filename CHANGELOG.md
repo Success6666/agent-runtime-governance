@@ -2,6 +2,18 @@
 
 All notable changes are documented here.
 
+## [0.4.1] - 2026-07-25
+
+### Added
+
+- GitHub-native linked-issue enforcement for every pull request.
+- Pull request template with an explicit closing-keyword issue field.
+- Repository-policy tests in CI and CodeRabbit as a required status context.
+
+### Changed
+
+- The README quick-start heading is now explicitly labelled in Chinese.
+
 ## [0.4.0] - 2026-07-25
 
 ### Added

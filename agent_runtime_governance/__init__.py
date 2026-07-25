@@ -74,7 +74,7 @@ from .telemetry import OpenTelemetryMiddleware
 from .visualization import trace_to_mermaid
 from .yaml_policy import PolicyDocument, PolicyValidationError, YAMLPolicyLoader
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 __all__ = [
     "ApprovalMiddleware",
