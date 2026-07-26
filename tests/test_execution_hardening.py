@@ -137,6 +137,30 @@ class DenyAtExecutionBoundary(GatingMiddleware):
         )
 
 
+class StalledApprovalCommit(GatingMiddleware):
+    name = "stalled-approval-commit"
+
+    async def process(self, context: ExecutionContext) -> ExecutionContext:
+        return context
+
+    async def commit_approval(self, context: ExecutionContext) -> ExecutionContext:
+        await asyncio.Event().wait()
+        return context
+
+
+class StalledApprovalRelease(GatingMiddleware):
+    name = "stalled-approval-release"
+
+    async def process(self, context: ExecutionContext) -> ExecutionContext:
+        return context.with_decision(
+            DecisionRecord(DecisionOutcome.DENY, "release required", self.name)
+        )
+
+    async def release_approval(self, context: ExecutionContext) -> ExecutionContext:
+        await asyncio.Event().wait()
+        return context
+
+
 def test_default_mutating_tool_is_not_retried() -> None:
     attempts = 0
     runtime = Runtime([RetryMiddleware(max_attempts=3, retry_on=(ConnectionError,))])
@@ -154,6 +178,54 @@ def test_default_mutating_tool_is_not_retried() -> None:
     assert caught.value.context.tool_call.name == "write"
     assert caught.value.context.status is ExecutionStatus.UNKNOWN
     assert any(entry.outcome == "skipped" for entry in caught.value.context.history)
+
+
+@pytest.mark.asyncio
+async def test_stalled_approval_commit_honors_runtime_timeout() -> None:
+    runtime = Runtime(
+        [StalledApprovalCommit()],
+        limits=RuntimeLimits(
+            middleware_timeout_seconds=0.01,
+            cancellation_grace_seconds=0.01,
+        ),
+    )
+    executions = 0
+
+    @runtime.tool()
+    async def operate() -> None:
+        nonlocal executions
+        executions += 1
+
+    started = time.perf_counter()
+    with pytest.raises(ToolExecutionError) as caught:
+        await operate.ainvoke()
+    assert time.perf_counter() - started < 0.1 * LEASE_TIMING_SCALE
+    assert isinstance(caught.value.cause, StageTimeoutError)
+    assert executions == 0
+
+
+@pytest.mark.asyncio
+async def test_stalled_approval_release_is_bounded_on_denial() -> None:
+    runtime = Runtime(
+        [StalledApprovalRelease()],
+        limits=RuntimeLimits(
+            middleware_timeout_seconds=0.01,
+            cancellation_grace_seconds=0.01,
+        ),
+    )
+
+    @runtime.tool()
+    async def operate() -> None:
+        raise AssertionError("denied operation must not execute")
+
+    started = time.perf_counter()
+    with pytest.raises(GovernanceDenied) as caught:
+        await operate.ainvoke()
+    assert time.perf_counter() - started < 0.1 * LEASE_TIMING_SCALE
+    assert any(
+        entry.outcome == "approval_cleanup_error"
+        for entry in caught.value.context.history
+    )
 
 
 @pytest.mark.asyncio
