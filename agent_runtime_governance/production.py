@@ -8,7 +8,6 @@ from typing import Any, Iterable, Mapping, Protocol
 from ._serialization import thaw as _thaw
 from .action_contracts import ActionContract
 from .context import ExecutionMode
-from .identity import HMACClaimsIdentityProvider
 from .middleware.audit import AuditMiddleware
 from .middleware.decision import DecisionMiddleware
 from .pipeline import Pipeline
@@ -156,7 +155,7 @@ class ProductionProfile:
                 )
             if not require_verified_identity:
                 reasons.append(ProductionReadinessReason.VERIFIED_IDENTITY_REQUIRED)
-            if isinstance(identity_provider, HMACClaimsIdentityProvider) and not _capability(
+            if hasattr(identity_provider, "replay_store") and not _capability(
                 identity_provider.replay_store, "production_durable"
             ):
                 reasons.append(
