@@ -115,12 +115,16 @@ verified deletion from replicas. Treat `from_dict()` as parsing only.
 `Runtime.areplay()` is non-authoritative policy analysis and deliberately does
 not create `BoundAction`. For a current bound preview, verify the snapshot chain
 externally and call `Runtime.apreview()` with freshly verified identity claims;
-do not promote replay output into authorization evidence.
+do not promote replay output into authorization evidence. Replay preserves
+non-governance correlation metadata, removes identity/approval/policy metadata,
+and returns `replay.parameter_validation_failed` when recorded parameters no
+longer satisfy the current tool contract.
 
 Precondition providers receive the contract, exact normalized parameters,
 verified principal, and tenant. They must return a lowercase SHA-256 digest,
 finish within the middleware/deadline budget, and fail closed on stale,
-missing, or ambiguous state. Entry-time revalidation narrows TOCTOU exposure
+missing, or ambiguous state. Final executor-boundary revalidation narrows
+TOCTOU exposure
 but cannot make an external write atomic. Strongly consistent side effects must
 send an ETag, version, CAS predicate, or transaction condition to the target
 system and have that system reject a changed state.

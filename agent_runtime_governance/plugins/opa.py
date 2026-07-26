@@ -136,6 +136,7 @@ class OPAMiddleware(GatingMiddleware):
     priority = 30
     replayable = False
     requires_action_policy_identity = True
+    requires_fail_closed_in_production = True
 
     def __init__(
         self,

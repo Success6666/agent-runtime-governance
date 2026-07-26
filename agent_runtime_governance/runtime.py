@@ -509,17 +509,6 @@ class Runtime:
                 context = await self._release_approvals(context)
                 context = await self._run_observers(context, post=True)
                 raise GovernanceDenied(context)
-            try:
-                context = await self._revalidate_bound_action(
-                    spec,
-                    context,
-                    execution_args,
-                    execution_kwargs,
-                )
-            except GovernanceDenied as exc:
-                context = await self._release_approvals(exc.context)
-                context = await self._run_observers(context, post=True)
-                raise GovernanceDenied(context) from exc
         except asyncio.CancelledError as exc:
             context = await asyncio.shield(self._release_approvals(context))
             context = await self._handle_cancellation(context, started, uncertain=False)
@@ -859,16 +848,24 @@ class Runtime:
         )
         clean = clean.evolve(
             metadata={
+                **clean.metadata,
                 "replay_mode": "analysis",
                 "replay_authoritative": False,
             }
         )
-        self._prepare_parameters(
-            spec,
-            clean.tool_call.args,
-            dict(clean.tool_call.kwargs),
-            clean.deadline,
-        )
+        try:
+            self._prepare_parameters(
+                spec,
+                clean.tool_call.args,
+                dict(clean.tool_call.kwargs),
+                clean.deadline,
+            )
+        except (ContractValidationError, StageTimeoutError, ValueError):
+            reason = "replay.parameter_validation_failed"
+            decision = DecisionRecord(DecisionOutcome.DENY, reason, "replay")
+            return clean.with_decision(decision).append_history(
+                HistoryEntry("replay", "deny", reason)
+            )
         # Parameter preparation is retained so analysis sees the same defaults
         # and contract validation as admission. Persisted identity metadata is
         # intentionally insufficient to mint a new BoundAction.
