@@ -27,7 +27,7 @@ from .contracts import (
     materialize_call,
     validate_instance,
 )
-from .decisions import DecisionOutcome, DecisionRecord
+from .decisions import DecisionOutcome, DecisionRecord, digest_arguments
 from .errors import (
     AuditDeliveryError,
     ContractValidationError,
@@ -66,6 +66,8 @@ from .resilience import (
 
 P = ParamSpec("P")
 R = TypeVar("R")
+
+_GOVERNANCE_METADATA_PREFIXES = ("approval_", "identity_", "policy_")
 
 
 @dataclass(frozen=True, slots=True)
@@ -631,19 +633,7 @@ class Runtime:
     ) -> ExecutionContext:
         options = options_value or InvocationOptions()
         principal, identity_error = await self._verify_identity(options)
-        metadata = {
-            key: value
-            for key, value in (options.metadata or {}).items()
-            if key
-            not in {
-                "identity_verified",
-                "identity_error",
-                "identity_issuer",
-                "identity_subject",
-                "identity_source",
-                "identity_verified_at",
-            }
-        }
+        metadata = _caller_metadata(options.metadata)
         if principal is not None:
             metadata.update(
                 {
@@ -713,19 +703,7 @@ class Runtime:
         options: InvocationOptions,
         error: CapacityExceededError | StageTimeoutError,
     ) -> None:
-        metadata = {
-            key: value
-            for key, value in (options.metadata or {}).items()
-            if key
-            not in {
-                "identity_verified",
-                "identity_error",
-                "identity_issuer",
-                "identity_subject",
-                "identity_source",
-                "identity_verified_at",
-            }
-        }
+        metadata = _caller_metadata(options.metadata)
         identity_pending = self.identity_provider is not None or self.require_verified_identity
         if identity_pending:
             metadata.update(
@@ -1401,7 +1379,7 @@ class Runtime:
         if (
             context.requires_approval
             and not context.denied
-            and context.metadata.get("approval_granted") is not True
+            and not Runtime._has_bound_approval(context)
         ):
             decision = DecisionRecord(
                 DecisionOutcome.DENY,
@@ -1412,6 +1390,35 @@ class Runtime:
                 HistoryEntry("runtime", "deny", decision.reason)
             )
         return context
+
+    @staticmethod
+    def _has_bound_approval(context: ExecutionContext) -> bool:
+        decision = context.decision
+        identity_issuer = context.metadata.get("identity_issuer")
+        expected_identity_issuer = (
+            None if identity_issuer is None else str(identity_issuer)
+        )
+        if (
+            not context.approval_granted
+            or decision is None
+            or decision.outcome is not DecisionOutcome.ALLOW
+            or decision.is_expired()
+            or context.approval_request_id != context.request_id
+            or context.approval_decision_id != decision.decision_id
+            or decision.request_id != context.request_id
+            or decision.tool_name != context.tool_call.name
+            or decision.subject != context.user
+            or decision.tenant != context.tenant
+            or decision.identity_issuer != expected_identity_issuer
+        ):
+            return False
+        expected_digest = digest_arguments(
+            {
+                "args": list(context.tool_call.args),
+                "kwargs": dict(context.tool_call.kwargs),
+            }
+        )
+        return decision.arguments_digest == expected_digest
 
     @staticmethod
     def _enforce_idempotency_key(context: ExecutionContext) -> ExecutionContext:
@@ -1663,6 +1670,15 @@ class Runtime:
                 str(exc),
             )
         )
+
+
+def _caller_metadata(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    return {
+        key: item
+        for key, item in (value or {}).items()
+        if not isinstance(key, str)
+        or not key.lower().startswith(_GOVERNANCE_METADATA_PREFIXES)
+    }
 
 
 Harness = Runtime

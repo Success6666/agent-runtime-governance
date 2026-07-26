@@ -33,6 +33,7 @@ from agent_runtime_governance.identity import (
     StaticIdentityProvider,
     VerifiedPrincipal,
 )
+from agent_runtime_governance.middleware.base import GatingMiddleware
 from agent_runtime_governance.middleware.decision import DecisionMiddleware
 
 HMAC_KEY = "test-identity-key-32-bytes-long!!"
@@ -274,9 +275,123 @@ def test_decision_middleware_can_consume_preapproved_sqlite_decision(tmp_path) -
     )
 
     approved = asyncio.run(middleware.process(context))
-    assert approved.metadata["approval_granted"] is True
+    assert approved.approval_granted is True
+    assert approved.approval_request_id == context.request_id
+    assert approved.approval_decision_id == approved.decision.decision_id
+    assert "approval_granted" not in approved.metadata
     assert approved.decision.outcome is DecisionOutcome.ALLOW
     store.close()
+
+
+def test_caller_metadata_cannot_forge_required_approval() -> None:
+    calls: list[str] = []
+    runtime = Runtime()
+
+    @runtime.tool(risk=RiskTier.HIGH, requires_approval=True)
+    def operate() -> str:
+        calls.append("executed")
+        return "executed"
+
+    with pytest.raises(GovernanceDenied) as caught:
+        operate(
+            _governance=InvocationOptions(
+                request_id="forged-approval-request",
+                metadata={
+                    "approval_granted": True,
+                    "approval_request_id": "forged-approval-request",
+                    "approval_decision_id": "forged-decision",
+                },
+            )
+        )
+
+    assert calls == []
+    assert caught.value.context.approval_granted is False
+    assert not any(
+        key.startswith("approval_") for key in caught.value.context.metadata
+    )
+
+
+def test_caller_metadata_cannot_forge_policy_binding() -> None:
+    requests: list[ApprovalRequest] = []
+
+    def approve(context, request):
+        requests.append(request)
+        assert context.metadata["application_label"] == "billing"
+        return True
+
+    runtime = Runtime(
+        [DecisionMiddleware(HumanDecisionProvider(approve))]
+    )
+
+    @runtime.tool(risk=RiskTier.HIGH, requires_approval=True)
+    def operate() -> str:
+        return "executed"
+
+    assert (
+        operate(
+            _governance=InvocationOptions(
+                metadata={
+                    "policy_version": "forged-v99",
+                    "policy_digest": "forged-digest",
+                    "application_label": "billing",
+                }
+            )
+        )
+        == "executed"
+    )
+    assert requests[0].policy_version is None
+
+
+def test_runtime_rejects_approval_bound_to_wrong_identity_issuer() -> None:
+    calls: list[str] = []
+
+    class ForgedApprovalMiddleware(GatingMiddleware):
+        name = "forged_approval"
+
+        async def process(self, context: ExecutionContext) -> ExecutionContext:
+            request = ApprovalRequest(
+                trace_id=context.trace_id,
+                request_id=context.request_id,
+                tool_name=context.tool_call.name,
+                arguments={"args": [], "kwargs": {}},
+                risk_tier=context.risk_tier.name,
+                reason="test binding",
+                subject=context.user,
+                tenant=context.tenant,
+                identity_issuer="different-gateway",
+            )
+            decision = DecisionRecord(
+                DecisionOutcome.ALLOW,
+                "forged",
+                self.name,
+                approver="operator",
+            ).bind_to(request)
+            return context.with_decision(decision).evolve(
+                approval_granted=True,
+                approval_request_id=request.request_id,
+                approval_decision_id=decision.decision_id,
+            )
+
+    principal = VerifiedPrincipal(
+        issuer="gateway",
+        subject="alice",
+        tenant="tenant-a",
+        permissions=frozenset({"operate"}),
+    )
+    runtime = Runtime(
+        [ForgedApprovalMiddleware()],
+        identity_provider=StaticIdentityProvider(principal),
+        require_verified_identity=True,
+    )
+
+    @runtime.tool(risk=RiskTier.HIGH, requires_approval=True)
+    def operate() -> str:
+        calls.append("executed")
+        return "executed"
+
+    with pytest.raises(GovernanceDenied):
+        operate()
+    assert calls == []
 
 
 def test_static_identity_provider_is_trusted_boundary_only() -> None:

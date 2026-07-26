@@ -151,14 +151,68 @@ def test_denial_cannot_be_overridden() -> None:
 
 
 def test_context_round_trip_preserves_governance_state() -> None:
-    context = make_context(
+    base = make_context(
         risk_tier=RiskTier.HIGH,
         risk_score=0.8,
         status=ExecutionStatus.SUCCEEDED,
         result={"ok": True},
+    )
+    decision = DecisionRecord(
+        DecisionOutcome.ALLOW,
+        "approved",
+        "human",
+        request_id=base.request_id,
+        tool_name=base.tool_call.name,
+    )
+    context = base.evolve(
+        decision=decision,
+        approval_granted=True,
+        approval_request_id=base.request_id,
+        approval_decision_id=decision.decision_id,
     ).append_history(HistoryEntry("rule", "allow", "safe"))
     restored = ExecutionContext.from_dict(context.to_dict())
     assert restored.to_dict() == context.to_dict()
+
+
+def test_context_rejects_partial_approval_state() -> None:
+    with pytest.raises(ValueError, match="requires request and decision IDs"):
+        make_context(approval_granted=True)
+
+    with pytest.raises(ValueError, match="require a granted approval"):
+        make_context(approval_request_id="request")
+
+    decision = DecisionRecord(DecisionOutcome.ALLOW, "approved", "human")
+    with pytest.raises(ValueError, match="must match an allow decision"):
+        make_context(
+            decision=decision,
+            approval_granted=True,
+            approval_request_id="different-request",
+            approval_decision_id=decision.decision_id,
+        )
+
+
+def test_denial_clears_previously_granted_approval() -> None:
+    base = make_context()
+    allow = DecisionRecord(
+        DecisionOutcome.ALLOW,
+        "approved",
+        "human",
+        request_id=base.request_id,
+        tool_name=base.tool_call.name,
+    )
+    approved = base.with_decision(allow).evolve(
+        approval_granted=True,
+        approval_request_id=base.request_id,
+        approval_decision_id=allow.decision_id,
+    )
+
+    denied = approved.with_decision(
+        DecisionRecord(DecisionOutcome.DENY, "revoked", "runtime")
+    )
+
+    assert denied.approval_granted is False
+    assert denied.approval_request_id is None
+    assert denied.approval_decision_id is None
 
 
 def test_non_json_result_uses_safe_representation() -> None:

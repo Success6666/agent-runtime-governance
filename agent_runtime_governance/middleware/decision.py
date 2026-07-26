@@ -132,12 +132,9 @@ class DecisionMiddleware(GatingMiddleware):
         updated = context.with_decision(decision)
         if decision.outcome is DecisionOutcome.ALLOW:
             updated = updated.evolve(
-                metadata={
-                    **updated.metadata,
-                    "approval_granted": True,
-                    "approval_request_id": request.request_id,
-                    "approval_decision_id": decision.decision_id,
-                }
+                approval_granted=True,
+                approval_request_id=request.request_id,
+                approval_decision_id=decision.decision_id,
             )
         return updated.append_history(
             HistoryEntry(
@@ -159,13 +156,13 @@ class DecisionMiddleware(GatingMiddleware):
         if self._store is None:
             return context
         if reservation is None:
-            if not context.metadata.get("approval_granted"):
+            if not context.approval_granted:
                 return context
             decision = DecisionRecord(
                 DecisionOutcome.DENY,
                 "approval reservation was unavailable at the execution boundary",
                 self.name,
-                request_id=_metadata_text(context, "approval_request_id"),
+                request_id=context.approval_request_id,
                 tool_name=context.tool_call.name,
                 subject=context.user,
                 tenant=context.tenant,

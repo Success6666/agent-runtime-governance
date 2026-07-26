@@ -118,6 +118,9 @@ class ExecutionContext:
     risk_tier: RiskTier = RiskTier.LOW
     risk_score: float = 0.0
     requires_approval: bool = False
+    approval_granted: bool = False
+    approval_request_id: str | None = None
+    approval_decision_id: str | None = None
     status: ExecutionStatus = ExecutionStatus.PENDING
     decision: DecisionRecord | None = None
     history: tuple[HistoryEntry, ...] = ()
@@ -134,6 +137,18 @@ class ExecutionContext:
             self.deadline.tzinfo is None or self.deadline.utcoffset() is None
         ):
             raise ValueError("deadline must be timezone-aware")
+        approval_ids = (self.approval_request_id, self.approval_decision_id)
+        if self.approval_granted and any(not value for value in approval_ids):
+            raise ValueError("granted approval requires request and decision IDs")
+        if not self.approval_granted and any(value is not None for value in approval_ids):
+            raise ValueError("approval IDs require a granted approval")
+        if self.approval_granted and (
+            self.decision is None
+            or self.decision.outcome is not DecisionOutcome.ALLOW
+            or self.approval_request_id != self.request_id
+            or self.approval_decision_id != self.decision.decision_id
+        ):
+            raise ValueError("granted approval must match an allow decision")
         object.__setattr__(self, "permissions", frozenset(self.permissions))
         object.__setattr__(self, "history", tuple(self.history))
         object.__setattr__(self, "metadata", _freeze_mapping(self.metadata))
@@ -209,7 +224,14 @@ class ExecutionContext:
             if decision.outcome is DecisionOutcome.DENY
             else self.status
         )
-        return self.evolve(decision=decision, status=status)
+        changes: dict[str, Any] = {"decision": decision, "status": status}
+        if decision.outcome is not DecisionOutcome.ALLOW:
+            changes.update(
+                approval_granted=False,
+                approval_request_id=None,
+                approval_decision_id=None,
+            )
+        return self.evolve(**changes)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -230,6 +252,9 @@ class ExecutionContext:
             "risk_tier": self.risk_tier.name,
             "risk_score": self.risk_score,
             "requires_approval": self.requires_approval,
+            "approval_granted": self.approval_granted,
+            "approval_request_id": self.approval_request_id,
+            "approval_decision_id": self.approval_decision_id,
             "status": self.status.value,
             "decision": self.decision.to_dict() if self.decision else None,
             "history": [entry.to_dict() for entry in self.history],
@@ -310,6 +335,9 @@ class ExecutionContext:
             risk_tier=RiskTier[data.get("risk_tier", "LOW")],
             risk_score=float(data.get("risk_score", 0.0)),
             requires_approval=bool(data.get("requires_approval", False)),
+            approval_granted=bool(data.get("approval_granted", False)),
+            approval_request_id=data.get("approval_request_id"),
+            approval_decision_id=data.get("approval_decision_id"),
             status=ExecutionStatus(data.get("status", "pending")),
             decision=decision,
             history=tuple(
