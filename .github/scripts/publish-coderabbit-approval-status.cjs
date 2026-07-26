@@ -23,26 +23,19 @@ async function publishCodeRabbitApprovalStatus({
   github,
   context,
   core,
+  pullNumber = context.payload.pull_request?.number,
   maxAttempts = 1,
   intervalMs = 0,
   missingState = "pending",
   wait = sleep,
 }) {
   const { owner, repo } = context.repo;
-  const pullNumber = context.payload.pull_request?.number;
   if (!pullNumber) {
     throw new Error("pull request number is missing from the event payload");
   }
 
-  let statusSha = context.payload.pull_request.head.sha;
+  let statusSha;
   const committedAtByHead = new Map();
-  await publishStatus(
-    github,
-    context,
-    statusSha,
-    "pending",
-    "Waiting for current-head CodeRabbit approval",
-  );
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
@@ -54,7 +47,7 @@ async function publishCodeRabbitApprovalStatus({
       const pullRequest = pullResponse.data;
       const headSha = pullRequest.head.sha;
 
-      if (headSha !== statusSha) {
+      if (!statusSha || headSha !== statusSha) {
         statusSha = headSha;
         await publishStatus(
           github,
@@ -156,6 +149,9 @@ async function publishCodeRabbitApprovalStatus({
       }
     } catch (error) {
       core.error(error instanceof Error ? error.stack || error.message : String(error));
+      if (!statusSha) {
+        throw error;
+      }
       try {
         await publishStatus(
           github,

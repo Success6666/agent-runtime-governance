@@ -1,0 +1,17 @@
+name: CodeRabbit review signal
+
+on:
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+
+permissions: {}
+
+jobs:
+  signal:
+    if: >-
+      contains(fromJSON('["coderabbitai", "coderabbitai[bot]"]'), github.event.review.user.login)
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Record review event
+        run: echo "CodeRabbit review event received"
