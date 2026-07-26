@@ -252,15 +252,14 @@ Production deployments must configure a trusted identity provider with
 stores coordinate processes on one host and require a distributed adapter for
 multi-host deployments.
 
-### v0.5 pre-release verification record
+### v0.5 release verification record
 
-The release candidate was validated on 2026-07-25 (UTC) on Windows 11 with Python 3.12,
-Docker Engine 29.4.2, and Kind 0.31.0:
+The release was validated on 2026-07-26 (UTC) on Windows 11 with Python 3.12,
+Docker Engine 29.4.2, and Kind 0.31.0, and on GitHub-hosted Linux runners:
 
-- 345 tests passed with 88.45% branch coverage on Python 3.12; the enforced floor
-  is 80%;
-- the same 345-test suite passed in clean Linux containers on Python 3.10.18
-  and Python 3.13.5;
+- 359 tests passed locally with 88.52% branch coverage on Python 3.12;
+- the same 359-test suite passed on Python 3.10, 3.11, 3.12, and 3.13 in GitHub
+  Actions, with 88.63%-88.66% branch coverage; the enforced floor is 80%;
 - 15 repository-policy tests passed;
 - real OPA HTTP allow/deny, OTLP HTTP export to an OpenTelemetry Collector,
   Prometheus scraping, and a Kind 1.34.3 control-plane readiness check passed;
@@ -268,8 +267,8 @@ Docker Engine 29.4.2, and Kind 0.31.0:
   virtual environments; and
 - an isolated environment with the OTel, YAML, and Prometheus extras had no
   known dependency vulnerabilities reported by `pip-audit` 2.10.1 at the time
-  of the run; the unpublished root distribution was reported as unavailable on
-  PyPI and was not treated as an audited third-party dependency.
+  of the run; before publication, the root distribution was reported as
+  unavailable on PyPI and was not treated as an audited third-party dependency.
 
 These are point-in-time verification results, not a latency SLA or a guarantee
 against future advisories. CI repeats the test matrix, policy checks, dependency
