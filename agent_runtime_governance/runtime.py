@@ -15,6 +15,7 @@ from typing import Any, Callable, Iterable, Mapping, ParamSpec, TypeVar
 
 from ._context_boundaries import validate_middleware_transition
 from ._metadata import metadata_text as _metadata_text
+from .action_contracts import ActionContract
 from .context import (
     ExecutionContext,
     ExecutionMode,
@@ -224,6 +225,7 @@ class Runtime:
         result_schema: dict[str, Any] | None = None,
         max_parameters_bytes: int | None = None,
         max_result_bytes: int | None = None,
+        action_contract: ActionContract | None = None,
     ) -> Callable[[Callable[P, R]], GovernedTool[P, R]]:
         def decorator(function: Callable[P, R]) -> GovernedTool[P, R]:
             spec = ToolSpec(
@@ -237,6 +239,7 @@ class Runtime:
                 result_schema=result_schema,
                 max_parameters_bytes=max_parameters_bytes,
                 max_result_bytes=max_result_bytes,
+                action_contract=action_contract,
             )
             self.registry.register(spec)
             return GovernedTool(self, spec)
