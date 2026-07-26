@@ -7,13 +7,34 @@
 [![PyPI](https://img.shields.io/pypi/v/agent-runtime-governance.svg)](https://pypi.org/project/agent-runtime-governance/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 
-Agent Runtime Governance is a lightweight, framework-agnostic Python runtime
-built around an immutable `ExecutionContext` and deterministic middleware.
-v0.5.1 binds approval to the normalized tool call and trusted governance state,
-and marks uncertain in-flight mutations as `UNKNOWN` instead of blindly
-retrying them. The v0.6-v1.0 direction develops that verified baseline into
-Action Commit Safety without presenting planned recovery or evidence features
-as already shipped.
+**The action a reviewer approved is the action that executes, and a side
+effect with an uncertain outcome is never blindly retried.**
+
+Two failures motivate this project. An agent retries a payment call after a
+network timeout and charges a customer twice. A reviewer approves one tool
+call, and something different executes because arguments or governance state
+changed between approval and execution. Agent Runtime Governance is an
+embeddable, framework-agnostic Python runtime that closes both gaps at the
+commit boundary - the moment a proposed tool call is about to touch the real
+world. It runs inside the agent stack you already use rather than replacing
+it.
+
+Every shipped guarantee links to its regression test:
+
+| Shipped in v0.5.1 | Evidence |
+| --- | --- |
+| Approval is bound to the exact normalized tool call: arguments, risk tier, policy digest, subject, tenant, and expiry. Any change invalidates it before the tool body runs | [`test_decision_binding_rejects_wrong_request_or_arguments`](tests/test_approval_identity_hardening.py) |
+| Caller-supplied metadata cannot forge approval, policy, or identity state | [`test_caller_metadata_cannot_forge_required_approval`](tests/test_approval_identity_hardening.py) |
+| A mutating call with an uncertain outcome is recorded as `UNKNOWN` instead of being retried | [`test_cancellation_propagates_and_marks_context_unknown`](tests/test_production_reliability.py) |
+| Idempotency keys are mandatory for idempotent mutating tools and bound to the parameter fingerprint | [`test_idempotency_key_is_bound_to_parameter_fingerprint`](tests/test_execution_hardening.py) |
+| JSONL audit is hash-chained and signable; deletion and tampering are detected | [`test_jsonl_audit_hash_chain_detects_deletion_and_tamper`](tests/test_audit_otel_hardening.py) |
+
+The v0.6-v1.0 direction develops this baseline into **Action Commit Safety**:
+one immutable bound action shared by policy, approval, idempotency, execution,
+and audit, then deterministic reconciliation for `UNKNOWN` outcomes and
+portable evidence. The staged plan and its exit criteria are in
+[`docs/production-roadmap.md`](docs/production-roadmap.md); planned features
+are never presented as shipped.
 
 ## Quick start
 
@@ -71,13 +92,19 @@ delete_file(
 )
 ```
 
-## Why it exists
+## How it compares
 
-| Approach | Deterministic boundary | Human decision | Audit and replay |
-| --- | --- | --- | --- |
-| Prompt-only guardrails | No | Ad hoc | No |
-| Hand-written permission checks | Partial | Application-specific | Ad hoc |
-| Agent Runtime Governance | Yes | Provider interface | Built in |
+Human approval, policy interception, audit, retries, and telemetry are
+industry baseline; this project does not claim to have invented them. The
+narrow claim is the commit boundary. Rows cite each project's own public
+documentation and describe scope, not quality.
+
+| Alternative | What it provides | Where this project is narrower and deeper |
+| --- | --- | --- |
+| Framework-native approvals: [OpenAI Agents SDK](https://openai.github.io/openai-agents-js/guides/human-in-the-loop/), [LangGraph](https://docs.langchain.com/oss/python/langchain/human-in-the-loop), [pydantic-ai deferred tools](https://ai.pydantic.dev/deferred-tools/) | Pause-and-approve flows inside one framework | One framework-neutral runtime where approval is revalidated against the normalized call immediately before execution, combined with idempotent commit and `UNKNOWN` semantics |
+| [Microsoft Agent Governance Toolkit](https://github.com/microsoft/agent-governance-toolkit) | Broad policy, identity, sandboxing, and SRE toolkit | Its [limitations document](https://github.com/microsoft/agent-governance-toolkit/blob/main/docs/LIMITATIONS.md) records that audit captures attempts and allow/deny results, with outcome attestation planned; this project's entire scope is that commit-and-outcome boundary |
+| Durable execution engines: [Temporal](https://github.com/temporalio/temporal), [Restate](https://github.com/restatedev/restate), [DBOS](https://github.com/dbos-inc/dbos-transact-py) | Durable workflow state with automatic retries | The opposite default at the governance layer: an uncertain side effect stays `UNKNOWN` until reconciliation supplies evidence, and human approval binds to the action identity |
+| Content guardrails: [NeMo Guardrails](https://github.com/NVIDIA-NeMo/Guardrails), [Guardrails AI](https://github.com/guardrails-ai/guardrails) | Input, output, and dialog rails | A different layer that composes with this one; this project governs the side-effect boundary, not prompts or content |
 
 Prompt instructions are useful guidance, but they are not an authorization
 boundary. This project places deterministic policy, explicit decisions, and
@@ -253,32 +280,14 @@ Production deployments must configure a trusted identity provider with
 stores coordinate processes on one host and require a distributed adapter for
 multi-host deployments.
 
-### v0.5.1 release verification record
+### Release verification
 
-The release was validated on 2026-07-26 (UTC) on Windows and GitHub-hosted Linux
-runners:
-
-- 396 tests passed in the release workflow with 88.89% branch coverage; the
-  enforced floor is 80%;
-- the same 396-test suite passed on Python 3.10, 3.11, 3.12, and 3.13 in the
-  pull-request matrix;
-- 15 repository-policy tests passed;
-- real OPA HTTP allow/deny, OTLP HTTP export to an OpenTelemetry Collector,
-  and Prometheus HTTP scraping passed in Docker;
-- the wheel and source distribution installed and imported from separate clean
-  virtual environments;
-- an isolated environment with the OTel, YAML, and Prometheus extras had no
-  known dependency vulnerabilities reported by `pip-audit` 2.10.1 at release
-  time; and
-- the wheel, source distribution, SPDX SBOM, SHA256 checksums, and GitHub
-  provenance were verified before PyPI Trusted Publishing.
-
-The immutable release, assets, and verification entry point are available at
-[`v0.5.1`](https://github.com/Success6666/agent-runtime-governance/releases/tag/v0.5.1).
-
-These are point-in-time verification results, not a latency SLA or a guarantee
-against future advisories. CI repeats the test matrix, policy checks, dependency
-audit, and Docker integration smoke from clean runners.
+Each release is verified before publishing: the full test matrix on Python
+3.10-3.13, Docker-backed integration smoke, an isolated dependency audit, and
+wheel/sdist installation from clean environments, with the SPDX SBOM, SHA256
+checksums, and GitHub provenance attached to the release. The complete
+point-in-time record for v0.5.1 is in
+[`docs/release-verification.md`](docs/release-verification.md).
 
 Benchmarks measure incremental runtime overhead for baseline, Rule, OPA, Audit,
 OpenTelemetry, and 10-middleware pipelines:
