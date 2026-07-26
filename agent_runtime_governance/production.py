@@ -147,7 +147,7 @@ class ProductionProfile:
         approval_required = any(spec.requires_approval for spec in tool_items)
         reasons: list[ProductionReadinessReason] = []
 
-        if side_effecting:
+        if entries:
             if identity_provider is None:
                 reasons.append(ProductionReadinessReason.IDENTITY_PROVIDER_REQUIRED)
             elif not _capability(identity_provider, "production_trusted"):
@@ -156,13 +156,17 @@ class ProductionProfile:
                 )
             if not require_verified_identity:
                 reasons.append(ProductionReadinessReason.VERIFIED_IDENTITY_REQUIRED)
-            if not _capability(idempotency_store, "production_durable"):
-                reasons.append(ProductionReadinessReason.IDEMPOTENCY_DURABLE_REQUIRED)
             if isinstance(identity_provider, HMACClaimsIdentityProvider) and not _capability(
                 identity_provider.replay_store, "production_durable"
             ):
                 reasons.append(
                     ProductionReadinessReason.IDENTITY_REPLAY_DURABLE_REQUIRED
+                )
+            if side_effecting and not _capability(
+                idempotency_store, "production_durable"
+            ):
+                reasons.append(
+                    ProductionReadinessReason.IDEMPOTENCY_DURABLE_REQUIRED
                 )
             self._audit_reasons(pipeline, reasons)
 
