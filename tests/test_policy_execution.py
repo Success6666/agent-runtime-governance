@@ -38,6 +38,14 @@ def test_policy_denies_named_tool() -> None:
         runtime.invoke("operate")
 
 
+def test_policy_identity_requires_complete_version_and_digest() -> None:
+    with pytest.raises(ValueError, match="provided together"):
+        PolicyMiddleware(SimplePolicy(), version="policy-v1")
+
+    middleware = PolicyMiddleware(SimplePolicy())
+    assert middleware.action_policy_identity() is None
+
+
 def test_admin_only_policy_requires_permission() -> None:
     runtime = Runtime([PolicyMiddleware(SimplePolicy(admin_only={"operate"}))])
     register(runtime)

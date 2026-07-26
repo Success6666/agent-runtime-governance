@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 
 import pytest
 
@@ -71,6 +72,23 @@ def test_policy_artifact_digest_covers_exact_loaded_bytes(tmp_path) -> None:
         "1",
         document.digest,
     )
+
+
+def test_policy_artifact_identity_requires_exact_source_bytes() -> None:
+    document = replace(YAMLPolicyLoader.loads(VALID_POLICY), artifact_digest=None)
+
+    with pytest.raises(ValueError, match="artifact digest is unavailable"):
+        document.artifact_middleware()
+
+
+def test_policy_loader_rejects_non_utf8_artifact_and_non_text_input(tmp_path) -> None:
+    artifact = tmp_path / "policy.yaml"
+    artifact.write_bytes(b"\xff\xfe")
+
+    with pytest.raises(PolicyValidationError, match="must be UTF-8"):
+        YAMLPolicyLoader.load(artifact)
+    with pytest.raises(TypeError, match="must be a string"):
+        YAMLPolicyLoader.loads(b"version: 1")  # type: ignore[arg-type]
 
 
 def test_duplicate_tool_policy_is_rejected() -> None:

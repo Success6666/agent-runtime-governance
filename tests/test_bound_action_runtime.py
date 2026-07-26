@@ -13,7 +13,6 @@ from agent_runtime_governance import (
     AuditMiddleware,
     DecisionMiddleware,
     ExecutionMode,
-    GovernanceCancelledError,
     GovernanceDenied,
     HumanDecisionProvider,
     InMemoryIdempotencyStore,
@@ -30,6 +29,7 @@ from agent_runtime_governance import (
     SQLiteIdempotencyStore,
     StaticIdentityProvider,
     VerifiedPrincipal,
+    get_cancellation_context,
 )
 from agent_runtime_governance.errors import ToolExecutionError
 from agent_runtime_governance.hooks import HookPoint
@@ -534,10 +534,12 @@ async def test_cancellation_keeps_bound_action_in_audit(tmp_path) -> None:
     task = asyncio.create_task(runtime.arun("operate", "node-a"))
     await entered.wait()
     task.cancel()
-    with pytest.raises(GovernanceCancelledError) as cancelled:
+    with pytest.raises(asyncio.CancelledError) as cancelled:
         await task
 
-    action = cancelled.value.context.bound_action
+    context = get_cancellation_context(cancelled.value)
+    assert context is not None
+    action = context.bound_action
     assert action is not None
     assert sink.read_verified()[-1]["action_digest"] == action.action_digest
 

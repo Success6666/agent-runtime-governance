@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
@@ -56,6 +57,19 @@ def test_context_freezes_tool_arguments() -> None:
     call = ToolCall("x", kwargs={"options": {"force": False}})
     with pytest.raises(TypeError):
         call.kwargs["options"]["force"] = True  # type: ignore[index]
+
+
+def test_context_rejects_untrusted_bound_action_shapes() -> None:
+    context = make_context()
+    with pytest.raises(TypeError, match="must be a BoundAction"):
+        replace(context, bound_action=object())
+    with pytest.raises(TypeError, match="must be a BoundAction"):
+        context.bind_action(object())  # type: ignore[arg-type]
+
+    payload = context.to_dict()
+    payload["bound_action"] = "forged"
+    with pytest.raises(TypeError, match="must be an object"):
+        ExecutionContext.from_dict(payload)
 
 
 @pytest.mark.parametrize(

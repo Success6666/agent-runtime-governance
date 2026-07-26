@@ -166,6 +166,8 @@ def test_opa_plugin_registers_real_middleware() -> None:
 
     assert operate() is True
     assert "opa" in manager.builder.services
+    middleware = runtime.pipeline.middlewares[0]
+    assert middleware.action_policy_identity() is None
 
     identified = PluginManager()
     identified.load(
@@ -175,8 +177,8 @@ def test_opa_plugin_registers_real_middleware() -> None:
             policy_digest="a" * 64,
         )
     )
-    middleware = identified.build().pipeline.middlewares[0]
-    assert middleware.action_policy_identity() == ("bundle-v1", "a" * 64)
+    identified_middleware = identified.build().pipeline.middlewares[0]
+    assert identified_middleware.action_policy_identity() == ("bundle-v1", "a" * 64)
 
 
 def test_opa_policy_identity_is_strict_and_reportable() -> None:
