@@ -26,6 +26,14 @@ Lightweight deployment, framework independence, approval, audit, idempotency,
 and telemetry remain required foundations. They are not treated as unique
 differentiators.
 
+The runtime is embedded inside existing agent frameworks as a governance
+layer. It complements framework-native approval flows instead of replacing
+the host framework.
+
+The commit-boundary gap is publicly acknowledged by larger projects and is
+expected to narrow. Delivery speed for v0.6 and v0.7 is part of the strategy,
+not an implementation detail.
+
 ## v0.6 - Action Contracts
 
 - One immutable bound action for policy, approval, idempotency, execution, and

@@ -5,12 +5,23 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agent-runtime-governance"
 version = "0.5.1"
-description = "Framework-agnostic runtime governance for AI agents."
+description = "Action Commit Safety for AI agents: approval bound to the exact tool call, no blind retries, idempotent execution, and signed audit."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [{ name = "Li Zhengda" }]
-keywords = ["agents", "runtime", "governance", "audit", "approval", "replay"]
+keywords = [
+  "ai-agents",
+  "governance",
+  "guardrails",
+  "human-in-the-loop",
+  "approval",
+  "idempotency",
+  "audit",
+  "tool-calling",
+  "agent-security",
+  "runtime",
+]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",

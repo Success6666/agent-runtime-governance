@@ -23,7 +23,10 @@ The product direction is **Action Commit Safety for AI Agents**:
 > with an auditable path from intent to supported evidence about the outcome.
 
 The runtime remains an embeddable Python library. It does not become an agent
-planner, workflow engine, hosted control plane, or Kubernetes operator.
+planner, workflow engine, hosted control plane, or Kubernetes operator. It is
+positioned as a complement embedded inside host agent frameworks, not as a
+replacement for them: framework-native approval flows remain useful, and this
+runtime binds their decisions to the committed action.
 
 ## Verified baseline
 
@@ -51,7 +54,7 @@ claim that another project cannot implement it.
 | Capability | Existing public overlap | This project's narrower proof target |
 | --- | --- | --- |
 | Multi-stage guardrails | OpenAI Agents SDK and NVIDIA NeMo describe input, output, retrieval, dialog, and execution guardrails | Govern the external side-effect commit boundary rather than expand prompt or content rails |
-| Human approval and policy | OpenAI Agents SDK, LangChain, and Agent Policy describe persistent HITL and deterministic policy decisions | Bind one canonical `BoundAction` to policy, approval, idempotency, execution, and audit |
+| Human approval and policy | OpenAI Agents SDK, LangChain, pydantic-ai deferred tools, and Agent Policy describe persistent HITL and deterministic policy decisions | Bind one canonical `BoundAction` to policy, approval, idempotency, execution, and audit |
 | Chokepoint, idempotency, and leases | Lynx and OnceOnly describe action chokepoints, persistent execution, leases, and duplicate suppression | Combine intent-bound approval with explicit `UNKNOWN` and a reconciliation protocol |
 | Cryptographic evidence | Stipul describes pre-execution policy and cryptographic proof | Separate evidence integrity, signer authenticity, and verified external outcome, then test the complete chain across frameworks |
 | Broad governance runtime | Microsoft Agent Governance Toolkit spans policy, runtime, observability, and other packages | Keep a narrow embeddable library and publish conformance evidence for the action-commit path |
@@ -62,6 +65,7 @@ of another project's production quality:
 - [OpenAI Agents SDK guardrails](https://openai.github.io/openai-agents-js/guides/guardrails/)
 - [OpenAI Agents SDK human in the loop](https://openai.github.io/openai-agents-js/guides/human-in-the-loop/)
 - [LangChain human in the loop](https://docs.langchain.com/oss/python/langchain/human-in-the-loop)
+- [pydantic-ai deferred tools](https://ai.pydantic.dev/deferred-tools/)
 - [NVIDIA NeMo Guardrails rail types](https://docs.nvidia.com/nemo/guardrails/about-nemo-guardrails-library/rail-types)
 - [Agent Policy](https://agent-policy.github.io/guard/)
 - [Lynx](https://lynxharness.com/)
@@ -78,6 +82,18 @@ problem. The intended differentiation is the tested combination of a unified
 bound action, intent-bound approval, explicit `UNKNOWN` reconciliation, and
 cross-framework evidence consistency:
 [Microsoft known limitations](https://github.com/microsoft/agent-governance-toolkit/blob/main/docs/LIMITATIONS.md).
+
+Two boundary observations recorded on 2026-07-26 qualify that opening:
+
+- The Microsoft toolkit repository already contains in-progress receipt and
+  attestation schemas alongside the planned-outcome-attestation statement, so
+  the overlap window should be treated as narrowing rather than static.
+  Delivery speed for v0.6 and v0.7 is therefore strategic, not incidental.
+- [HumanLayer](https://humanlayer.dev), a human-approval SDK with far wider
+  adoption than this project, now markets an AI coding product rather than the
+  approval SDK. Standalone approval flows were not a durable wedge on their
+  own, which supports scoping this project to the commit boundary rather than
+  to approval alone.
 
 ## Target users
 
