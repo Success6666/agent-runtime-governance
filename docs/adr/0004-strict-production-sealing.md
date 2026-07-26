@@ -42,12 +42,14 @@ Every `MUTATING` or `IDEMPOTENT` tool requires an `ActionContract`. `READ_ONLY`
 tools have an explicit contract exception because they do not commit an external
 side effect; they may still opt into a contract. A supplied contract must match
 the registered tool name, execution mode, parameter schema, and parameter byte
-limit. Contracted tools also require a tenant-scoped identity-digest key provider
-and a public key version.
+limit. Contracted tools also require a tenant-scoped identity-digest key
+provider, public key version, and explicit policy version and digest. Contracts
+declaring external preconditions require a precondition digest provider. A tool
+result schema must agree with a declared contract receipt schema.
 
-The action contract is attached to `ToolSpec` in this phase only for registration
-and startup validation. Binding it into policy, approval, idempotency, execution,
-and audit remains a separate v0.6 change with v0.5 migration readers.
+The runtime binds the contract after parameter preparation and carries one
+immutable action identity through policy, approval, idempotency, executor
+revalidation, telemetry, and audit. The detailed decision is ADR 0005.
 
 ### Runtime capabilities
 

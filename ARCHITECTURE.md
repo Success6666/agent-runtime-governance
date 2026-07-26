@@ -24,17 +24,28 @@ planning, model selection, prompts, or framework state.
 7. Every terminal path can emit a structured audit snapshot.
 8. Rules inspect the application-supplied user input, not generated internal
    messages or audit records.
+9. A contracted invocation has one `BoundAction`; approval, idempotency,
+   execution, telemetry, and audit use its `action_digest`.
+10. Executor-boundary mismatch denies before tool entry and is never reported
+    as an uncertain side effect.
 
 ## Context boundaries
 
 Immutable identity fields include trace IDs, principal, permissions, original
-user input, and the requested tool call. Governance fields such as risk score,
-decision, status, history, result, and metadata evolve by replacement.
+user input, the requested tool call, and the optional `BoundAction`. Runtime
+code binds the action once after parameter isolation. Governance fields such as
+risk score, decision, status, history, result, and metadata evolve by
+replacement.
 
 Nested mappings and sequences, including execution result snapshots, are frozen
 on context construction. Serialization produces a detached JSON-compatible
 representation for audit and replay. The caller-facing tool return remains the
 application value and is not replaced by the context snapshot.
+
+For contracted tools, the frozen parameter values stored by `BoundAction` are
+also used to materialize the Python call. Immediately before tool entry, the
+runtime rebuilds the identity from the actual execution objects and current
+trusted key, policy, and precondition inputs. The action digest must match.
 
 ## Middleware boundaries
 
@@ -63,23 +74,35 @@ Human approval is modeled as a `DecisionProvider`, allowing CLI, chat, or HTTP
 applications to supply an asynchronous callback. The framework provides the
 protocol and suspension point, not a user interface.
 
+Contracted approval requests and decisions carry `action_digest`. A v0.5
+approval without that identity is readable but cannot authorize a contracted
+v0.6 tool. Contracted idempotency uses a separate `action/v1` namespace and the
+same digest as its fingerprint; non-contracted tools retain the v0.5 path.
+
 ## Audit and replay
 
 Audit events contain the context snapshot before execution and after completion.
-The JSONL sink can redact known secret keys and HMAC-sign each record. v0.1
+Schema version 3 adds the contract ID, contract version, and action digest. The
+nested audit action uses the evidence-safe form without raw parameters, while
+controlled snapshot persistence retains the complete isolated snapshot. The
+JSONL sink can redact known secret keys and HMAC-sign each record. v0.1
 replay intentionally only loads and prints these snapshots; it does not execute
 tools again.
 
 v0.3 adds a separate snapshot store for debugger and regression workflows.
-Replay rebuilds the original request identity and runs only middleware whose
-metadata declares it replayable. External model review, human interaction,
-metrics, retries, audit, and telemetry are never invoked by deterministic
-replay.
+Replay preserves historical request fields only as non-authoritative policy
+test inputs and runs middleware whose metadata declares it replayable. It strips
+identity-verification metadata and never creates an executor-authoritative
+`BoundAction`. External model review, human interaction, metrics, retries,
+audit, and telemetry are never invoked by deterministic replay. A fresh bound
+preview uses `apreview()` and the current trusted identity provider.
 
-Policy documents have an explicit version and a digest derived from canonical
-validated content. Duplicate tool rules are rejected instead of introducing an
-implicit conflict-resolution language. Drift detection compares outcomes and
-risk tiers after applying two deterministic pipelines to the same request.
+Policy documents expose a formatting-independent semantic digest and an exact
+artifact-byte digest. Strict production identity uses the artifact digest;
+drift analysis may use semantic identity. Duplicate tool rules are rejected
+instead of introducing an implicit conflict-resolution language. Drift
+detection compares outcomes and risk tiers after applying two deterministic
+pipelines to the same historical request input.
 
 ## Plugin boundary
 

@@ -33,10 +33,20 @@ Every shipped guarantee links to its regression test:
 | Idempotency keys are mandatory for idempotent mutating tools and bound to the parameter fingerprint | [`test_idempotency_key_is_bound_to_parameter_fingerprint`](tests/test_execution_hardening.py) |
 | JSONL audit is hash-chained and signable; deletion and tampering are detected | [`test_jsonl_audit_hash_chain_detects_deletion_and_tamper`](tests/test_audit_otel_hardening.py) |
 
-The v0.6-v1.0 direction develops this baseline into **Action Commit Safety**:
-one immutable bound action shared by policy, approval, idempotency, execution,
-and audit, then deterministic reconciliation for `UNKNOWN` outcomes and
-portable evidence. The staged plan and its exit criteria are in
+The unreleased v0.6 candidate binds one immutable action across the commit
+boundary. These claims are covered before release:
+
+| v0.6 candidate behavior | Evidence |
+| --- | --- |
+| The exact frozen parameter snapshot covered by `action_digest` reaches the tool body and cannot be replaced by middleware or hooks | [`test_exact_bound_snapshot_reaches_tool_and_audit`](tests/test_bound_action_runtime.py), [`test_middleware_cannot_replace_or_mutate_bound_action`](tests/test_bound_action_runtime.py) |
+| Key, policy, and external-precondition drift fail before tool entry | [`test_key_rotation_fails_before_tool_entry`](tests/test_bound_action_runtime.py), [`test_policy_identity_mismatch_fails_closed`](tests/test_bound_action_runtime.py), [`test_precondition_change_fails_before_tool_entry`](tests/test_bound_action_runtime.py) |
+| Approval and idempotency consume `action_digest`; v0.5 records remain readable but cannot authorize or satisfy a contracted v0.6 action | [`test_approval_is_bound_to_action_digest`](tests/test_bound_action_runtime.py), [`test_v05_approval_fails_closed_for_contracted_tool`](tests/test_bound_action_runtime.py), [`test_v05_compatibility.py`](tests/test_v05_compatibility.py) |
+| Success and terminal exception/timeout/cancellation paths retain the same action identity | [`test_exact_bound_snapshot_reaches_tool_and_audit`](tests/test_bound_action_runtime.py), [`test_exception_and_timeout_keep_bound_action_in_audit`](tests/test_bound_action_runtime.py), [`test_cancellation_keeps_bound_action_in_audit`](tests/test_bound_action_runtime.py) |
+| Audit evidence carries the action identity without duplicating raw parameters, and OpenTelemetry exports the same contract/action attributes | [`test_audit_bound_action_never_duplicates_raw_parameters`](tests/test_bound_action_runtime.py), [`test_opentelemetry_exports_bound_action_identity`](tests/test_audit_otel_hardening.py) |
+| At 1,000 requests and concurrency 100 on the recorded Windows/Python 3.12 host, the median of three alternating paired runs measured action bind plus verification at 1.940x mean, 2.232x p95, 2.337x p99, and 0.996x peak traced memory versus its strict baseline | [`v0.6.0-rc-windows-python312.json`](benchmarks/results/v0.6.0-rc-windows-python312.json), [`v0.6.0 budget`](benchmarks/budgets/v0.6.0.json) |
+
+The v0.7-v1.0 direction adds deterministic reconciliation for `UNKNOWN`
+outcomes and portable evidence. The staged plan and its exit criteria are in
 [`docs/production-roadmap.md`](docs/production-roadmap.md); planned features
 are never presented as shipped.
 
@@ -125,10 +135,13 @@ Immutable ExecutionContext
      |
      v
 Runtime Pipeline
-  Rule -> LLM -> Human Decision -> Audit
+  Prepare -> Bind Action -> Policy -> Human Decision
      |
      v
-Explicit Decision -> Tool Executor -> Final Audit Snapshot
+Action Digest -> Idempotency -> Executor Revalidation -> Tool
+     |
+     v
+Terminal Context -> Evidence-safe Audit Snapshot
 ```
 
 Gating middleware may stop execution and fails closed. Observing middleware
@@ -158,6 +171,7 @@ cannot be overridden by later middleware.
 - `examples/agno_integration.py`: Agno function tool
 - `examples/llamaindex_integration.py`: LlamaIndex `FunctionTool`
 - `examples/autogen_integration.py`: Microsoft AutoGen `FunctionTool`
+- `examples/strict_action_contract.py`: sealed contracted side-effecting runtime
 - `scripts/replay.py`: print the snapshots for a trace from JSONL audit data
 
 Each framework adapter is intentionally an example rather than a runtime
@@ -193,24 +207,31 @@ concurrent calls. Hooks may enrich context but cannot change status or decisions
 
 ## Policies, snapshots, and regression
 
-Load a strict versioned policy with a deterministic digest:
+Load a versioned policy with separate semantic and exact-artifact digests:
 
 ```python
 from agent_runtime_governance import Runtime, YAMLPolicyLoader
 
 document = YAMLPolicyLoader.load("examples/policy.yaml")
-runtime = Runtime([document.middleware()])
-print(document.version, document.digest)
+runtime = Runtime([document.artifact_middleware()])
+print(document.version, document.digest, document.artifact_digest)
 ```
 
 Duplicate tool entries, unknown fields, invalid risks, and unsafe YAML tags are
 rejected. YAML remains a configuration format over the deliberately small
-`SimplePolicy` model; it is not a general policy language.
+`SimplePolicy` model; it is not a general policy language. `digest` identifies
+normalized policy semantics for compatibility and drift comparison;
+`artifact_digest` identifies the exact loaded bytes and is the value strict
+production profiles must bind.
 
 `SnapshotMiddleware` records immutable lifecycle snapshots. `ReplayDebugger`
 prints timelines and field-level diffs, while `EvaluationSuite` runs governance
 without executing tools. `PolicyDriftDetector` reapplies deterministic policy to
 the same recorded request identity and reports decision or risk changes.
+`Runtime.areplay()` is deliberately non-authoritative: historical identity
+fields are analysis inputs, verification metadata is stripped, no tool runs,
+and no `BoundAction` is created. Use `apreview()` with current trusted identity
+claims when a fresh bound action preview is required.
 
 ```bash
 python scripts/trace_debug.py snapshots.jsonl TRACE_ID
@@ -256,7 +277,7 @@ pip install "agent-runtime-governance[yaml,prometheus,crewai]"
 
 ## Production reliability
 
-v0.5 focuses on production behavior instead of adding a new agent framework:
+v0.5 establishes the production reliability baseline:
 
 - idempotent tool execution with mandatory keys and in-memory or SQLite stores;
 - durable approval recovery with leased reserve/commit/release transitions;
@@ -267,6 +288,42 @@ v0.5 focuses on production behavior instead of adding a new agent framework:
 - contract validation for parameters, results, and payload size limits;
 - reliable JSONL and SQLite audit sinks with hash-chain verification;
 - bounded concurrency, external integration circuit breakers, and fault tests.
+
+The v0.6 candidate adds strict startup inventory and sealing, one
+`BoundAction.action_digest` across approval/idempotency/execution/audit,
+executor-boundary revalidation, policy and precondition identity checks, and
+versioned v0.5 migration readers. See
+[`docs/migration-v0.6.md`](docs/migration-v0.6.md) and the runnable
+[`strict_action_contract.py`](examples/strict_action_contract.py) example.
+
+The example is a v0.6 release-candidate source example, so run it from a
+checkout rather than against the current stable PyPI package. It hashes the
+exact policy artifact in `examples/policies/`, passes that identity through
+`PolicyMiddleware` and `ProductionProfile`, seals the runtime, and persists
+signed audit plus idempotency state:
+
+```powershell
+python -m pip install -e .
+$env:ARG_IDENTITY_DIGEST_KEY = python -c "import secrets; print(secrets.token_urlsafe(32))"
+$env:ARG_AUDIT_HMAC_KEY = python -c "import secrets; print(secrets.token_urlsafe(32))"
+$env:ARG_STATE_DIR = ".arg-state-example"
+python examples/strict_action_contract.py
+Remove-Item -Recurse -Force $env:ARG_STATE_DIR
+```
+
+```bash
+python -m pip install -e .
+export ARG_IDENTITY_DIGEST_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+export ARG_AUDIT_HMAC_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+export ARG_STATE_DIR=.arg-state-example
+python examples/strict_action_contract.py
+rm -rf -- "$ARG_STATE_DIR"
+```
+
+`StaticIdentityProvider` in this example represents one identity already
+authenticated by a trusted single-service host boundary. It must not be used
+to authenticate arbitrary multi-user requests; use a validating identity
+provider at that boundary in production.
 
 The production smoke suite starts real Docker services for OPA and the
 OpenTelemetry Collector, exports through OTLP HTTP, scrapes a real HTTP
@@ -294,7 +351,8 @@ point-in-time record for v0.5.1 is in
 [`docs/release-verification.md`](docs/release-verification.md).
 
 Benchmarks measure incremental runtime overhead for baseline, Rule, OPA, Audit,
-OpenTelemetry, and 10-middleware pipelines:
+OpenTelemetry, 10-middleware pipelines, and paired strict runtimes with and
+without action binding:
 
 ```bash
 python benchmarks/benchmark_runtime.py --requests 100,500,1000 --concurrency 100
@@ -305,6 +363,10 @@ The committed Windows/Python 3.12 measurement is available in
 Its 100-waiter, zero-hold FIFO admission test measured 2.93 ms p99 wait time.
 This point-in-time result is regression evidence for that machine, not a
 cross-platform latency SLA.
+
+The v0.6 release-candidate measurement and enforced paired budget are in
+[`benchmarks/results/v0.6.0-rc-windows-python312.json`](benchmarks/results/v0.6.0-rc-windows-python312.json)
+and [`benchmarks/budgets/v0.6.0.json`](benchmarks/budgets/v0.6.0.json).
 
 ## Releases
 
