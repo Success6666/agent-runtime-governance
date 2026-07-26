@@ -7,29 +7,55 @@ const publishCodeRabbitApprovalStatus = require(
 
 const HEAD = "a".repeat(40);
 
-function fixture({ reviews = [], comments = [], state = "open" } = {}) {
+function fixture({
+  reviews = [],
+  comments = [],
+  state = "open",
+  currentHead = HEAD,
+  eventHead = HEAD,
+  pullError,
+} = {}) {
   const statuses = [];
+  const errors = [];
+  let commitLookups = 0;
   const github = {
     paginate: async (method) => method(),
     rest: {
       pulls: {
-        get: async () => ({ data: { state, head: { sha: HEAD } } }),
+        get: async () => {
+          if (pullError) {
+            throw pullError;
+          }
+          return { data: { state, head: { sha: currentHead } } };
+        },
         listReviews: async () => reviews,
       },
       issues: { listComments: async () => comments },
       repos: {
         createCommitStatus: async (status) => statuses.push(status),
-        getCommit: async () => ({
-          data: { commit: { committer: { date: "2026-01-01T00:00:00Z" } } },
-        }),
+        getCommit: async () => {
+          commitLookups += 1;
+          return {
+            data: { commit: { committer: { date: "2026-01-01T00:00:00Z" } } },
+          };
+        },
       },
     },
   };
   const context = {
     repo: { owner: "owner", repo: "repo" },
-    payload: { pull_request: { number: 7, head: { sha: HEAD } } },
+    payload: { pull_request: { number: 7, head: { sha: eventHead } } },
   };
-  return { github, context, statuses, core: { info() {} } };
+  return {
+    github,
+    context,
+    statuses,
+    errors,
+    get commitLookups() {
+      return commitLookups;
+    },
+    core: { info() {}, error(value) { errors.push(value); } },
+  };
 }
 
 function review(state, overrides = {}) {
@@ -69,11 +95,11 @@ test("publishes failure for current-head requested changes", async () => {
 test("a later approval supersedes requested changes", async () => {
   const setup = fixture({
     reviews: [
-      review("CHANGES_REQUESTED"),
       review("APPROVED", {
         id: 2,
         submitted_at: "2026-01-01T00:00:02Z",
       }),
+      review("CHANGES_REQUESTED"),
     ],
   });
 
@@ -83,7 +109,35 @@ test("a later approval supersedes requested changes", async () => {
   assert.equal(setup.statuses.at(-1).state, "success");
 });
 
-test("dismissal or missing approval publishes the configured state", async () => {
+test("dismissal remains failure until a newer approval", async () => {
+  const dismissed = review("DISMISSED", {
+    id: 2,
+    submitted_at: "2026-01-01T00:00:02Z",
+  });
+  const setup = fixture({ reviews: [review("APPROVED"), dismissed] });
+
+  const dismissedResult = await publishCodeRabbitApprovalStatus(setup);
+
+  assert.equal(dismissedResult, "failure");
+  assert.equal(setup.statuses.at(-1).state, "failure");
+  assert.match(setup.statuses.at(-1).description, /dismissed/i);
+
+  const approved = fixture({
+    reviews: [
+      dismissed,
+      review("APPROVED", {
+        id: 3,
+        submitted_at: "2026-01-01T00:00:03Z",
+      }),
+    ],
+  });
+
+  const approvedResult = await publishCodeRabbitApprovalStatus(approved);
+
+  assert.equal(approvedResult, "success");
+});
+
+test("missing approval publishes the configured state", async () => {
   const setup = fixture();
 
   const result = await publishCodeRabbitApprovalStatus({
@@ -94,6 +148,45 @@ test("dismissal or missing approval publishes the configured state", async () =>
   assert.equal(result, "failure");
   assert.equal(setup.statuses.at(-1).state, "failure");
   assert.match(setup.statuses.at(-1).description, /dismissed/i);
+});
+
+test("a new head receives a new pending status", async () => {
+  const nextHead = "b".repeat(40);
+  const setup = fixture({ eventHead: HEAD, currentHead: nextHead });
+
+  const result = await publishCodeRabbitApprovalStatus(setup);
+
+  assert.equal(result, "pending");
+  assert.deepEqual(
+    setup.statuses.map(({ sha, state }) => [sha, state]),
+    [
+      [HEAD, "pending"],
+      [nextHead, "pending"],
+      [nextHead, "pending"],
+    ],
+  );
+});
+
+test("commit timestamps are cached while polling the same head", async () => {
+  const setup = fixture();
+
+  await publishCodeRabbitApprovalStatus({
+    ...setup,
+    maxAttempts: 3,
+    wait: async () => {},
+  });
+
+  assert.equal(setup.commitLookups, 1);
+});
+
+test("unexpected API failures publish an error status", async () => {
+  const setup = fixture({ pullError: new Error("network unavailable") });
+
+  const result = await publishCodeRabbitApprovalStatus(setup);
+
+  assert.equal(result, "error");
+  assert.equal(setup.statuses.at(-1).state, "error");
+  assert.match(setup.errors.at(-1), /network unavailable/);
 });
 
 test("stale approvals do not authorize a new head", async () => {

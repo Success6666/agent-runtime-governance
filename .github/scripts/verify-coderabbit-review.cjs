@@ -10,7 +10,7 @@ function latestReviewForHead(reviews, headSha) {
       (review) =>
         isCodeRabbit(review?.user?.login) &&
         review.commit_id === headSha &&
-        ["APPROVED", "CHANGES_REQUESTED"].includes(review.state),
+        ["APPROVED", "CHANGES_REQUESTED", "DISMISSED"].includes(review.state),
     )
     .sort((left, right) => {
       const timeDifference =
