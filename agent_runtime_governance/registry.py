@@ -24,6 +24,7 @@ from typing import (
 )
 
 from ._sqlite import connect_sqlite, initialize_sqlite
+from .action_contracts import ActionContract
 from .context import ExecutionMode, RiskTier
 from .contracts import canonical_json_bytes, validate_schema
 from .errors import RegistryError
@@ -47,6 +48,7 @@ class ToolSpec(Generic[P, R]):
     result_schema: Mapping[str, Any] | None = None
     max_parameters_bytes: int | None = None
     max_result_bytes: int | None = None
+    action_contract: ActionContract | None = None
 
     def __post_init__(self) -> None:
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.:-]{0,127}", self.name):
@@ -55,6 +57,10 @@ class ToolSpec(Generic[P, R]):
             )
         if not callable(self.function):
             raise TypeError("tool function must be callable")
+        if self.action_contract is not None and not isinstance(
+            self.action_contract, ActionContract
+        ):
+            raise TypeError("action_contract must be an ActionContract")
         for name, value in (
             ("max_parameters_bytes", self.max_parameters_bytes),
             ("max_result_bytes", self.max_result_bytes),
