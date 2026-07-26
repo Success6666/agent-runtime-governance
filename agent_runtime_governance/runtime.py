@@ -1347,15 +1347,20 @@ class Runtime:
     async def _commit_approvals(
         self, context: ExecutionContext
     ) -> ExecutionContext:
-        self._bounded_timeout(
-            context.deadline,
-            self.limits.middleware_timeout_seconds,
-            "approval commit",
-        )
         for middleware in self.pipeline:
             commit = getattr(middleware, "commit_approval", None)
             if callable(commit):
-                context = await commit(context)
+                timeout = self._bounded_timeout(
+                    context.deadline,
+                    self.limits.middleware_timeout_seconds,
+                    "approval commit",
+                )
+                context = await await_stage(
+                    commit(context),
+                    stage="approval commit",
+                    timeout_seconds=timeout,
+                    cancellation_grace_seconds=self.limits.cancellation_grace_seconds,
+                )
                 if context.denied:
                     break
         return context
@@ -1366,7 +1371,29 @@ class Runtime:
         for middleware in self.pipeline:
             release = getattr(middleware, "release_approval", None)
             if callable(release):
-                context = await release(context)
+                try:
+                    timeout = self._bounded_timeout(
+                        context.deadline,
+                        self.limits.middleware_timeout_seconds,
+                        "approval release",
+                    )
+                    context = await await_stage(
+                        release(context),
+                        stage="approval release",
+                        timeout_seconds=timeout,
+                        cancellation_grace_seconds=self.limits.cancellation_grace_seconds,
+                    )
+                except Exception as exc:
+                    # Cleanup is bounded and fail-closed: a durable lease can
+                    # recover the reservation, but a stalled release must not
+                    # hold the request open indefinitely.
+                    context = context.append_history(
+                        HistoryEntry(
+                            "runtime",
+                            "approval_cleanup_error",
+                            f"approval release bounded: {type(exc).__name__}",
+                        )
+                    )
         return context
 
     @staticmethod
