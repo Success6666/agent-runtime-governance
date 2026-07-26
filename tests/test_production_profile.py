@@ -17,6 +17,7 @@ from agent_runtime_governance import (
     InMemoryIdempotencyStore,
     InvocationOptions,
     JSONLAuditSink,
+    PolicyMiddleware,
     ProductionProfile,
     ProductionReadinessError,
     ProductionReadinessReason,
@@ -25,6 +26,7 @@ from agent_runtime_governance import (
     RiskTier,
     Runtime,
     RuntimeBuilder,
+    SimplePolicy,
     SQLiteApprovalStore,
     SQLiteIdempotencyStore,
     SQLiteIdentityReplayStore,
@@ -656,6 +658,36 @@ def test_signed_durable_approval_store_is_ready(tmp_path) -> None:
         return bool(target)
 
     assert runtime.seal_production().ready is True
+
+
+def test_unidentified_policy_middleware_prevents_production_sealing(tmp_path) -> None:
+    runtime = Runtime(
+        [
+            PolicyMiddleware(SimplePolicy()),
+            AuditMiddleware(
+                JSONLAuditSink(tmp_path / "audit.jsonl", sign_key=b"a" * 32),
+                fail_closed=True,
+            ),
+        ],
+        idempotency_store=SQLiteIdempotencyStore(tmp_path / "idempotency.db"),
+        identity_provider=StaticIdentityProvider(_principal()),
+        require_verified_identity=True,
+        production_profile=strict_profile(),
+    )
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.MUTATING,
+        action_contract=contract(),
+    )
+    def operate(target: str) -> bool:
+        return bool(target)
+
+    with pytest.raises(ProductionReadinessError) as caught:
+        runtime.seal_production()
+    assert (
+        ProductionReadinessReason.POLICY_MIDDLEWARE_IDENTITY_REQUIRED
+        in caught.value.report.runtime_reasons
+    )
 
 
 def test_non_fail_closed_audit_is_rejected(tmp_path) -> None:
