@@ -54,6 +54,9 @@ class AdmissionContentionMeasurement:
     p99_wait_ms: float
 
 
+_PAIRED_SCENARIOS = ("strict_baseline", "strict_bound_action")
+
+
 class NullAuditSink(AuditSink):
     production_durable = True
     production_integrity_protected = True
@@ -235,14 +238,44 @@ def _percentile(ordered: list[float], quantile: float) -> float:
     return ordered[position]
 
 
+def _median_measurement(samples: list[Measurement]) -> Measurement:
+    if not samples:
+        raise ValueError("at least one benchmark sample is required")
+    first = samples[0]
+    if any(
+        (item.scenario, item.requests, item.concurrency)
+        != (first.scenario, first.requests, first.concurrency)
+        for item in samples[1:]
+    ):
+        raise ValueError("benchmark samples must describe the same scenario")
+    return Measurement(
+        scenario=first.scenario,
+        requests=first.requests,
+        concurrency=first.concurrency,
+        throughput_per_second=statistics.median(
+            item.throughput_per_second for item in samples
+        ),
+        mean_ms=statistics.median(item.mean_ms for item in samples),
+        p50_ms=statistics.median(item.p50_ms for item in samples),
+        p95_ms=statistics.median(item.p95_ms for item in samples),
+        p99_ms=statistics.median(item.p99_ms for item in samples),
+        peak_memory_kib=statistics.median(item.peak_memory_kib for item in samples),
+    )
+
+
 async def run_matrix(
-    request_counts: Iterable[int], concurrency: int
+    request_counts: Iterable[int],
+    concurrency: int,
+    *,
+    paired_repetitions: int = 3,
 ) -> list[Measurement]:
     measurements: list[Measurement] = []
     scenarios = build_scenarios(concurrency)
     try:
         for requests in request_counts:
             for scenario, runtime in scenarios.items():
+                if scenario in _PAIRED_SCENARIOS:
+                    continue
                 measurements.append(
                     await measure(
                         runtime,
@@ -251,6 +284,28 @@ async def run_matrix(
                         concurrency=min(concurrency, requests),
                     )
                 )
+            paired: dict[str, list[Measurement]] = {
+                scenario: [] for scenario in _PAIRED_SCENARIOS
+            }
+            for repetition in range(paired_repetitions):
+                order = (
+                    _PAIRED_SCENARIOS
+                    if repetition % 2 == 0
+                    else tuple(reversed(_PAIRED_SCENARIOS))
+                )
+                for scenario in order:
+                    paired[scenario].append(
+                        await measure(
+                            scenarios[scenario],
+                            scenario=scenario,
+                            requests=requests,
+                            concurrency=min(concurrency, requests),
+                        )
+                    )
+            measurements.extend(
+                _median_measurement(paired[scenario])
+                for scenario in _PAIRED_SCENARIOS
+            )
     finally:
         await asyncio.gather(*(runtime.aclose() for runtime in scenarios.values()))
     return measurements
@@ -296,9 +351,16 @@ async def measure_admission_contention(
 
 
 async def run_benchmarks(
-    request_counts: Iterable[int], concurrency: int
+    request_counts: Iterable[int],
+    concurrency: int,
+    *,
+    paired_repetitions: int = 3,
 ) -> tuple[list[Measurement], AdmissionContentionMeasurement]:
-    measurements = await run_matrix(request_counts, concurrency)
+    measurements = await run_matrix(
+        request_counts,
+        concurrency,
+        paired_repetitions=paired_repetitions,
+    )
     admission = await measure_admission_contention(waiters=max(10, concurrency))
     return measurements, admission
 
@@ -313,6 +375,12 @@ def main() -> int:
         help="comma-separated request counts, for example 100,500,1000,5000",
     )
     parser.add_argument("--concurrency", type=int, default=100)
+    parser.add_argument(
+        "--paired-repetitions",
+        type=int,
+        default=3,
+        help="odd number of alternating strict-pair samples aggregated by median",
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     counts = [int(item) for item in args.requests.split(",")]
@@ -320,8 +388,16 @@ def main() -> int:
         parser.error("request counts must be positive")
     if args.concurrency < 1:
         parser.error("concurrency must be positive")
+    if args.paired_repetitions < 1 or args.paired_repetitions % 2 == 0:
+        parser.error("paired repetitions must be a positive odd integer")
 
-    measurements, admission = asyncio.run(run_benchmarks(counts, args.concurrency))
+    measurements, admission = asyncio.run(
+        run_benchmarks(
+            counts,
+            args.concurrency,
+            paired_repetitions=args.paired_repetitions,
+        )
+    )
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "environment": {
@@ -330,6 +406,7 @@ def main() -> int:
             "processor": platform.processor(),
             "cpu_count": os.cpu_count(),
         },
+        "paired_repetitions": args.paired_repetitions,
         "measurements": [asdict(item) for item in measurements],
         "admission_contention": asdict(admission),
     }
