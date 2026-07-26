@@ -20,6 +20,8 @@ from agent_runtime_governance.errors import ContractValidationError
 
 _DIGEST_A = "a" * 64
 _DIGEST_B = "b" * 64
+_IDENTITY_DIGEST_KEY = b"0123456789abcdef0123456789abcdef"
+_IDENTITY_DIGEST_KEY_VERSION = "2026-07"
 _SAFE_INTEGER = (1 << 53) - 1
 _FIXTURE_DIR = Path(__file__).parent / "fixtures" / "action-contracts" / "v1"
 
@@ -58,6 +60,8 @@ def _bound(contract: ActionContract | None = None, **overrides: object) -> Bound
         "identity_issuer": "issuer:local",
         "principal": "user:operator",
         "tenant": "tenant:acme",
+        "identity_digest_key": _IDENTITY_DIGEST_KEY,
+        "identity_digest_key_version": _IDENTITY_DIGEST_KEY_VERSION,
         "policy_version": "policy-v1",
         "policy_digest": _DIGEST_A,
         "precondition_digest": None,
@@ -68,23 +72,46 @@ def _bound(contract: ActionContract | None = None, **overrides: object) -> Bound
     return selected.bind(parameters, **values)  # type: ignore[arg-type]
 
 
+def _bind(
+    contract: ActionContract,
+    parameters: Mapping[str, object],
+    **overrides: object,
+) -> BoundAction:
+    values: dict[str, object] = {
+        "identity_issuer": "issuer:local",
+        "principal": "user:operator",
+        "tenant": "tenant:acme",
+        "identity_digest_key": _IDENTITY_DIGEST_KEY,
+        "identity_digest_key_version": _IDENTITY_DIGEST_KEY_VERSION,
+    }
+    values.update(overrides)
+    return contract.bind(parameters, **values)  # type: ignore[arg-type]
+
+
 def test_contract_has_stable_rfc8785_fixture() -> None:
     contract = _contract()
     expected = bytes.fromhex(
         (_FIXTURE_DIR / "contract.hex").read_text(encoding="ascii").strip()
     )
     assert contract.canonical_bytes() == expected
-    assert contract.contract_digest == json.loads(
-        (_FIXTURE_DIR / "digests.json").read_text(encoding="utf-8")
-    )["contract_digest"]
+    assert (
+        contract.contract_digest
+        == json.loads((_FIXTURE_DIR / "digests.json").read_text(encoding="utf-8"))[
+            "contract_digest"
+        ]
+    )
 
 
 def test_bound_action_has_stable_digest_fixture() -> None:
     bound = _bound()
-    expected = json.loads(
-        (_FIXTURE_DIR / "digests.json").read_text(encoding="utf-8")
-    )
+    expected = json.loads((_FIXTURE_DIR / "digests.json").read_text(encoding="utf-8"))
     assert bound.parameters_digest == expected["parameters_digest"]
+    assert bound.principal_digest == expected["principal_digest"]
+    assert bound.tenant_digest == expected["tenant_digest"]
+    assert (
+        bound.identity_digest_key_version
+        == expected["identity_digest_key_version"]
+    )
     assert bound.action_digest == expected["action_digest"]
 
 
@@ -101,18 +128,8 @@ def test_mapping_insertion_order_does_not_change_digests() -> None:
     second_contract = _contract(parameters_schema=schema_two, receipt_schema=None)
     assert first_contract.contract_digest == second_contract.contract_digest
 
-    first = first_contract.bind(
-        {"beta": 2, "alpha": "one"},
-        identity_issuer="issuer:local",
-        principal="user:operator",
-        tenant="tenant:acme",
-    )
-    second = second_contract.bind(
-        {"alpha": "one", "beta": 2},
-        identity_issuer="issuer:local",
-        principal="user:operator",
-        tenant="tenant:acme",
-    )
+    first = _bind(first_contract, {"beta": 2, "alpha": "one"})
+    second = _bind(second_contract, {"alpha": "one", "beta": 2})
     assert first.parameters_digest == second.parameters_digest
     assert first.action_digest == second.action_digest
 
@@ -124,12 +141,7 @@ def test_contract_and_bound_action_detach_nested_inputs() -> None:
     }
     parameters = {"items": ["one"]}
     contract = _contract(parameters_schema=schema, receipt_schema=None)
-    bound = contract.bind(
-        parameters,
-        identity_issuer="issuer:local",
-        principal="user:operator",
-        tenant="tenant:acme",
-    )
+    bound = _bind(contract, parameters)
     contract_digest = contract.contract_digest
     parameters_digest = bound.parameters_digest
 
@@ -137,9 +149,9 @@ def test_contract_and_bound_action_detach_nested_inputs() -> None:
     parameters["items"].append("two")
 
     assert contract.contract_digest == contract_digest
-    assert contract.to_dict()["contract"]["parameters_schema"]["properties"][
+    assert contract.to_dict()["contract"]["parameters_schema"]["properties"]["items"][
         "items"
-    ]["items"] == {"type": "string"}
+    ] == {"type": "string"}
     assert bound.parameters_digest == parameters_digest
     assert bound.to_dict()["parameters"] == {"items": ["one"]}
 
@@ -173,7 +185,9 @@ def test_public_values_and_nested_members_are_immutable() -> None:
         ("max_parameters_bytes", 2048),
     ],
 )
-def test_every_contract_field_changes_contract_digest(field: str, value: object) -> None:
+def test_every_contract_field_changes_contract_digest(
+    field: str, value: object
+) -> None:
     assert _contract(**{field: value}).contract_digest != _contract().contract_digest
 
 
@@ -184,6 +198,8 @@ def test_every_contract_field_changes_contract_digest(field: str, value: object)
         ("identity_issuer", "issuer:other"),
         ("principal", "user:reviewer"),
         ("tenant", "tenant:other"),
+        ("identity_digest_key", b"abcdef0123456789abcdef0123456789"),
+        ("identity_digest_key_version", "2026-08"),
         ("policy_version", "policy-v2"),
         ("policy_digest", _DIGEST_B),
         ("precondition_digest", _DIGEST_B),
@@ -198,6 +214,17 @@ def test_same_subject_from_different_issuer_changes_action_digest() -> None:
         _bound(identity_issuer="issuer:primary").action_digest
         != _bound(identity_issuer="issuer:secondary").action_digest
     )
+
+
+def test_identity_digest_key_rotation_changes_identity_and_action_digests() -> None:
+    original = _bound()
+    rotated_key = _bound(identity_digest_key=b"abcdef0123456789abcdef0123456789")
+    rotated_version = _bound(identity_digest_key_version="2026-08")
+
+    for rotated in (rotated_key, rotated_version):
+        assert rotated.principal_digest != original.principal_digest
+        assert rotated.tenant_digest != original.tenant_digest
+        assert rotated.action_digest != original.action_digest
 
 
 def test_contract_change_changes_bound_action_digest() -> None:
@@ -238,23 +265,13 @@ def test_ambiguous_or_unsupported_parameter_values_are_rejected(
         receipt_schema=None,
     )
     with pytest.raises(ContractValidationError, match=message):
-        contract.bind(
-            {"value": value},
-            identity_issuer="issuer:local",
-            principal="user:operator",
-            tenant="tenant:acme",
-        )
+        _bind(contract, {"value": value})
 
 
 def test_non_string_mapping_key_is_rejected() -> None:
     contract = _contract(parameters_schema={}, receipt_schema=None)
     with pytest.raises(ContractValidationError, match="object keys must be strings"):
-        contract.bind(
-            {1: "value"},  # type: ignore[dict-item]
-            identity_issuer="issuer:local",
-            principal="user:operator",
-            tenant="tenant:acme",
-        )
+        _bind(contract, {1: "value"})  # type: ignore[dict-item]
 
 
 def test_cyclic_parameter_value_is_rejected_explicitly() -> None:
@@ -262,23 +279,13 @@ def test_cyclic_parameter_value_is_rejected_explicitly() -> None:
     recursive["self"] = recursive
     contract = _contract(parameters_schema={}, receipt_schema=None)
     with pytest.raises(ContractValidationError, match="cyclic values"):
-        contract.bind(
-            recursive,
-            identity_issuer="issuer:local",
-            principal="user:operator",
-            tenant="tenant:acme",
-        )
+        _bind(contract, recursive)
 
 
 def test_lone_unicode_surrogate_is_rejected() -> None:
     contract = _contract(parameters_schema={}, receipt_schema=None)
     with pytest.raises(ContractValidationError, match="Unicode scalar"):
-        contract.bind(
-            {"value": "\ud800"},
-            identity_issuer="issuer:local",
-            principal="user:operator",
-            tenant="tenant:acme",
-        )
+        _bind(contract, {"value": "\ud800"})
 
 
 def test_parameter_payload_limit_uses_canonical_parameter_bytes() -> None:
@@ -288,19 +295,16 @@ def test_parameter_payload_limit_uses_canonical_parameter_bytes() -> None:
         max_parameters_bytes=12,
     )
     with pytest.raises(ContractValidationError, match="exceeds 12 bytes"):
-        contract.bind(
-            {"value": "long"},
-            identity_issuer="issuer:local",
-            principal="user:operator",
-            tenant="tenant:acme",
-        )
+        _bind(contract, {"value": "long"})
 
 
 def test_required_precondition_cannot_be_omitted() -> None:
     contract = _contract(precondition_requirements=("resource.etag",))
     with pytest.raises(ValueError, match="precondition_digest is required"):
         _bound(contract)
-    assert _bound(contract, precondition_digest=_DIGEST_A).precondition_digest == _DIGEST_A
+    assert (
+        _bound(contract, precondition_digest=_DIGEST_A).precondition_digest == _DIGEST_A
+    )
 
 
 @pytest.mark.parametrize(
@@ -364,6 +368,7 @@ def test_contract_deserialization_rejects_untrusted_envelope(
         ("parameters_digest", _DIGEST_B, "parameters digest mismatch"),
         ("action_digest", _DIGEST_B, "action digest mismatch"),
         ("principal_digest", _DIGEST_B, "action digest mismatch"),
+        ("identity_digest_key_version", "2026-08", "action digest mismatch"),
     ],
 )
 def test_bound_action_deserialization_detects_tampering(
@@ -390,7 +395,8 @@ def test_serialized_envelopes_reject_missing_and_extra_fields() -> None:
 def test_identity_values_are_opaque_and_not_retained() -> None:
     principal = "用户+ops@example.com"
     tenant = "https://issuer.example/tenant?id=北"
-    bound = _contract().bind(
+    bound = _bind(
+        _contract(),
         {"target": "/srv/data", "count": 1},
         identity_issuer="issuer:local",
         principal=principal,
@@ -402,6 +408,9 @@ def test_identity_values_are_opaque_and_not_retained() -> None:
     assert tenant not in serialized
     assert principal not in repr(bound)
     assert tenant not in repr(bound)
+    assert _IDENTITY_DIGEST_KEY.decode("ascii") not in serialized
+    assert not hasattr(bound, "identity_digest_key")
+    assert bound.identity_digest_key_version == _IDENTITY_DIGEST_KEY_VERSION
 
 
 def test_evidence_representation_excludes_raw_parameters() -> None:
@@ -412,6 +421,10 @@ def test_evidence_representation_excludes_raw_parameters() -> None:
     assert secret not in evidence
     assert secret not in repr(bound)
     assert "parameters" not in bound.to_evidence_dict()
+    assert (
+        bound.to_evidence_dict()["identity_digest_key_version"]
+        == _IDENTITY_DIGEST_KEY_VERSION
+    )
 
 
 def test_digest_backed_values_are_hashable() -> None:
@@ -439,12 +452,7 @@ class _Code(str, Enum):
 def test_non_json_native_values_are_not_coerced(value: object) -> None:
     contract = _contract(parameters_schema={}, receipt_schema=None)
     with pytest.raises(ContractValidationError, match="unsupported value type"):
-        contract.bind(
-            {"value": value},
-            identity_issuer="issuer:local",
-            principal="user:operator",
-            tenant="tenant:acme",
-        )
+        _bind(contract, {"value": value})
 
 
 class _StringSubclass(str):
@@ -459,12 +467,7 @@ class _IntegerSubclass(int):
 def test_json_primitive_subclasses_are_not_coerced(value: object) -> None:
     contract = _contract(parameters_schema={}, receipt_schema=None)
     with pytest.raises(ContractValidationError, match="unsupported value type"):
-        contract.bind(
-            {"value": value},
-            identity_issuer="issuer:local",
-            principal="user:operator",
-            tenant="tenant:acme",
-        )
+        _bind(contract, {"value": value})
 
 
 class _DuplicateKeyMapping(Mapping[str, object]):
@@ -486,12 +489,7 @@ class _DuplicateKeyMapping(Mapping[str, object]):
 def test_custom_mapping_cannot_supply_duplicate_keys() -> None:
     contract = _contract(parameters_schema={}, receipt_schema=None)
     with pytest.raises(ContractValidationError, match="duplicate object keys"):
-        contract.bind(
-            _DuplicateKeyMapping(),
-            identity_issuer="issuer:local",
-            principal="user:operator",
-            tenant="tenant:acme",
-        )
+        _bind(contract, _DuplicateKeyMapping())
 
 
 def test_unicode_is_not_silently_normalized() -> None:
@@ -506,12 +504,7 @@ def test_parameter_limit_accepts_exact_canonical_size() -> None:
         receipt_schema=None,
         max_parameters_bytes=13,
     )
-    assert contract.bind(
-        {"value": "x"},
-        identity_issuer="issuer:local",
-        principal="user:operator",
-        tenant="tenant:acme",
-    )
+    assert _bind(contract, {"value": "x"})
 
 
 def test_excessive_nesting_is_rejected() -> None:
@@ -520,12 +513,7 @@ def test_excessive_nesting_is_rejected() -> None:
         nested = [nested]
     contract = _contract(parameters_schema={}, receipt_schema=None)
     with pytest.raises(ContractValidationError, match="maximum nesting depth"):
-        contract.bind(
-            {"value": nested},
-            identity_issuer="issuer:local",
-            principal="user:operator",
-            tenant="tenant:acme",
-        )
+        _bind(contract, {"value": nested})
 
 
 @pytest.mark.parametrize(
@@ -580,14 +568,33 @@ def test_bound_action_requires_a_contract_and_parameter_object() -> None:
             identity_issuer="issuer:local",
             principal="user:operator",
             tenant="tenant:acme",
+            identity_digest_key=_IDENTITY_DIGEST_KEY,
+            identity_digest_key_version=_IDENTITY_DIGEST_KEY_VERSION,
         )
     with pytest.raises(ContractValidationError, match="must be an object"):
-        _contract().bind(  # type: ignore[arg-type]
-            [],
-            identity_issuer="issuer:local",
-            principal="user:operator",
-            tenant="tenant:acme",
-        )
+        _bind(_contract(), [])  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("key", "error", "message"),
+    [
+        ("not-bytes", TypeError, "must be bytes"),
+        (bytearray(b"x" * 32), TypeError, "must be bytes"),
+        (b"x" * 31, ValueError, "32-4096 bytes"),
+        (b"x" * 4097, ValueError, "32-4096 bytes"),
+    ],
+)
+def test_identity_digest_key_boundaries(
+    key: object, error: type[Exception], message: str
+) -> None:
+    with pytest.raises(error, match=message):
+        _bound(identity_digest_key=key)
+
+
+@pytest.mark.parametrize("version", ["", "bad/version", "x" * 65, 1])
+def test_identity_digest_key_version_is_strict(version: object) -> None:
+    with pytest.raises(ValueError, match="identity_digest_key_version"):
+        _bound(identity_digest_key_version=version)
 
 
 @pytest.mark.parametrize(
@@ -598,9 +605,7 @@ def test_bound_action_requires_a_contract_and_parameter_object() -> None:
         ("principal", "x" * 1025, "1024 UTF-8 bytes"),
     ],
 )
-def test_identity_input_boundaries(
-    field: str, value: object, message: str
-) -> None:
+def test_identity_input_boundaries(field: str, value: object, message: str) -> None:
     with pytest.raises(ValueError, match=message):
         _bound(**{field: value})
 
@@ -612,9 +617,7 @@ def test_serialized_contract_validates_field_types_and_digest_shape() -> None:
         ActionContract.from_dict(wrong_requirements)
 
     invalid_schema = _contract().to_dict()
-    invalid_schema["contract"]["parameters_schema"] = {
-        "type": "not-a-json-type"
-    }
+    invalid_schema["contract"]["parameters_schema"] = {"type": "not-a-json-type"}
     with pytest.raises(ContractValidationError, match="invalid parameters_schema"):
         ActionContract.from_dict(invalid_schema)
 
@@ -634,6 +637,11 @@ def test_serialized_bound_action_validates_all_binding_metadata() -> None:
     invalid_policy["policy_digest"] = None
     with pytest.raises(ContractValidationError, match="provided together"):
         BoundAction.from_dict(invalid_policy)
+
+    invalid_key_version = _bound().to_dict()
+    invalid_key_version["identity_digest_key_version"] = "bad/version"
+    with pytest.raises(ContractValidationError, match="identity_digest_key_version"):
+        BoundAction.from_dict(invalid_key_version)
 
     required = _bound(
         _contract(precondition_requirements=("resource.etag",)),
@@ -659,12 +667,27 @@ def test_serialized_object_boundaries_are_strict() -> None:
 def test_canonical_node_budget_is_enforced(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(action_contracts, "_MAX_CANONICAL_NODES", 2)
     with pytest.raises(ContractValidationError, match="value count"):
-        _contract(parameters_schema={}, receipt_schema=None).bind(
+        _bind(
+            _contract(parameters_schema={}, receipt_schema=None),
             {"first": 1, "second": 2},
-            identity_issuer="issuer:local",
-            principal="user:operator",
-            tenant="tenant:acme",
         )
+
+
+def test_parameter_validator_is_reused_per_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contract = _contract()
+    validator = contract._parameters_validator
+
+    def fail(_: object) -> None:
+        raise AssertionError("validator must not be rebuilt while binding")
+
+    monkeypatch.setattr(action_contracts, "Draft202012Validator", fail)
+    first = _bind(contract, {"target": "/srv/one", "count": 1})
+    second = _bind(contract, {"target": "/srv/two", "count": 2})
+
+    assert contract._parameters_validator is validator
+    assert first.parameters_digest != second.parameters_digest
 
 
 def test_canonicalizer_errors_are_translated(
@@ -680,28 +703,16 @@ def test_canonicalizer_errors_are_translated(
 
 def test_jcs_number_equivalence_is_explicit() -> None:
     contract = _contract(parameters_schema={}, receipt_schema=None)
-    integer = contract.bind(
-        {"value": 1},
-        identity_issuer="issuer:local",
-        principal="user:operator",
-        tenant="tenant:acme",
-    )
-    floating = contract.bind(
-        {"value": 1.0},
-        identity_issuer="issuer:local",
-        principal="user:operator",
-        tenant="tenant:acme",
-    )
+    integer = _bind(contract, {"value": 1})
+    floating = _bind(contract, {"value": 1.0})
     assert integer.parameters_digest == floating.parameters_digest
 
 
 def test_safe_integer_boundaries_are_accepted() -> None:
     contract = _contract(parameters_schema={}, receipt_schema=None)
-    bound = contract.bind(
+    bound = _bind(
+        contract,
         {"minimum": -_SAFE_INTEGER, "maximum": _SAFE_INTEGER},
-        identity_issuer="issuer:local",
-        principal="user:operator",
-        tenant="tenant:acme",
     )
     assert bound.parameters["minimum"] == -_SAFE_INTEGER
     assert bound.parameters["maximum"] == _SAFE_INTEGER
@@ -716,8 +727,7 @@ def test_v05_legacy_canonicalization_fixture_is_unchanged() -> None:
         label="legacy action",
     )
     assert encoded == (
-        b'{"parameters":{"count":1,"target":"/srv/data"},'
-        b'"tool":"delete_file"}'
+        b'{"parameters":{"count":1,"target":"/srv/data"},"tool":"delete_file"}'
     )
     assert hashlib.sha256(encoded).hexdigest() == (
         "7c73281f77d007309fee3b03485215a2f8ea9fb3305581e498f15a08a13bb55e"
@@ -759,6 +769,8 @@ bound = contract.bind(
     identity_issuer="issuer:local",
     principal="user:operator",
     tenant="tenant:acme",
+    identity_digest_key=b"0123456789abcdef0123456789abcdef",
+    identity_digest_key_version="2026-07",
     policy_version="policy-v1",
     policy_digest="a" * 64,
 )

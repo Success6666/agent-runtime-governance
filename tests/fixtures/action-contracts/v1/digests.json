@@ -1,5 +1,8 @@
 {
-  "action_digest": "bedcdd3d63c92c04629001cc7cbfb9ff4889b9ad025e2cb6adb32745c23e2522",
+  "action_digest": "824781d1ffa5880bd8b381e60126bfeb32661ec5356459605e9b87f19d53031a",
   "contract_digest": "d38d79a9c0592bd2eb1a5567f54c50081361c7d82534fe664353cb82d0d34384",
-  "parameters_digest": "c174773ea1190a5150853ac6b3b797d8bdd31c42e732f0e4ec399f1a4029406e"
+  "identity_digest_key_version": "2026-07",
+  "parameters_digest": "c174773ea1190a5150853ac6b3b797d8bdd31c42e732f0e4ec399f1a4029406e",
+  "principal_digest": "57c8664cf0e2a0f1dcd22163a6d5b8ca97a4e6dc2d49d9d4bff5e575c9f076f5",
+  "tenant_digest": "5a2382014e3b04554e171151d262a343a86738c8c0c57654e0cd30d1eebd4252"
 }

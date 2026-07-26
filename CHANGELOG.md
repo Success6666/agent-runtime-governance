@@ -7,15 +7,17 @@ All notable changes are documented here.
 ### Added
 
 - Immutable `ActionContract` and `BoundAction` primitives with versioned RFC
-  8785 canonical envelopes and domain-separated SHA-256 digests.
+  8785 canonical envelopes, domain-separated SHA-256 digests, and keyed
+  HMAC-SHA-256 identity digests with explicit rotation versions.
 - Strict action-value validation for unsupported types, non-finite numbers,
   negative zero, unsafe integers, invalid Unicode, cycles, duplicate mapping
   keys, nesting limits, node budgets, and canonical payload limits.
 - Versioned serialization that recomputes every digest on restore, plus a
   parameter-free evidence representation and cross-process golden fixtures.
-- Principal digests that bind trusted issuer and subject while keeping both raw
-  values out of serialized actions, evidence, and representations. Parameter
-  contract errors omit rejected values to avoid secret disclosure.
+- Principal and tenant digests that require deployment- or tenant-scoped secret
+  material while keeping the key and raw identity values out of serialized
+  actions, evidence, and representations. Parameter contract errors omit
+  rejected values to avoid secret disclosure.
 
 ### Changed
 
