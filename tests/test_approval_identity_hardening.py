@@ -100,20 +100,54 @@ def test_hmac_identity_claims_reject_tampering() -> None:
 
 
 def test_decision_binding_rejects_wrong_request_or_arguments() -> None:
-    request = make_request()
+    now = datetime.now(timezone.utc)
+    request_expiry = now + timedelta(minutes=2)
+    request = make_request(
+        issued_at=now.isoformat(),
+        expires_at=request_expiry.isoformat(),
+        subject="alice",
+        tenant="tenant-a",
+        identity_issuer="gateway",
+    )
     decision = DecisionRecord(DecisionOutcome.ALLOW, "ok", "human").bind_to(request)
     assert decision.request_id == request.request_id
+    assert decision.tool_name == request.tool_name
     assert decision.arguments_digest == request.arguments_digest
     assert decision.risk_tier == request.risk_tier
     assert decision.policy_version == request.policy_version
     assert decision.policy_digest == request.policy_digest
+    assert decision.subject == request.subject
+    assert decision.tenant == request.tenant
+    assert decision.identity_issuer == request.identity_issuer
+    assert decision.expires_at == request.expires_at
 
-    with pytest.raises(ValueError, match="request_id mismatch"):
+    mismatches = (
+        ("request_id", "other"),
+        ("tool_name", "read_file"),
+        ("arguments_digest", "f" * 64),
+        ("risk_tier", "LOW"),
+        ("policy_version", "policy-v2"),
+        ("policy_digest", "digest-v2"),
+        ("subject", "mallory"),
+        ("tenant", "tenant-b"),
+        ("identity_issuer", "untrusted-gateway"),
+    )
+    for field, value in mismatches:
+        with pytest.raises(ValueError, match=rf"{field} mismatch"):
+            DecisionRecord(
+                DecisionOutcome.ALLOW,
+                "mismatched binding",
+                "human",
+                **{field: value},
+            ).bind_to(request)
+
+    with pytest.raises(ValueError, match="outlives its request"):
         DecisionRecord(
             DecisionOutcome.ALLOW,
-            "wrong request",
+            "overlong decision",
             "human",
-            request_id="other",
+            issued_at=now.isoformat(),
+            expires_at=(request_expiry + timedelta(minutes=1)).isoformat(),
         ).bind_to(request)
 
 

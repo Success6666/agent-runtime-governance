@@ -7,8 +7,9 @@
 [![PyPI](https://img.shields.io/pypi/v/agent-runtime-governance.svg)](https://pypi.org/project/agent-runtime-governance/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 
-**The action a reviewer approved is the action that executes, and a side
-effect with an uncertain outcome is never blindly retried.**
+**The action a reviewer approved is the action that executes. A side effect
+with an uncertain outcome is recorded as `UNKNOWN`, and automatic reuse stays
+blocked while that idempotency record is retained.**
 
 Two failures motivate this project. An agent retries a payment call after a
 network timeout and charges a customer twice. A reviewer approves one tool
@@ -16,14 +17,17 @@ call, and something different executes because arguments or governance state
 changed between approval and execution. Agent Runtime Governance is an
 embeddable, framework-agnostic Python runtime that closes both gaps at the
 commit boundary - the moment a proposed tool call is about to touch the real
-world. It runs inside the agent stack you already use rather than replacing
-it.
+world within the configured storage guarantees. It runs inside the agent stack
+you already use rather than replacing it. The default in-memory idempotency
+store has bounded TTL/LRU retention and does not survive restarts; longer-lived
+protection requires a durable store. Deterministic `UNKNOWN` reconciliation is
+planned for v0.7.
 
 Every shipped guarantee links to its regression test:
 
 | Shipped in v0.5.1 | Evidence |
 | --- | --- |
-| Approval is bound to the exact normalized tool call: arguments, risk tier, policy digest, subject, tenant, and expiry. Any change invalidates it before the tool body runs | [`test_decision_binding_rejects_wrong_request_or_arguments`](tests/test_approval_identity_hardening.py) |
+| Approval is bound to request ID, tool name, argument digest, risk tier, policy version/digest, subject, tenant, identity issuer, and request expiry. A mismatch or expired request/decision is rejected before the tool body runs | [`test_decision_binding_rejects_wrong_request_or_arguments`](tests/test_approval_identity_hardening.py) |
 | Caller-supplied metadata cannot forge approval, policy, or identity state | [`test_caller_metadata_cannot_forge_required_approval`](tests/test_approval_identity_hardening.py) |
 | A mutating call with an uncertain outcome is recorded as `UNKNOWN` instead of being retried | [`test_cancellation_propagates_and_marks_context_unknown`](tests/test_production_reliability.py) |
 | Idempotency keys are mandatory for idempotent mutating tools and bound to the parameter fingerprint | [`test_idempotency_key_is_bound_to_parameter_fingerprint`](tests/test_execution_hardening.py) |
@@ -102,8 +106,8 @@ documentation and describe scope, not quality.
 | Alternative | What it provides | Where this project is narrower and deeper |
 | --- | --- | --- |
 | Framework-native approvals: [OpenAI Agents SDK](https://openai.github.io/openai-agents-js/guides/human-in-the-loop/), [LangGraph](https://docs.langchain.com/oss/python/langchain/human-in-the-loop), [pydantic-ai deferred tools](https://ai.pydantic.dev/deferred-tools/) | Pause-and-approve flows inside one framework | One framework-neutral runtime where approval is revalidated against the normalized call immediately before execution, combined with idempotent commit and `UNKNOWN` semantics |
-| [Microsoft Agent Governance Toolkit](https://github.com/microsoft/agent-governance-toolkit) | Broad policy, identity, sandboxing, and SRE toolkit | Its [limitations document](https://github.com/microsoft/agent-governance-toolkit/blob/main/docs/LIMITATIONS.md) records that audit captures attempts and allow/deny results, with outcome attestation planned; this project's entire scope is that commit-and-outcome boundary |
-| Durable execution engines: [Temporal](https://github.com/temporalio/temporal), [Restate](https://github.com/restatedev/restate), [DBOS](https://github.com/dbos-inc/dbos-transact-py) | Durable workflow state with automatic retries | The opposite default at the governance layer: an uncertain side effect stays `UNKNOWN` until reconciliation supplies evidence, and human approval binds to the action identity |
+| [Microsoft Agent Governance Toolkit](https://github.com/microsoft/agent-governance-toolkit) | Broad policy, identity, sandboxing, and SRE toolkit | Its [versioned limitations document](https://github.com/microsoft/agent-governance-toolkit/blob/2962693358c26201f2bbc13a54b5966af933accf/docs/LIMITATIONS.md) records that audit captures attempts and allow/deny results, with outcome attestation planned; this project's entire scope is that commit-and-outcome boundary |
+| Durable execution engines: [Temporal](https://github.com/temporalio/temporal), [Restate](https://github.com/restatedev/restate), [DBOS](https://github.com/dbos-inc/dbos-transact-py) | Durable workflow state with automatic retries | The governance-layer default is different: an uncertain side effect is recorded as `UNKNOWN` and is not automatically retried while its idempotency record is retained; deterministic reconciliation is planned for v0.7, and human approval binds to the action identity |
 | Content guardrails: [NeMo Guardrails](https://github.com/NVIDIA-NeMo/Guardrails), [Guardrails AI](https://github.com/guardrails-ai/guardrails) | Input, output, and dialog rails | A different layer that composes with this one; this project governs the side-effect boundary, not prompts or content |
 
 Prompt instructions are useful guidance, but they are not an authorization
