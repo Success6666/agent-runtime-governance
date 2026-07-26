@@ -4,6 +4,8 @@ All notable changes are documented here.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-27
+
 ### Added
 
 - Immutable `ActionContract` and `BoundAction` primitives with versioned RFC
@@ -27,8 +29,8 @@ All notable changes are documented here.
 - Strict policy-identity and external-precondition readiness checks, contract
   receipt validation, v0.5 context/approval/idempotency compatibility fixtures,
   and a documented migration and rollback procedure.
-- A paired strict-runtime benchmark, committed release-candidate measurement,
-  and CI-enforced latency and memory regression budget.
+- A paired strict-runtime benchmark, committed pre-release and final release
+  measurements, and a CI-enforced latency and memory regression budget.
 
 ### Changed
 

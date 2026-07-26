@@ -1,0 +1,284 @@
+{
+  "generated_at": "2026-07-26T20:39:46.490354+00:00",
+  "environment": {
+    "python": "3.12.0 (tags/v3.12.0:0fb18b0, Oct  2 2023, 13:03:39) [MSC v.1935 64 bit (AMD64)]",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "processor": "Intel64 Family 6 Model 154 Stepping 3, GenuineIntel",
+    "cpu_count": 16
+  },
+  "paired_repetitions": 3,
+  "measurements": [
+    {
+      "scenario": "baseline",
+      "requests": 100,
+      "concurrency": 100,
+      "throughput_per_second": 576.6936193469645,
+      "mean_ms": 128.37112400011392,
+      "p50_ms": 128.30620000022464,
+      "p95_ms": 158.18600001512095,
+      "p99_ms": 162.13609999977052,
+      "peak_memory_kib": 1091.14453125
+    },
+    {
+      "scenario": "rule",
+      "requests": 100,
+      "concurrency": 100,
+      "throughput_per_second": 659.947956588034,
+      "mean_ms": 120.2737900003558,
+      "p50_ms": 120.01469999086112,
+      "p95_ms": 141.93409998551942,
+      "p99_ms": 144.11769999423996,
+      "peak_memory_kib": 1015.833984375
+    },
+    {
+      "scenario": "rule_opa",
+      "requests": 100,
+      "concurrency": 100,
+      "throughput_per_second": 473.580147548999,
+      "mean_ms": 161.58622600138187,
+      "p50_ms": 162.37559998990037,
+      "p95_ms": 175.28369999490678,
+      "p99_ms": 176.94509998545982,
+      "peak_memory_kib": 1137.4296875
+    },
+    {
+      "scenario": "rule_opa_audit",
+      "requests": 100,
+      "concurrency": 100,
+      "throughput_per_second": 296.70922762957713,
+      "mean_ms": 303.1472420011414,
+      "p50_ms": 306.29189999308437,
+      "p95_ms": 322.15379999252036,
+      "p99_ms": 323.69559997459874,
+      "peak_memory_kib": 1518.8935546875
+    },
+    {
+      "scenario": "rule_opa_audit_otel",
+      "requests": 100,
+      "concurrency": 100,
+      "throughput_per_second": 341.38757663904676,
+      "mean_ms": 255.13439300033497,
+      "p50_ms": 259.8174999875482,
+      "p95_ms": 270.78039999469183,
+      "p99_ms": 271.9972000049893,
+      "peak_memory_kib": 1582.6767578125
+    },
+    {
+      "scenario": "ten_gates",
+      "requests": 100,
+      "concurrency": 100,
+      "throughput_per_second": 609.6620460091056,
+      "mean_ms": 142.37920799816493,
+      "p50_ms": 143.04080000147223,
+      "p95_ms": 157.53279998898506,
+      "p99_ms": 158.79709998262115,
+      "peak_memory_kib": 984.486328125
+    },
+    {
+      "scenario": "strict_baseline",
+      "requests": 100,
+      "concurrency": 100,
+      "throughput_per_second": 344.5211999482449,
+      "mean_ms": 281.8718870001612,
+      "p50_ms": 281.938900006935,
+      "p95_ms": 282.5779999839142,
+      "p99_ms": 282.6751999964472,
+      "peak_memory_kib": 1686.5859375
+    },
+    {
+      "scenario": "strict_bound_action",
+      "requests": 100,
+      "concurrency": 100,
+      "throughput_per_second": 224.51633007729038,
+      "mean_ms": 432.814995998051,
+      "p50_ms": 433.11650000396185,
+      "p95_ms": 438.2917000039015,
+      "p99_ms": 438.3079999824986,
+      "peak_memory_kib": 1788.3388671875
+    },
+    {
+      "scenario": "baseline",
+      "requests": 500,
+      "concurrency": 100,
+      "throughput_per_second": 863.09470892657,
+      "mean_ms": 91.12456979986746,
+      "p50_ms": 90.57380000012927,
+      "p95_ms": 116.53110000770539,
+      "p99_ms": 120.03250000998378,
+      "peak_memory_kib": 1622.591796875
+    },
+    {
+      "scenario": "rule",
+      "requests": 500,
+      "concurrency": 100,
+      "throughput_per_second": 856.4377397032698,
+      "mean_ms": 94.21693579957355,
+      "p50_ms": 92.91840001242235,
+      "p95_ms": 115.86580000584945,
+      "p99_ms": 119.92610001470894,
+      "peak_memory_kib": 1589.439453125
+    },
+    {
+      "scenario": "rule_opa",
+      "requests": 500,
+      "concurrency": 100,
+      "throughput_per_second": 471.40984163552514,
+      "mean_ms": 194.43984820047626,
+      "p50_ms": 198.0475999880582,
+      "p95_ms": 227.17190001276322,
+      "p99_ms": 250.05119998240843,
+      "peak_memory_kib": 1635.9521484375
+    },
+    {
+      "scenario": "rule_opa_audit",
+      "requests": 500,
+      "concurrency": 100,
+      "throughput_per_second": 339.07928039325674,
+      "mean_ms": 273.10306559997844,
+      "p50_ms": 274.4241000036709,
+      "p95_ms": 312.7059999969788,
+      "p99_ms": 320.3284000046551,
+      "peak_memory_kib": 2269.0302734375
+    },
+    {
+      "scenario": "rule_opa_audit_otel",
+      "requests": 500,
+      "concurrency": 100,
+      "throughput_per_second": 279.5777459038921,
+      "mean_ms": 343.3533150003641,
+      "p50_ms": 316.39979997999035,
+      "p95_ms": 478.40390002238564,
+      "p99_ms": 483.4066999901552,
+      "peak_memory_kib": 2320.5576171875
+    },
+    {
+      "scenario": "ten_gates",
+      "requests": 500,
+      "concurrency": 100,
+      "throughput_per_second": 511.03895240362493,
+      "mean_ms": 170.39250619971426,
+      "p50_ms": 171.0912999988068,
+      "p95_ms": 207.7768000017386,
+      "p99_ms": 217.04289998160675,
+      "peak_memory_kib": 1554.72265625
+    },
+    {
+      "scenario": "strict_baseline",
+      "requests": 500,
+      "concurrency": 100,
+      "throughput_per_second": 306.753076964796,
+      "mean_ms": 312.67527159897145,
+      "p50_ms": 314.3229999986943,
+      "p95_ms": 374.08450001385063,
+      "p99_ms": 383.91869998304173,
+      "peak_memory_kib": 2223.8251953125
+    },
+    {
+      "scenario": "strict_bound_action",
+      "requests": 500,
+      "concurrency": 100,
+      "throughput_per_second": 169.37543148321052,
+      "mean_ms": 572.0456395992078,
+      "p50_ms": 555.7002999994438,
+      "p95_ms": 670.2963999996427,
+      "p99_ms": 710.2879000012763,
+      "peak_memory_kib": 2214.001953125
+    },
+    {
+      "scenario": "baseline",
+      "requests": 1000,
+      "concurrency": 100,
+      "throughput_per_second": 769.2933186961588,
+      "mean_ms": 103.04428720087162,
+      "p50_ms": 101.10430000349879,
+      "p95_ms": 136.9014999945648,
+      "p99_ms": 150.34969997941516,
+      "peak_memory_kib": 2362.349609375
+    },
+    {
+      "scenario": "rule",
+      "requests": 1000,
+      "concurrency": 100,
+      "throughput_per_second": 664.8126813761074,
+      "mean_ms": 121.10075109978789,
+      "p50_ms": 119.8953999846708,
+      "p95_ms": 151.15570000489242,
+      "p99_ms": 159.29460001643747,
+      "peak_memory_kib": 2309.765625
+    },
+    {
+      "scenario": "rule_opa",
+      "requests": 1000,
+      "concurrency": 100,
+      "throughput_per_second": 512.1409411841688,
+      "mean_ms": 183.01849739986937,
+      "p50_ms": 186.83159997453913,
+      "p95_ms": 238.7604999821633,
+      "p99_ms": 246.3663000089582,
+      "peak_memory_kib": 2379.7939453125
+    },
+    {
+      "scenario": "rule_opa_audit",
+      "requests": 1000,
+      "concurrency": 100,
+      "throughput_per_second": 324.23579568394786,
+      "mean_ms": 295.1794170001813,
+      "p50_ms": 289.03439998975955,
+      "p95_ms": 429.889799997909,
+      "p99_ms": 439.5566000021063,
+      "peak_memory_kib": 3012.4658203125
+    },
+    {
+      "scenario": "rule_opa_audit_otel",
+      "requests": 1000,
+      "concurrency": 100,
+      "throughput_per_second": 247.93029647915586,
+      "mean_ms": 384.1080659997824,
+      "p50_ms": 345.21010000025854,
+      "p95_ms": 599.5789999724366,
+      "p99_ms": 648.0605999822728,
+      "peak_memory_kib": 3072.3603515625
+    },
+    {
+      "scenario": "ten_gates",
+      "requests": 1000,
+      "concurrency": 100,
+      "throughput_per_second": 572.6405077993393,
+      "mean_ms": 151.12382109972532,
+      "p50_ms": 153.69070001179352,
+      "p95_ms": 186.91750001744367,
+      "p99_ms": 192.22729999455623,
+      "peak_memory_kib": 2277.685546875
+    },
+    {
+      "scenario": "strict_baseline",
+      "requests": 1000,
+      "concurrency": 100,
+      "throughput_per_second": 279.00289499125796,
+      "mean_ms": 344.58572010009084,
+      "p50_ms": 337.34369999729097,
+      "p95_ms": 439.4229000026826,
+      "p99_ms": 443.83010000456125,
+      "peak_memory_kib": 2937.4736328125
+    },
+    {
+      "scenario": "strict_bound_action",
+      "requests": 1000,
+      "concurrency": 100,
+      "throughput_per_second": 182.74589634495686,
+      "mean_ms": 535.0644449001411,
+      "p50_ms": 514.9007000145502,
+      "p95_ms": 755.5973999842536,
+      "p99_ms": 820.9872999868821,
+      "peak_memory_kib": 3053.8818359375
+    }
+  ],
+  "admission_contention": {
+    "waiters": 100,
+    "permit_hold_ms": 0.0,
+    "mean_wait_ms": 2.2452569994493388,
+    "p50_wait_ms": 2.262699999846518,
+    "p95_wait_ms": 3.540300007443875,
+    "p99_wait_ms": 3.6545000039041042
+  }
+}

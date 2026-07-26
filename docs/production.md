@@ -1,9 +1,8 @@
 # Production Operations
 
-This guide covers the operational contract for v0.5 and the unreleased v0.6
-candidate. Applications remain
-responsible for tool-specific authorization, business rollback, and data
-retention requirements.
+This guide covers the operational contract for v0.5 and v0.6. Applications
+remain responsible for tool-specific authorization, business rollback, and
+data retention requirements.
 
 The v0.6 strict profile adds an explicit registration and sealing lifecycle.
 Configure `ProductionProfile`, register every tool, call
