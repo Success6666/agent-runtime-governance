@@ -130,8 +130,8 @@ class Runtime:
         self._pipeline = (
             pipeline if isinstance(pipeline, Pipeline) else Pipeline(pipeline)
         )
-        self.hooks = hooks or HookRegistry()
-        self.registry = ToolRegistry()
+        self._hooks = hooks or HookRegistry()
+        self._registry = ToolRegistry()
         self._idempotency_store = idempotency_store or InMemoryIdempotencyStore()
         self._identity_provider = identity_provider
         self._require_verified_identity = require_verified_identity
@@ -227,6 +227,26 @@ class Runtime:
             self._pipeline = (
                 value if isinstance(value, Pipeline) else Pipeline(value)
             )
+
+    @property
+    def hooks(self) -> HookRegistry:
+        return self._hooks
+
+    @hooks.setter
+    def hooks(self, value: HookRegistry) -> None:
+        with self._production_seal_lock:
+            self._guard_sealed_mutation("hooks")
+            self._hooks = value
+
+    @property
+    def registry(self) -> ToolRegistry:
+        return self._registry
+
+    @registry.setter
+    def registry(self, value: ToolRegistry) -> None:
+        with self._production_seal_lock:
+            self._guard_sealed_mutation("registry")
+            self._registry = value
 
     @property
     def idempotency_store(self) -> IdempotencyStore:
