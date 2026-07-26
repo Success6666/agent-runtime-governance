@@ -15,9 +15,7 @@ replayable trace.
 ## Quick start
 
 ```bash
-git clone https://github.com/Success6666/agent-runtime-governance.git
-cd agent-runtime-governance
-pip install .
+pip install agent-runtime-governance
 ```
 
 ```python
@@ -298,6 +296,7 @@ cross-platform latency SLA.
 | v0.4.1 | Mandatory linked issues and merge-policy verification |
 | v0.4.2 | Fail-closed CodeRabbit review verification for the current commit |
 | v0.5.0 | Production reliability: idempotency, identity, durable approvals, audit, deadlines, cancellation, contracts, real integration smoke |
+| v0.5.1 | Security hardening: caller metadata isolation and exact approval binding |
 
 Released versions are preserved as immutable Git tags. See
 [CHANGELOG.md](CHANGELOG.md) for the detailed compatibility and security notes.
