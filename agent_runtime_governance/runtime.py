@@ -436,6 +436,10 @@ class Runtime:
             ) -> tuple[ExecutionContext, Any]:
                 nonlocal execution_started
 
+                current = self._enforce_required_approval(current)
+                if current.denied:
+                    raise GovernanceDenied(current)
+
                 def mark_started() -> None:
                     nonlocal execution_started
                     execution_started = True
@@ -512,8 +516,16 @@ class Runtime:
             context = await self._emit_hook(HookPoint.ON_ERROR, context, allow_critical=False)
             context = await self._run_observers(context, post=True)
             raise ToolExecutionError(context, cause) from cause
-        except GovernanceDenied:
-            raise
+        except GovernanceDenied as exc:
+            await self._stop_idempotency_heartbeat(
+                heartbeat_task, raise_on_failure=False
+            )
+            context = await self._settle_idempotency(
+                claim, exc.context, exc
+            )
+            claim = None
+            context = await self._run_observers(context, post=True)
+            raise GovernanceDenied(context) from exc
         except asyncio.CancelledError as exc:
             await asyncio.shield(
                 self._stop_idempotency_heartbeat(

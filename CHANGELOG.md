@@ -12,7 +12,8 @@ All notable changes are documented here.
 - Required approvals now execute only when a first-class grant is bound to the
   current request, allow decision, tool, arguments, risk tier, policy version
   and digest, subject, tenant, identity issuer, and unexpired decision. The
-  binding is revalidated after pre-execution hooks and approval commit.
+  binding is revalidated after pre-execution hooks, after approval commit, and
+  inside the execution middleware chain immediately before the tool body.
 - Runtime-owned duration metadata is isolated from caller metadata so metrics
   cannot be polluted by forged execution timing values.
 
