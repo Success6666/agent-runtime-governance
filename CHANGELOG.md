@@ -31,6 +31,22 @@ All notable changes are documented here.
   runtimes reject traffic until the complete registry and required durable,
   trusted, integrity-protected components pass startup validation. Non-strict
   construction remains compatible and can emit the same migration inventory.
+- Sealed production runtimes now reject reassignment of `pipeline`,
+  `idempotency_store`, `identity_provider`, `require_verified_identity`, and
+  `production_profile`, so post-seal mutation can no longer invalidate the
+  sealed guarantees. Assigning a production profile to an existing runtime
+  re-arms the fail-closed admission gate.
+- `Runtime.apreview` and `Runtime.areplay` enforce the same fail-closed
+  sealing gate as `Runtime.arun`, so governance previews and replays cannot
+  run middleware before a strict runtime is sealed.
+- Identity replay-store durability validation now applies to any identity
+  provider exposing a `replay_store`, not just the built-in HMAC provider.
+
+### Fixed
+
+- The production smoke test's pinned image pulls now treat a hung
+  `docker pull` (`subprocess.TimeoutExpired`) as a retryable failure instead
+  of aborting before the retry/backoff logic engages.
 
 ## [0.5.1] - 2026-07-26
 
