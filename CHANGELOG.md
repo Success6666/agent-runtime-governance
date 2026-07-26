@@ -2,6 +2,24 @@
 
 All notable changes are documented here.
 
+## [0.5.1] - 2026-07-26
+
+### Security
+
+- Invocation metadata can no longer supply reserved `approval_`, `identity_`,
+  or `policy_` governance state. Reserved prefixes are filtered
+  case-insensitively at the runtime trust boundary.
+- Required approvals now execute only when a first-class grant is bound to the
+  current request, allow decision, tool, arguments, subject, tenant, identity
+  issuer, and unexpired decision.
+
+### Changed
+
+- Serialized execution contexts now include validated approval request and
+  decision identifiers. Contexts created by earlier releases remain readable
+  and restore as unapproved unless they contain the new bound state.
+- A later deny decision clears any previously granted approval state.
+
 ## [0.5.0] - 2026-07-26
 
 ### Added
