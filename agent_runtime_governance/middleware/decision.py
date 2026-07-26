@@ -238,13 +238,7 @@ class DecisionMiddleware(GatingMiddleware):
     ) -> None:
         with self._reservation_lock:
             now = monotonic()
-            expired = [
-                key
-                for key, (_, _, deadline) in self._reservations.items()
-                if deadline <= now
-            ]
-            for key in expired:
-                self._reservations.pop(key, None)
+            self._prune_expired_reservations_locked(now)
             self._reservations[trace_id] = (
                 request,
                 token,
@@ -253,6 +247,7 @@ class DecisionMiddleware(GatingMiddleware):
 
     def _pop_reservation(self, trace_id: str) -> tuple[ApprovalRequest, str] | None:
         with self._reservation_lock:
+            self._prune_expired_reservations_locked(monotonic())
             reservation = self._reservations.pop(trace_id, None)
         if reservation is None:
             return None
@@ -262,7 +257,17 @@ class DecisionMiddleware(GatingMiddleware):
     @property
     def active_reservation_count(self) -> int:
         with self._reservation_lock:
+            self._prune_expired_reservations_locked(monotonic())
             return len(self._reservations)
+
+    def _prune_expired_reservations_locked(self, now: float) -> None:
+        expired = [
+            key
+            for key, (_, _, deadline) in self._reservations.items()
+            if deadline <= now
+        ]
+        for key in expired:
+            self._reservations.pop(key, None)
 
     async def _decide(
         self, context: ExecutionContext, request: ApprovalRequest
