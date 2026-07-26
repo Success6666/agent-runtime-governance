@@ -11,6 +11,7 @@ from agent_runtime_governance import (
     ExecutionContext,
     ExecutionMode,
     HMACClaimsIdentityProvider,
+    HookRegistry,
     InMemoryApprovalStore,
     InMemoryAuditSink,
     InMemoryIdempotencyStore,
@@ -709,12 +710,18 @@ def test_sealed_runtime_rejects_component_reassignment(tmp_path) -> None:
 
     runtime.seal_production()
     original_pipeline = runtime.pipeline
+    original_hooks = runtime.hooks
+    original_registry = runtime.registry
     original_store = runtime.idempotency_store
     original_provider = runtime.identity_provider
     original_profile = runtime.production_profile
 
     with pytest.raises(RuntimeError, match="sealed for production"):
         runtime.pipeline = []
+    with pytest.raises(RuntimeError, match="sealed for production"):
+        runtime.hooks = HookRegistry()
+    with pytest.raises(RuntimeError, match="sealed for production"):
+        runtime.registry = ToolRegistry()
     with pytest.raises(RuntimeError, match="sealed for production"):
         runtime.idempotency_store = InMemoryIdempotencyStore()
     with pytest.raises(RuntimeError, match="sealed for production"):
@@ -725,6 +732,8 @@ def test_sealed_runtime_rejects_component_reassignment(tmp_path) -> None:
         runtime.production_profile = None
 
     assert runtime.pipeline is original_pipeline
+    assert runtime.hooks is original_hooks
+    assert runtime.registry is original_registry
     assert runtime.idempotency_store is original_store
     assert runtime.identity_provider is original_provider
     assert runtime.require_verified_identity is True

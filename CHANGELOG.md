@@ -31,11 +31,12 @@ All notable changes are documented here.
   runtimes reject traffic until the complete registry and required durable,
   trusted, integrity-protected components pass startup validation. Non-strict
   construction remains compatible and can emit the same migration inventory.
-- Sealed production runtimes now reject reassignment of `pipeline`,
-  `idempotency_store`, `identity_provider`, `require_verified_identity`, and
-  `production_profile`, so post-seal mutation can no longer invalidate the
-  sealed guarantees. Assigning a production profile to an existing runtime
-  re-arms the fail-closed admission gate.
+- Sealed production runtimes now reject reassignment of `pipeline`, `hooks`,
+  `registry`, `idempotency_store`, `identity_provider`,
+  `require_verified_identity`, and `production_profile`, so post-seal mutation
+  can no longer swap in an unvalidated registry, drop critical hooks, or
+  otherwise invalidate the sealed guarantees. Assigning a production profile to
+  an existing runtime re-arms the fail-closed admission gate.
 - `Runtime.apreview` and `Runtime.areplay` enforce the same fail-closed
   sealing gate as `Runtime.arun`, so governance previews and replays cannot
   run middleware before a strict runtime is sealed.
