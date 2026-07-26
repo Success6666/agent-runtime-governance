@@ -152,6 +152,7 @@ class ExecutionContext:
         object.__setattr__(self, "permissions", frozenset(self.permissions))
         object.__setattr__(self, "history", tuple(self.history))
         object.__setattr__(self, "metadata", _freeze_mapping(self.metadata))
+        object.__setattr__(self, "result", _freeze(self.result))
 
     @classmethod
     def create(

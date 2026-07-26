@@ -31,19 +31,26 @@ Immutable identity fields include trace IDs, principal, permissions, original
 user input, and the requested tool call. Governance fields such as risk score,
 decision, status, history, result, and metadata evolve by replacement.
 
-Nested mappings and sequences are frozen on context construction. Serialization
-produces a detached JSON-compatible representation for audit and replay.
+Nested mappings and sequences, including execution result snapshots, are frozen
+on context construction. Serialization produces a detached JSON-compatible
+representation for audit and replay. The caller-facing tool return remains the
+application value and is not replaced by the context snapshot.
 
 ## Middleware boundaries
 
-`GatingMiddleware` may deny execution. `ObservingMiddleware` records state but
-does not gain authority to allow or deny. v0.1 accepts a fixed Python list so
-execution order is explicit at construction time.
+`GatingMiddleware` may tighten risk and approval requirements or deny execution.
+It cannot lower existing risk or approval requirements. `ObservingMiddleware`
+may append history and add ordinary metadata, but it cannot change request,
+governance, execution, or existing metadata state. These boundaries are checked
+by the runtime for every returned context, including contexts reconstructed
+without `ExecutionContext.evolve()`.
 
 v0.2 represents that list as an immutable `Pipeline`. Composition operations
 return a new pipeline, preserving deterministic order and avoiding concurrent
 runtime mutation. `ExecutionMiddleware` wraps only the tool executor, enabling
-retry and timeout without giving those controls policy authority.
+retry and timeout without giving those controls policy authority. Its input and
+output are checked again at the innermost tool boundary before the tool body is
+called.
 
 Hooks are lightweight observation/enrichment points. They cannot change status
 or decisions. A critical pre-execution hook failure is converted into an
