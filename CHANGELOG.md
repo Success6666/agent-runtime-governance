@@ -16,6 +16,12 @@ All notable changes are documented here.
   inside the execution middleware chain immediately before the tool body.
 - Runtime-owned duration metadata is isolated from caller metadata so metrics
   cannot be polluted by forged execution timing values.
+- Middleware context transitions are enforced at runtime boundaries so
+  observers and execution wrappers cannot rewrite identity, tool arguments,
+  risk, approval, decisions, or terminal outcomes through reconstructed
+  contexts.
+- Context result snapshots now freeze nested mappings and sequences before
+  post-execution observers run, preventing in-place audit-state mutation.
 
 ### Changed
 

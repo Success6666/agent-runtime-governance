@@ -13,6 +13,7 @@ from threading import Lock
 from time import perf_counter
 from typing import Any, Callable, Iterable, Mapping, ParamSpec, TypeVar
 
+from ._context_boundaries import validate_middleware_transition
 from .context import (
     ExecutionContext,
     ExecutionMode,
@@ -30,6 +31,7 @@ from .contracts import (
 from .decisions import DecisionOutcome, DecisionRecord, digest_arguments
 from .errors import (
     AuditDeliveryError,
+    ContextMutationError,
     ContractValidationError,
     ExecutionControlError,
     GovernanceCancelledError,
@@ -436,6 +438,20 @@ class Runtime:
             ) -> tuple[ExecutionContext, Any]:
                 nonlocal execution_started
 
+                try:
+                    current = validate_middleware_transition(
+                        context, current, MiddlewareKind.EXECUTION
+                    )
+                except ContextMutationError as exc:
+                    decision = DecisionRecord(
+                        DecisionOutcome.DENY,
+                        f"execution middleware boundary rejected context: {exc}",
+                        "runtime",
+                    )
+                    denied = context.with_decision(decision).append_history(
+                        HistoryEntry("runtime", "deny", decision.reason)
+                    )
+                    raise GovernanceDenied(denied) from exc
                 current = self._enforce_required_approval(current)
                 if current.denied:
                     raise GovernanceDenied(current)
@@ -480,7 +496,17 @@ class Runtime:
                     current_middleware: ExecutionMiddleware = middleware,
                     call_next: ExecutionCall = next_call,
                 ) -> tuple[ExecutionContext, Any]:
-                    return await current_middleware.execute(current, call_next)
+                    candidate, value = await current_middleware.execute(
+                        current, call_next
+                    )
+                    return (
+                        validate_middleware_transition(
+                            current,
+                            candidate,
+                            MiddlewareKind.EXECUTION,
+                        ),
+                        value,
+                    )
 
                 call = wrapped
             context, value = await self._with_deadline(context, call)
@@ -1302,11 +1328,14 @@ class Runtime:
                     ),
                     f"middleware:{middleware.name}",
                 )
-                context = await await_stage(
+                candidate = await await_stage(
                     middleware.process(context),
                     stage=f"middleware:{middleware.name}",
                     timeout_seconds=timeout,
                     cancellation_grace_seconds=self.limits.cancellation_grace_seconds,
+                )
+                context = validate_middleware_transition(
+                    context, candidate, middleware.kind
                 )
                 context = await self._emit_middleware_hook(
                     middleware.name, context, before=False
@@ -1482,11 +1511,14 @@ class Runtime:
                     self.limits.observer_timeout_seconds,
                     f"observer:{middleware.name}",
                 )
-                context = await await_stage(
+                candidate = await await_stage(
                     middleware.process(context),
                     stage=f"observer:{middleware.name}",
                     timeout_seconds=timeout,
                     cancellation_grace_seconds=self.limits.cancellation_grace_seconds,
+                )
+                context = validate_middleware_transition(
+                    context, candidate, MiddlewareKind.OBSERVING
                 )
                 context = await self._emit_middleware_hook(
                     middleware.name, context, before=False
