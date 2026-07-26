@@ -355,7 +355,7 @@ def test_caller_metadata_cannot_forge_policy_binding() -> None:
     assert requests[0].policy_digest is None
 
 
-def test_before_execute_hook_cannot_invalidate_approval_after_final_check() -> None:
+def test_critical_before_execute_hook_cannot_mutate_approval_state() -> None:
     calls: list[str] = []
     runtime = Runtime(
         [DecisionMiddleware(HumanDecisionProvider(lambda context, request: True))]
@@ -374,8 +374,9 @@ def test_before_execute_hook_cannot_invalidate_approval_after_final_check() -> N
         calls.append("executed")
         return "executed"
 
-    with pytest.raises(GovernanceDenied):
+    with pytest.raises(GovernanceDenied) as caught:
         operate()
+    assert "hooks cannot change protected execution state" in str(caught.value)
     assert calls == []
 
 

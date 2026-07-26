@@ -14,6 +14,7 @@ from time import perf_counter
 from typing import Any, Callable, Iterable, Mapping, ParamSpec, TypeVar
 
 from ._context_boundaries import validate_middleware_transition
+from ._metadata import metadata_text as _metadata_text
 from .context import (
     ExecutionContext,
     ExecutionMode,
@@ -1738,11 +1739,6 @@ def _caller_metadata(value: Mapping[str, Any] | None) -> dict[str, Any]:
             and not key.lower().startswith(_GOVERNANCE_METADATA_PREFIXES)
         )
     }
-
-
-def _metadata_text(metadata: Mapping[str, Any], key: str) -> str | None:
-    value = metadata.get(key)
-    return None if value is None else str(value)
 
 
 Harness = Runtime
