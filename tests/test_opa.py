@@ -98,6 +98,8 @@ def test_opa_rejects_unsafe_policy_paths(path: str) -> None:
 
 def test_opa_client_refuses_real_http_redirect_without_visiting_target() -> None:
     target_hits: list[str | None] = []
+    redirect_statuses: list[int] = []
+    redirect_emitted = threading.Event()
 
     class RedirectHandler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:  # noqa: N802
@@ -109,6 +111,8 @@ def test_opa_client_refuses_real_http_redirect_without_visiting_target() -> None
             self.send_header("Content-Length", "0")
             self.send_header("Connection", "close")
             self.end_headers()
+            redirect_statuses.append(302)
+            redirect_emitted.set()
             self.wfile.flush()
             self.close_connection = True
 
@@ -138,6 +142,8 @@ def test_opa_client_refuses_real_http_redirect_without_visiting_target() -> None
             client.evaluate(ExecutionContext.create(ToolCall("operate")))
         if isinstance(caught.value, HTTPError):
             assert caught.value.code == 302
+        assert redirect_emitted.wait(timeout=1.0)
+        assert redirect_statuses == [302]
         assert target_hits == []
     finally:
         server.shutdown()
