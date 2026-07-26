@@ -15,7 +15,9 @@ replayable trace.
 ## Quick start
 
 ```bash
-pip install agent-runtime-governance
+git clone https://github.com/Success6666/agent-runtime-governance.git
+cd agent-runtime-governance
+pip install .
 ```
 
 ```python
