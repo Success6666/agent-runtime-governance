@@ -68,7 +68,7 @@ def test_v05_idempotency_fixture_survives_store_restart(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_v05_context_can_be_rebound_for_contracted_replay(tmp_path) -> None:
+async def test_v05_context_replay_is_analysis_only_and_preview_rebinds(tmp_path) -> None:
     principal = VerifiedPrincipal(
         issuer="trusted-gateway",
         subject="service-account",
@@ -121,6 +121,13 @@ async def test_v05_context_can_be_rebound_for_contracted_replay(tmp_path) -> Non
     replayed = await runtime.areplay(recorded)
 
     assert replayed.request_id == recorded.request_id
-    assert replayed.bound_action is not None
-    assert replayed.bound_action.parameters["target"] == "node-a"
-    assert replayed.bound_action.policy_version == "policy-v1"
+    assert replayed.bound_action is None
+    assert replayed.metadata["replay_mode"] == "analysis"
+    assert replayed.metadata["replay_authoritative"] is False
+    assert "identity_verified" not in replayed.metadata
+    assert "identity_issuer" not in replayed.metadata
+
+    previewed = await runtime.apreview("operate", "node-a")
+    assert previewed.bound_action is not None
+    assert previewed.bound_action.parameters["target"] == "node-a"
+    assert previewed.bound_action.policy_version == "policy-v1"
