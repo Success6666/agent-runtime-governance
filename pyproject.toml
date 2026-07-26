@@ -76,6 +76,7 @@ include = ["agent_runtime_governance*"]
 [tool.pytest.ini_options]
 addopts = "-q"
 asyncio_mode = "auto"
+pythonpath = ["."]
 testpaths = ["tests"]
 
 [tool.coverage.run]
