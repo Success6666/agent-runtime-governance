@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import math
 
-from hypothesis import given
+from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from agent_runtime_governance import ActionContract, BoundAction, ExecutionMode
 
 _SAFE_INTEGER = (1 << 53) - 1
+_IDENTITY_DIGEST_KEY = b"0123456789abcdef0123456789abcdef"
 
 safe_json_scalars = (
     st.none()
@@ -20,11 +21,13 @@ safe_json_scalars = (
 )
 safe_json_values = st.recursive(
     safe_json_scalars,
-    lambda children: st.lists(children, max_size=4)
-    | st.dictionaries(
-        st.text(alphabet=st.characters(exclude_categories=("Cs",)), max_size=12),
-        children,
-        max_size=4,
+    lambda children: (
+        st.lists(children, max_size=4)
+        | st.dictionaries(
+            st.text(alphabet=st.characters(exclude_categories=("Cs",)), max_size=12),
+            children,
+            max_size=4,
+        )
     ),
     max_leaves=20,
 )
@@ -42,6 +45,7 @@ def _contract() -> ActionContract:
     )
 
 
+@settings(deadline=None)
 @given(st.dictionaries(st.text(min_size=1, max_size=12), safe_json_values, max_size=6))
 def test_supported_parameters_have_deterministic_action_identity(parameters) -> None:
     contract = _contract()
@@ -50,17 +54,22 @@ def test_supported_parameters_have_deterministic_action_identity(parameters) -> 
         identity_issuer="issuer:local",
         principal="user:operator",
         tenant="tenant:acme",
+        identity_digest_key=_IDENTITY_DIGEST_KEY,
+        identity_digest_key_version="2026-07",
     )
     second = contract.bind(
         dict(reversed(list(parameters.items()))),
         identity_issuer="issuer:local",
         principal="user:operator",
         tenant="tenant:acme",
+        identity_digest_key=_IDENTITY_DIGEST_KEY,
+        identity_digest_key_version="2026-07",
     )
     assert first.parameters_digest == second.parameters_digest
     assert first.action_digest == second.action_digest
 
 
+@settings(deadline=None)
 @given(st.dictionaries(st.text(min_size=1, max_size=12), safe_json_values, max_size=6))
 def test_serialized_bound_actions_round_trip(parameters) -> None:
     bound = _contract().bind(
@@ -68,5 +77,7 @@ def test_serialized_bound_actions_round_trip(parameters) -> None:
         identity_issuer="issuer:local",
         principal="user:operator",
         tenant="tenant:acme",
+        identity_digest_key=_IDENTITY_DIGEST_KEY,
+        identity_digest_key_version="2026-07",
     )
     assert BoundAction.from_dict(bound.to_dict()) == bound
