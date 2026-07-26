@@ -1,3 +1,4 @@
+from .action_contracts import ActionContract, BoundAction
 from .approval_store import (
     ApprovalReservation,
     ApprovalStatus,
@@ -126,6 +127,7 @@ from .yaml_policy import PolicyDocument, PolicyValidationError, YAMLPolicyLoader
 __version__ = "0.5.1"
 
 __all__ = [
+    "ActionContract",
     "ApprovalMiddleware",
     "ApprovalRequest",
     "ApprovalReservation",
@@ -135,6 +137,7 @@ __all__ = [
     "AuditSink",
     "AuditIntegrityError",
     "AuditMiddleware",
+    "BoundAction",
     "ContextMutationError",
     "ContextSnapshot",
     "ContractValidationError",

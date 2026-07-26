@@ -2,6 +2,27 @@
 
 All notable changes are documented here.
 
+## [Unreleased]
+
+### Added
+
+- Immutable `ActionContract` and `BoundAction` primitives with versioned RFC
+  8785 canonical envelopes and domain-separated SHA-256 digests.
+- Strict action-value validation for unsupported types, non-finite numbers,
+  negative zero, unsafe integers, invalid Unicode, cycles, duplicate mapping
+  keys, nesting limits, node budgets, and canonical payload limits.
+- Versioned serialization that recomputes every digest on restore, plus a
+  parameter-free evidence representation and cross-process golden fixtures.
+- Principal digests that bind trusted issuer and subject while keeping both raw
+  values out of serialized actions, evidence, and representations. Parameter
+  contract errors omit rejected values to avoid secret disclosure.
+
+### Changed
+
+- Added the dependency-free `rfc8785` encoder for the new action-contract
+  domain. Existing v0.5 identity, approval, and idempotency encodings remain
+  unchanged until the versioned runtime migration phase.
+
 ## [0.5.1] - 2026-07-26
 
 ### Security
