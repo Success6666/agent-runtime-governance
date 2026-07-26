@@ -345,8 +345,8 @@ multi-host deployments.
 Each release is verified before publishing: the full test matrix on Python
 3.10-3.13, Docker-backed integration smoke, an isolated dependency audit, and
 wheel/sdist installation from clean environments, with the SPDX SBOM, SHA256
-checksums, and GitHub provenance attached to the release. The complete
-point-in-time record for v0.5.1 is in
+checksums, and GitHub provenance attached to the release. Complete
+point-in-time records for published releases are in
 [`docs/release-verification.md`](docs/release-verification.md).
 
 Benchmarks measure incremental runtime overhead for baseline, Rule, OPA, Audit,
