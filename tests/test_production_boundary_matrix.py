@@ -4,6 +4,7 @@ import asyncio
 import sqlite3
 import sys
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from types import ModuleType
 from uuid import uuid4
@@ -417,11 +418,13 @@ def test_sqlite_idempotency_store_fails_closed_on_invalid_persisted_state(tmp_pa
     path = tmp_path / "idempotency.db"
     store = SQLiteIdempotencyStore(path)
     owner = store.acquire("tenant/tool", "request", "a" * 64)
-    with sqlite3.connect(path) as connection:
-        connection.execute(
-            "UPDATE idempotency_records SET state = 'completed', result_json = 'null', "
-            "owner_token = NULL, lease_expires_at = NULL WHERE key = 'request'"
-        )
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute(
+                "UPDATE idempotency_records SET state = 'completed', "
+                "result_json = 'null', owner_token = NULL, "
+                "lease_expires_at = NULL WHERE key = 'request'"
+            )
     with pytest.raises(RuntimeError, match="ownership was lost"):
         store.renew(owner)
     with pytest.raises(RuntimeError, match="ownership was lost"):
@@ -598,7 +601,12 @@ def test_runtime_builder_applies_all_runtime_dependencies() -> None:
         assert builder.with_sync_executor(executor) is builder
         assert builder.with_idempotency_executor(idempotency_executor) is builder
         runtime = builder.build()
-        assert runtime is not None
+        assert runtime.identity_provider is identity
+        assert runtime.require_verified_identity is True
+        assert runtime.idempotency_store is idempotency
+        assert runtime.limits is limits
+        assert runtime.sync_executor is executor
+        assert runtime.idempotency_executor is idempotency_executor
         runtime.close()
 
 
@@ -763,7 +771,10 @@ async def test_prometheus_middleware_records_failures_once_and_skips_non_termina
     assert await middleware.process(recorded) is recorded
     middleware.record_external_failure("slack", reason="timeout")
     metrics = generate_latest(registry).decode("utf-8")
-    assert 'component="opa"' in metrics
+    assert (
+        'component="opa",outcome="error",reason="observer_failure"'
+        in metrics
+    )
     assert 'component="slack"' in metrics
 
     critical = ExecutionContext.create(ToolCall("critical")).append_history(
@@ -772,6 +783,6 @@ async def test_prometheus_middleware_records_failures_once_and_skips_non_termina
     await middleware.process(critical)
     metrics = generate_latest(registry).decode("utf-8")
     assert (
-        'component="audit",outcome="error",reason="critical_observer_failure"'
+        'component="audit",outcome="critical_error",reason="observer_failure"'
         in metrics
     )

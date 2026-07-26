@@ -128,6 +128,8 @@ class ExecutionContext:
     def __post_init__(self) -> None:
         if not 0.0 <= self.risk_score <= 1.0:
             raise ValueError("risk_score must be between 0.0 and 1.0")
+        if self.idempotency_key is not None and not self.idempotency_key.strip():
+            raise ValueError("idempotency_key cannot be empty")
         if self.deadline is not None and (
             self.deadline.tzinfo is None or self.deadline.utcoffset() is None
         ):

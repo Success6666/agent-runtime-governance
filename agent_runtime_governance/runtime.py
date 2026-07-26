@@ -153,6 +153,18 @@ class Runtime:
     async def aclose(self) -> None:
         await asyncio.to_thread(self.close)
 
+    @property
+    def sync_executor(self) -> Executor:
+        """Return the executor used for synchronous tool bodies."""
+
+        return self._sync_executor
+
+    @property
+    def idempotency_executor(self) -> Executor:
+        """Return the executor isolated for idempotency-store operations."""
+
+        return self._idempotency_executor
+
     def __enter__(self) -> "Runtime":
         return self
 
@@ -785,9 +797,7 @@ class Runtime:
             try:
                 principal = await self._invoke_identity_provider(None, options.deadline)
             except Exception:
-                if self.require_verified_identity:
-                    return None, "identity verification failed"
-                return None, None
+                return None, "identity verification failed"
             if not isinstance(principal, VerifiedPrincipal):
                 return None, "identity provider returned an invalid principal"
             return principal, None

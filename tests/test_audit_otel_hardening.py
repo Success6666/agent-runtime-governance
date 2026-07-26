@@ -4,7 +4,8 @@ import asyncio
 import json
 import sqlite3
 import warnings
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
+from urllib.error import HTTPError
 
 import pytest
 
@@ -72,6 +73,25 @@ async def test_noncritical_audit_failure_is_retried_and_denial_is_terminal() -> 
     assert recorded.history[-1].outcome == "record"
 
 
+def test_audit_critical_configuration_has_explicit_precedence() -> None:
+    critical = AuditMiddleware(
+        RetryAuditSink(),
+        critical=True,
+        fail_closed=False,
+    )
+    assert critical.critical is True
+    assert critical.fail_closed is False
+    assert critical.is_critical(make_context(risk_tier=RiskTier.LOW)) is True
+
+    fail_closed = AuditMiddleware(
+        RetryAuditSink(),
+        fail_closed=True,
+        critical_tiers=frozenset(),
+    )
+    assert fail_closed.critical is False
+    assert fail_closed.is_critical(make_context(risk_tier=RiskTier.LOW)) is True
+
+
 def test_jsonl_audit_wraps_invalid_state_json(tmp_path) -> None:
     path = tmp_path / "audit.jsonl"
     sink = JSONLAuditSink(path, sign_key="k")
@@ -84,11 +104,54 @@ def test_jsonl_audit_wraps_invalid_state_json(tmp_path) -> None:
         sink.write({"event": 2})
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "{",
+        "[]",
+        '{"sequence": 0}',
+        '{"sequence": "0", "prev_hash": "x"}',
+    ],
+)
+def test_jsonl_audit_rejects_malformed_segment_anchor(tmp_path, raw: str) -> None:
+    path = tmp_path / "audit.jsonl"
+    path.write_text(raw + "\n", encoding="utf-8")
+    sink = JSONLAuditSink(path, max_bytes=1, backup_count=1)
+
+    with pytest.raises(
+        AuditIntegrityError, match="audit JSON|must be an object|anchor"
+    ):
+        sink._first_raw_event()
+
+
+def test_audit_and_snapshot_hashes_reject_nonfinite_numbers(tmp_path) -> None:
+    audit = JSONLAuditSink(tmp_path / "audit.jsonl")
+    with pytest.raises(ValueError, match="Out of range float"):
+        audit.write({"risk_score": float("nan")})
+
+    context = ExecutionContext.create(
+        ToolCall("measure"), metadata={"risk_score": float("inf")}
+    )
+    snapshots = JSONLSnapshotStore(
+        tmp_path / "snapshots.jsonl", redact_sensitive=False
+    )
+    with pytest.raises(ValueError, match="Out of range float"):
+        snapshots.write_context(
+            trace_id=context.trace_id,
+            stage="governance",
+            context=context,
+            created_at="2026-01-01T00:00:00+00:00",
+            policy_version=None,
+            policy_digest=None,
+        )
+
+
 def test_sqlite_audit_missing_state_row_fails_closed(tmp_path) -> None:
     path = tmp_path / "audit.db"
     sink = SQLiteAuditSink(path, sign_key="k")
-    with sqlite3.connect(path) as connection:
-        connection.execute("DELETE FROM audit_state")
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute("DELETE FROM audit_state")
 
     with pytest.raises(AuditIntegrityError, match="state row is missing"):
         sink.write({"event": 1})
@@ -221,10 +284,12 @@ def test_sqlite_audit_sink_is_transactional_and_verifiable(tmp_path) -> None:
     sink.write({"trace_id": "t", "stage": "completed", "context": {"tool_call": {"args": []}}})
     assert [event["sequence"] for event in sink.read_verified()] == [0, 1]
 
-    with sqlite3.connect(path) as connection:
-        connection.execute(
-            "UPDATE audit_events SET event_json = replace(event_json, 'completed', 'tampered') WHERE sequence = 1"
-        )
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute(
+                "UPDATE audit_events SET event_json = replace(event_json, "
+                "'completed', 'tampered') WHERE sequence = 1"
+            )
     with pytest.raises(AuditIntegrityError):
         sink.read_verified()
 
@@ -340,6 +405,16 @@ async def test_snapshot_records_unknown_as_a_terminal_result() -> None:
     snapshots = store.read_trace(context.trace_id)
     assert [snapshot.stage for snapshot in snapshots] == ["governance", "result"]
     assert snapshots[-1].context.status is ExecutionStatus.UNKNOWN
+    for snapshot in snapshots:
+        entries = [
+            entry
+            for entry in snapshot.context.history
+            if entry.middleware == "snapshot"
+            and entry.data.get("stage") == snapshot.stage
+        ]
+        assert len(entries) == 1
+        assert entries[0].outcome == "record"
+        assert entries[0].data["sequence"] == snapshot.sequence
 
 
 def test_opa_client_limits_payload_and_circuit_breaks() -> None:
@@ -385,11 +460,15 @@ def test_slack_notifier_limits_payload_and_circuit_breaks(monkeypatch) -> None:
 
     calls = {"count": 0}
 
-    def failing_urlopen(*args, **kwargs):
-        calls["count"] += 1
-        raise ConnectionError("down")
+    class FailingOpener:
+        def open(self, *args, **kwargs):
+            calls["count"] += 1
+            raise ConnectionError("down")
 
-    monkeypatch.setattr("agent_runtime_governance.plugins.slack.urlopen", failing_urlopen)
+    monkeypatch.setattr(
+        "agent_runtime_governance.plugins.slack.build_opener",
+        lambda *handlers: FailingOpener(),
+    )
     notifier = SlackWebhookNotifier(
         "https://hooks.slack.com/services/T/B/C",
         failure_threshold=1,
@@ -400,6 +479,32 @@ def test_slack_notifier_limits_payload_and_circuit_breaks(monkeypatch) -> None:
     with pytest.raises(RuntimeError, match="circuit breaker"):
         notifier.send({"text": "ok"})
     assert calls["count"] == 1
+
+
+def test_slack_notifier_installs_redirect_rejecting_opener(monkeypatch) -> None:
+    handlers = []
+
+    class RedirectOpener:
+        def open(self, request, timeout):
+            raise HTTPError(request.full_url, 302, "redirect", {}, None)
+
+    def capture_opener(*installed):
+        handlers.extend(installed)
+        return RedirectOpener()
+
+    monkeypatch.setattr(
+        "agent_runtime_governance.plugins.slack.build_opener", capture_opener
+    )
+    notifier = SlackWebhookNotifier(
+        "https://hooks.slack.com/services/T/B/C",
+        headers={"Authorization": "Bearer secret"},
+    )
+
+    with pytest.raises(HTTPError) as caught:
+        notifier.send({"text": "ok"})
+
+    assert caught.value.code == 302
+    assert any(type(handler).__name__ == "_RejectRedirects" for handler in handlers)
 
 
 class FakeSpan:

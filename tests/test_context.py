@@ -106,6 +106,19 @@ def test_risk_score_range_is_validated(value: float) -> None:
         make_context().evolve(risk_score=value)
 
 
+@pytest.mark.parametrize("value", ["", " ", "\t\n"])
+def test_context_rejects_blank_idempotency_keys_on_all_restore_paths(
+    value: str,
+) -> None:
+    with pytest.raises(ValueError, match="idempotency_key cannot be empty"):
+        ExecutionContext.create(ToolCall("write"), idempotency_key=value)
+
+    payload = make_context().to_dict()
+    payload["idempotency_key"] = value
+    with pytest.raises(ValueError, match="idempotency_key cannot be empty"):
+        ExecutionContext.from_dict(payload)
+
+
 def test_history_is_append_only() -> None:
     original = make_context()
     updated = original.append_history(HistoryEntry("rule", "allow"))

@@ -8,6 +8,12 @@ from .base import ObservingMiddleware
 
 
 class AuditMiddleware(ObservingMiddleware):
+    """Persist governance records with explicit fail-closed precedence.
+
+    ``fail_closed`` applies to otherwise non-critical calls. ``critical=True``
+    and ``critical_tiers`` always take precedence over ``fail_closed=False``.
+    """
+
     name = "audit"
     replayable = False
 
@@ -20,8 +26,8 @@ class AuditMiddleware(ObservingMiddleware):
         critical_tiers: frozenset[RiskTier] = frozenset({RiskTier.CRITICAL}),
     ) -> None:
         self.sink = sink
-        self.critical = critical or bool(fail_closed)
-        self.fail_closed = self.critical if fail_closed is None else fail_closed
+        self.critical = critical
+        self.fail_closed = critical if fail_closed is None else fail_closed
         self.critical_tiers = frozenset(critical_tiers)
 
     async def process(self, context: ExecutionContext) -> ExecutionContext:
@@ -71,4 +77,8 @@ class AuditMiddleware(ObservingMiddleware):
         return updated
 
     def is_critical(self, context: ExecutionContext) -> bool:
-        return self.critical or context.risk_tier in self.critical_tiers
+        return (
+            self.critical
+            or self.fail_closed
+            or context.risk_tier in self.critical_tiers
+        )

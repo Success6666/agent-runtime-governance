@@ -18,6 +18,22 @@ HMAC_KEY = "test-identity-key-32-bytes-long!!"
 WRONG_HMAC_KEY = "wrong-identity-key-32-bytes-long!"
 
 
+@pytest.fixture(autouse=True)
+def close_created_runtimes(monkeypatch):
+    runtime_type = Runtime
+    created: list[Runtime] = []
+
+    def factory(*args, **kwargs):
+        runtime = runtime_type(*args, **kwargs)
+        created.append(runtime)
+        return runtime
+
+    monkeypatch.setitem(globals(), "Runtime", factory)
+    yield
+    for runtime in reversed(created):
+        runtime.close()
+
+
 def register_tool(runtime: Runtime, calls: list[str]):
     @runtime.tool(risk=RiskTier.HIGH)
     def operate() -> str:
@@ -223,3 +239,27 @@ def test_identity_replay_store_failure_fails_closed() -> None:
     with pytest.raises(GovernanceDenied, match="identity verification failed"):
         operate(_governance=InvocationOptions(identity_claims=signed_claims()))
     assert calls == []
+
+
+def test_provider_failure_without_claims_cannot_fall_back_to_caller_identity() -> None:
+    class FailingProvider:
+        def verify(self, claims):
+            raise OSError("identity service unavailable")
+
+    runtime = Runtime(identity_provider=FailingProvider())
+    calls: list[str] = []
+    operate = register_tool(runtime, calls)
+
+    with pytest.raises(GovernanceDenied, match="identity verification failed") as caught:
+        operate(
+            _governance=InvocationOptions(
+                user="caller-asserted",
+                tenant="untrusted",
+                permissions=frozenset({"admin"}),
+            )
+        )
+
+    assert calls == []
+    assert caught.value.context.user is None
+    assert caught.value.context.permissions == frozenset()
+    assert caught.value.context.metadata["identity_verified"] is False
