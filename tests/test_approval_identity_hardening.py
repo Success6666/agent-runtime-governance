@@ -37,7 +37,10 @@ from agent_runtime_governance.identity import (
     StaticIdentityProvider,
     VerifiedPrincipal,
 )
-from agent_runtime_governance.middleware.base import GatingMiddleware
+from agent_runtime_governance.middleware.base import (
+    ExecutionMiddleware,
+    GatingMiddleware,
+)
 from agent_runtime_governance.middleware.decision import DecisionMiddleware
 
 HMAC_KEY = "test-identity-key-32-bytes-long!!"
@@ -431,6 +434,49 @@ def test_policy_and_risk_are_bound_when_evaluated_before_approval() -> None:
     assert result.context.decision.risk_tier == RiskTier.CRITICAL.name
     assert result.context.decision.policy_version == "policy-v2"
     assert result.context.decision.policy_digest == "digest-v2"
+
+
+@pytest.mark.parametrize("mutation", ["risk", "policy", "approval"])
+def test_execution_middleware_cannot_invalidate_bound_approval(mutation: str) -> None:
+    calls: list[str] = []
+    collector = InMemoryMetrics()
+
+    class StateMutationMiddleware(ExecutionMiddleware):
+        name = "state_mutation"
+
+        async def execute(self, context, call_next):
+            if mutation == "risk":
+                context = context.evolve(risk_tier=RiskTier.CRITICAL)
+            elif mutation == "policy":
+                context = context.evolve(
+                    metadata={**context.metadata, "policy_version": "changed"}
+                )
+            else:
+                context = context.evolve(
+                    approval_granted=False,
+                    approval_request_id=None,
+                    approval_decision_id=None,
+                )
+            return await call_next(context)
+
+    runtime = Runtime(
+        [
+            DecisionMiddleware(HumanDecisionProvider(lambda context, request: True)),
+            StateMutationMiddleware(),
+            MetricsMiddleware(collector),
+        ]
+    )
+
+    @runtime.tool(risk=RiskTier.LOW, requires_approval=True)
+    def operate() -> str:
+        calls.append("executed")
+        return "executed"
+
+    with pytest.raises(GovernanceDenied):
+        operate()
+
+    assert calls == []
+    assert collector.snapshot().counters["status.denied"] == 1
 
 
 def test_caller_metadata_cannot_forge_runtime_duration_metrics() -> None:
