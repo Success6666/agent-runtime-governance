@@ -160,7 +160,6 @@ test("a new head receives a new pending status", async () => {
   assert.deepEqual(
     setup.statuses.map(({ sha, state }) => [sha, state]),
     [
-      [HEAD, "pending"],
       [nextHead, "pending"],
       [nextHead, "pending"],
     ],
@@ -179,14 +178,28 @@ test("commit timestamps are cached while polling the same head", async () => {
   assert.equal(setup.commitLookups, 1);
 });
 
-test("unexpected API failures publish an error status", async () => {
+test("the workflow fails closed when the current head cannot be read", async () => {
   const setup = fixture({ pullError: new Error("network unavailable") });
 
-  const result = await publishCodeRabbitApprovalStatus(setup);
-
-  assert.equal(result, "error");
-  assert.equal(setup.statuses.at(-1).state, "error");
+  await assert.rejects(
+    publishCodeRabbitApprovalStatus(setup),
+    /network unavailable/,
+  );
+  assert.equal(setup.statuses.length, 0);
   assert.match(setup.errors.at(-1), /network unavailable/);
+});
+
+test("accepts an explicit pull request number for workflow-run events", async () => {
+  const setup = fixture({ reviews: [review("APPROVED")] });
+  setup.context.payload = { workflow_run: { id: 101 } };
+
+  const result = await publishCodeRabbitApprovalStatus({
+    ...setup,
+    pullNumber: 22,
+  });
+
+  assert.equal(result, "success");
+  assert.equal(setup.statuses.at(-1).sha, HEAD);
 });
 
 test("stale approvals do not authorize a new head", async () => {

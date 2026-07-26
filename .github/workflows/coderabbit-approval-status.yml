@@ -2,23 +2,30 @@ name: Publish CodeRabbit approval status
 
 on:
   # zizmor: ignore[dangerous-triggers]
-  # This workflow uses pull_request_target only to publish a commit status.
-  # The checkout step below pins the trusted default branch, so fork-originated
-  # pull requests never execute workflow code from the PR head with write tokens.
+  # This workflow publishes status only from trusted default-branch code.
+  # The workflow_run path never consumes artifacts or executable content from
+  # the unprivileged signal workflow.
   pull_request_target:
     types: [opened, reopened, synchronize, ready_for_review]
-  pull_request_review:
-    types: [submitted, edited, dismissed]
+  workflow_run:
+    workflows: [CodeRabbit review signal]
+    types: [completed]
 
 concurrency:
-  group: coderabbit-approval-status-${{ github.event.pull_request.number }}
+  group: >-
+    coderabbit-approval-status-${{
+      github.event.pull_request.number ||
+      github.event.workflow_run.pull_requests[0].number ||
+      github.event.workflow_run.id
+    }}
   cancel-in-progress: true
 
 jobs:
   publish-coderabbit-approval-status:
     if: >-
-      github.event_name != 'pull_request_review' ||
-      contains(fromJSON('["coderabbitai", "coderabbitai[bot]"]'), github.event.review.user.login)
+      github.event_name == 'pull_request_target' ||
+      (github.event.workflow_run.event == 'pull_request_review' &&
+       github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -37,15 +44,17 @@ jobs:
             const publishCodeRabbitApprovalStatus = require(
               "./.github/scripts/publish-coderabbit-approval-status.cjs"
             );
-            const reviewEvent = context.eventName === "pull_request_review";
+            const resolvePullRequestNumber = require(
+              "./.github/scripts/resolve-pull-request-number.cjs"
+            );
+            const pullNumber = await resolvePullRequestNumber({ github, context });
+            const reviewEvent = context.eventName === "workflow_run";
             await publishCodeRabbitApprovalStatus({
               github,
               context,
               core,
+              pullNumber,
               maxAttempts: reviewEvent ? 1 : 40,
               intervalMs: reviewEvent ? 0 : 15000,
-              missingState:
-                reviewEvent && context.payload.action === "dismissed"
-                  ? "failure"
-                  : "pending",
+              missingState: "pending",
             });
