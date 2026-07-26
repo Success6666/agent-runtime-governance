@@ -138,6 +138,7 @@ class Runtime:
         self.production_profile = production_profile
         self._production_report: ProductionReadinessReport | None = None
         self._production_sealed = production_profile is None
+        self._production_seal_lock = Lock()
         self.limits = limits or RuntimeLimits()
         self._bulkhead = RuntimeBulkhead(self.limits.max_in_flight)
         self._async_tool_bulkhead = RuntimeBulkhead(self.limits.max_in_flight)
@@ -221,13 +222,28 @@ class Runtime:
     def seal_production(self) -> ProductionReadinessReport:
         if self.production_profile is None:
             raise ValueError("production_profile is not configured")
-        report = self.production_readiness()
-        if not report.ready:
-            raise ProductionReadinessError(report)
-        self.registry.seal()
-        self._production_report = report
-        self._production_sealed = True
-        return report
+        with self._production_seal_lock:
+            if self._production_sealed and self._production_report is not None:
+                return self._production_report
+
+            def validate(
+                tools: tuple[ToolSpec[Any, Any], ...]
+            ) -> ProductionReadinessReport:
+                report = self.production_profile.evaluate(
+                    tools,
+                    pipeline=self.pipeline,
+                    idempotency_store=self.idempotency_store,
+                    identity_provider=self.identity_provider,
+                    require_verified_identity=self.require_verified_identity,
+                )
+                if not report.ready:
+                    raise ProductionReadinessError(report)
+                return report
+
+            report = self.registry._seal_with(validate)
+            self._production_report = report
+            self._production_sealed = True
+            return report
 
     def before_tool(
         self, callback: HookCallback | None = None, *, critical: bool = False

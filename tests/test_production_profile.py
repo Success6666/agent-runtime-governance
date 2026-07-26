@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from agent_runtime_governance import (
@@ -18,14 +20,17 @@ from agent_runtime_governance import (
     ProductionReadinessReason,
     ProductionReadinessState,
     RegistryError,
+    RiskTier,
     Runtime,
     RuntimeBuilder,
     SQLiteApprovalStore,
     SQLiteIdempotencyStore,
     SQLiteIdentityReplayStore,
     StaticIdentityProvider,
+    ToolSpec,
     VerifiedPrincipal,
 )
+from agent_runtime_governance.registry import ToolRegistry
 
 
 class KeyProvider:
@@ -116,6 +121,52 @@ def test_read_only_tool_has_an_explicit_contract_exception() -> None:
     assert entry.reasons == ()
 
 
+def test_read_only_contract_exception_does_not_bypass_identity_or_audit() -> None:
+    runtime = Runtime(production_profile=strict_profile())
+
+    @runtime.tool(execution_mode=ExecutionMode.READ_ONLY)
+    def inspect() -> bool:
+        return True
+
+    report = runtime.production_readiness()
+
+    assert report.tools[0].state is ProductionReadinessState.READY
+    assert report.runtime_reasons == (
+        ProductionReadinessReason.IDENTITY_PROVIDER_REQUIRED,
+        ProductionReadinessReason.VERIFIED_IDENTITY_REQUIRED,
+        ProductionReadinessReason.AUDIT_MIDDLEWARE_REQUIRED,
+    )
+
+
+def test_empty_registry_can_be_sealed_without_unused_components() -> None:
+    runtime = Runtime(production_profile=strict_profile())
+
+    report = runtime.seal_production()
+
+    assert report.ready is True
+    assert report.tools == ()
+    assert runtime.registry.is_sealed is True
+
+
+def test_inventory_includes_direct_registry_entries() -> None:
+    runtime = Runtime()
+    runtime.registry.register(
+        ToolSpec(
+            name="direct_read",
+            function=lambda: True,
+            risk=RiskTier.LOW,
+            requires_approval=False,
+            description="",
+            execution_mode=ExecutionMode.READ_ONLY,
+        )
+    )
+
+    report = strict_profile().inventory(runtime.registry.list())
+
+    assert report.ready is True
+    assert report.tools[0].tool_name == "direct_read"
+
+
 @pytest.mark.parametrize(
     ("tool_name", "execution_mode", "schema", "limit", "reason"),
     [
@@ -204,6 +255,8 @@ def test_profile_rejects_invalid_key_configuration() -> None:
         ProductionProfile(identity_digest_key_version="bad version")
     with pytest.raises(ValueError, match="unsupported"):
         ProductionProfile(version=2)
+    with pytest.raises(TypeError, match="integer"):
+        ProductionProfile(version=True)
 
 
 def test_strict_runtime_rejects_traffic_until_sealed(tmp_path) -> None:
@@ -285,6 +338,97 @@ def test_sealed_registry_rejects_late_registration(tmp_path) -> None:
         @runtime.tool(name="late", execution_mode=ExecutionMode.READ_ONLY)
         def late() -> bool:
             return True
+
+
+def test_registry_snapshot_validation_and_seal_are_atomic() -> None:
+    runtime = Runtime()
+    validation_started = threading.Event()
+    release_validation = threading.Event()
+    registration_errors: list[BaseException] = []
+
+    def validate(specs):
+        assert specs == ()
+        validation_started.set()
+        assert release_validation.wait(timeout=2)
+        return "sealed"
+
+    seal_thread = threading.Thread(target=lambda: runtime.registry._seal_with(validate))
+    seal_thread.start()
+    assert validation_started.wait(timeout=2)
+
+    def register_late() -> None:
+        try:
+            runtime.registry.register(
+                ToolSpec(
+                    name="late",
+                    function=lambda: True,
+                    risk=RiskTier.LOW,
+                    requires_approval=False,
+                    description="",
+                    execution_mode=ExecutionMode.READ_ONLY,
+                )
+            )
+        except BaseException as exc:
+            registration_errors.append(exc)
+
+    register_thread = threading.Thread(target=register_late)
+    register_thread.start()
+    release_validation.set()
+    seal_thread.join(timeout=2)
+    register_thread.join(timeout=2)
+
+    assert not seal_thread.is_alive()
+    assert not register_thread.is_alive()
+    assert len(registration_errors) == 1
+    assert isinstance(registration_errors[0], RegistryError)
+    assert runtime.registry.list() == ()
+
+
+def test_concurrent_production_sealing_is_idempotent(monkeypatch) -> None:
+    runtime = Runtime(production_profile=strict_profile())
+    registry_sealed = threading.Event()
+    release_first_caller = threading.Event()
+    second_caller_started = threading.Event()
+    reports = []
+    errors: list[BaseException] = []
+    original_seal_with = ToolRegistry._seal_with
+    seal_calls = 0
+
+    def delayed_return(self, validator):
+        nonlocal seal_calls
+        seal_calls += 1
+        report = original_seal_with(self, validator)
+        registry_sealed.set()
+        assert release_first_caller.wait(timeout=2)
+        return report
+
+    monkeypatch.setattr(ToolRegistry, "_seal_with", delayed_return)
+
+    def seal(*, started: threading.Event | None = None) -> None:
+        if started is not None:
+            started.set()
+        try:
+            reports.append(runtime.seal_production())
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=seal)
+    first.start()
+    assert registry_sealed.wait(timeout=2)
+
+    second = threading.Thread(target=seal, kwargs={"started": second_caller_started})
+    second.start()
+    assert second_caller_started.wait(timeout=2)
+    release_first_caller.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert len(reports) == 2
+    assert reports[0] is reports[1]
+    assert seal_calls == 1
 
 
 def test_non_strict_runtime_remains_compatible() -> None:
@@ -519,6 +663,36 @@ def test_hmac_identity_requires_durable_replay_store(tmp_path) -> None:
 
     provider.replay_store = SQLiteIdentityReplayStore(tmp_path / "replay.db")
     assert runtime.production_readiness().runtime_reasons == ()
+
+
+def test_unmarked_identity_provider_is_not_trusted(tmp_path) -> None:
+    class UnmarkedProvider:
+        def verify(self, claims=None):
+            return _principal()
+
+    runtime = Runtime(
+        [
+            AuditMiddleware(
+                JSONLAuditSink(tmp_path / "audit.jsonl", sign_key=b"a" * 32),
+                fail_closed=True,
+            )
+        ],
+        idempotency_store=SQLiteIdempotencyStore(tmp_path / "idempotency.db"),
+        identity_provider=UnmarkedProvider(),
+        require_verified_identity=True,
+        production_profile=strict_profile(),
+    )
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.MUTATING,
+        action_contract=contract(),
+    )
+    def operate(target: str) -> bool:
+        return bool(target)
+
+    assert runtime.production_readiness().runtime_reasons == (
+        ProductionReadinessReason.IDENTITY_PROVIDER_NOT_TRUSTED,
+    )
 
 
 def _principal() -> VerifiedPrincipal:

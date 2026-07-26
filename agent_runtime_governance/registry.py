@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 
 P = ParamSpec("P")
 R = TypeVar("R")
+T = TypeVar("T")
 
 
 @dataclass(frozen=True, slots=True)
@@ -532,26 +533,42 @@ class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, ToolSpec[Any, Any]] = {}
         self._sealed = False
+        self._lock = Lock()
 
     def register(self, spec: ToolSpec[Any, Any]) -> None:
-        if self._sealed:
-            raise RegistryError("tool registry is sealed")
-        if spec.name in self._tools:
-            raise RegistryError(f"tool {spec.name!r} is already registered")
-        self._tools[spec.name] = spec
+        with self._lock:
+            if self._sealed:
+                raise RegistryError("tool registry is sealed")
+            if spec.name in self._tools:
+                raise RegistryError(f"tool {spec.name!r} is already registered")
+            self._tools[spec.name] = spec
 
     def get(self, name: str) -> ToolSpec[Any, Any]:
-        try:
-            return self._tools[name]
-        except KeyError as exc:
-            raise RegistryError(f"unknown tool {name!r}") from exc
+        with self._lock:
+            try:
+                return self._tools[name]
+            except KeyError as exc:
+                raise RegistryError(f"unknown tool {name!r}") from exc
 
     def list(self) -> tuple[ToolSpec[Any, Any], ...]:
-        return tuple(self._tools.values())
+        with self._lock:
+            return tuple(self._tools.values())
 
     @property
     def is_sealed(self) -> bool:
-        return self._sealed
+        with self._lock:
+            return self._sealed
 
     def seal(self) -> None:
-        self._sealed = True
+        with self._lock:
+            self._sealed = True
+
+    def _seal_with(
+        self, validator: Callable[[tuple[ToolSpec[Any, Any], ...]], T]
+    ) -> T:
+        with self._lock:
+            if self._sealed:
+                raise RegistryError("tool registry is already sealed")
+            result = validator(tuple(self._tools.values()))
+            self._sealed = True
+            return result
