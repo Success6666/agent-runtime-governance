@@ -13,6 +13,7 @@ from ..hooks import HookCallback, HookPoint, HookRegistry
 from ..identity import IdentityProvider
 from ..middleware.base import Middleware
 from ..pipeline import Pipeline
+from ..production import ProductionProfile
 from ..registry import IdempotencyStore
 from ..resilience import RuntimeLimits
 from ..runtime import Runtime
@@ -44,6 +45,7 @@ class RuntimeBuilder:
         limits: RuntimeLimits | None = None,
         sync_executor: Executor | None = None,
         idempotency_executor: Executor | None = None,
+        production_profile: ProductionProfile | None = None,
     ) -> None:
         self._middlewares: list[Middleware] = []
         self._hooks: list[tuple[HookPoint, HookCallback, bool]] = []
@@ -57,6 +59,7 @@ class RuntimeBuilder:
             "limits": limits,
             "sync_executor": sync_executor,
             "idempotency_executor": idempotency_executor,
+            "production_profile": production_profile,
         }
 
     def with_identity(
@@ -69,9 +72,7 @@ class RuntimeBuilder:
         self._runtime_options["require_verified_identity"] = required
         return self
 
-    def with_idempotency_store(
-        self, store: IdempotencyStore
-    ) -> "RuntimeBuilder":
+    def with_idempotency_store(self, store: IdempotencyStore) -> "RuntimeBuilder":
         self._runtime_options["idempotency_store"] = store
         return self
 
@@ -85,6 +86,10 @@ class RuntimeBuilder:
 
     def with_idempotency_executor(self, executor: Executor) -> "RuntimeBuilder":
         self._runtime_options["idempotency_executor"] = executor
+        return self
+
+    def with_production_profile(self, profile: ProductionProfile) -> "RuntimeBuilder":
+        self._runtime_options["production_profile"] = profile
         return self
 
     def add_middleware(self, middleware: Middleware) -> "RuntimeBuilder":

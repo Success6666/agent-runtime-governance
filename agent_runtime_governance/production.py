@@ -7,8 +7,14 @@ from typing import Any, Iterable, Mapping, Protocol
 
 from ._serialization import thaw as _thaw
 from .action_contracts import ActionContract
+from .approval_store import InMemoryApprovalStore
+from .audit import InMemoryAuditSink
 from .context import ExecutionMode
-from .registry import ToolSpec
+from .identity import HMACClaimsIdentityProvider, InMemoryIdentityReplayStore
+from .middleware.audit import AuditMiddleware
+from .middleware.decision import DecisionMiddleware
+from .pipeline import Pipeline
+from .registry import InMemoryIdempotencyStore, ToolSpec
 
 _KEY_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -33,6 +39,15 @@ class ProductionReadinessReason(str, Enum):
     CONTRACT_PARAMETER_LIMIT_MISMATCH = "contract.parameter_limit_mismatch"
     IDENTITY_DIGEST_KEY_PROVIDER_REQUIRED = "identity_digest.key_provider_required"
     IDENTITY_DIGEST_KEY_VERSION_REQUIRED = "identity_digest.key_version_required"
+    IDENTITY_PROVIDER_REQUIRED = "identity.provider_required"
+    VERIFIED_IDENTITY_REQUIRED = "identity.verification_required"
+    IDENTITY_REPLAY_DURABLE_REQUIRED = "identity.replay_store_durable_required"
+    IDEMPOTENCY_DURABLE_REQUIRED = "idempotency.durable_store_required"
+    APPROVAL_MIDDLEWARE_REQUIRED = "approval.middleware_required"
+    APPROVAL_STORE_DURABLE_REQUIRED = "approval.durable_store_required"
+    AUDIT_MIDDLEWARE_REQUIRED = "audit.middleware_required"
+    AUDIT_SINK_DURABLE_REQUIRED = "audit.durable_sink_required"
+    AUDIT_FAIL_CLOSED_REQUIRED = "audit.fail_closed_required"
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +128,48 @@ class ProductionProfile:
         )
         return ProductionReadinessReport(profile_version=self.version, tools=entries)
 
+    def evaluate(
+        self,
+        tools: Iterable[ToolSpec[Any, Any]],
+        *,
+        pipeline: Pipeline,
+        idempotency_store: Any,
+        identity_provider: Any,
+        require_verified_identity: bool,
+    ) -> ProductionReadinessReport:
+        tool_items = tuple(tools)
+        inventory = self.inventory(tool_items)
+        entries = inventory.tools
+        side_effecting = any(
+            tool.execution_mode is not ExecutionMode.READ_ONLY for tool in entries
+        )
+        approval_required = any(spec.requires_approval for spec in tool_items)
+        reasons: list[ProductionReadinessReason] = []
+
+        if side_effecting:
+            if identity_provider is None:
+                reasons.append(ProductionReadinessReason.IDENTITY_PROVIDER_REQUIRED)
+            if not require_verified_identity:
+                reasons.append(ProductionReadinessReason.VERIFIED_IDENTITY_REQUIRED)
+            if isinstance(idempotency_store, InMemoryIdempotencyStore):
+                reasons.append(ProductionReadinessReason.IDEMPOTENCY_DURABLE_REQUIRED)
+            if isinstance(identity_provider, HMACClaimsIdentityProvider) and isinstance(
+                identity_provider.replay_store, InMemoryIdentityReplayStore
+            ):
+                reasons.append(
+                    ProductionReadinessReason.IDENTITY_REPLAY_DURABLE_REQUIRED
+                )
+            self._audit_reasons(pipeline, reasons)
+
+        if approval_required:
+            self._approval_reasons(pipeline, reasons)
+
+        return ProductionReadinessReport(
+            profile_version=self.version,
+            tools=entries,
+            runtime_reasons=tuple(dict.fromkeys(reasons)),
+        )
+
     def _tool_readiness(self, spec: ToolSpec[Any, Any]) -> ToolProductionReadiness:
         contract = spec.action_contract
         if contract is None:
@@ -178,6 +235,36 @@ class ProductionProfile:
                 ProductionReadinessReason.IDENTITY_DIGEST_KEY_VERSION_REQUIRED
             )
         return tuple(reasons)
+
+    @staticmethod
+    def _approval_reasons(
+        pipeline: Pipeline, reasons: list[ProductionReadinessReason]
+    ) -> None:
+        middleware = next(
+            (item for item in pipeline if isinstance(item, DecisionMiddleware)), None
+        )
+        if middleware is None:
+            reasons.append(ProductionReadinessReason.APPROVAL_MIDDLEWARE_REQUIRED)
+            return
+        if middleware.store is None or isinstance(
+            middleware.store, InMemoryApprovalStore
+        ):
+            reasons.append(ProductionReadinessReason.APPROVAL_STORE_DURABLE_REQUIRED)
+
+    @staticmethod
+    def _audit_reasons(
+        pipeline: Pipeline, reasons: list[ProductionReadinessReason]
+    ) -> None:
+        middleware = next(
+            (item for item in pipeline if isinstance(item, AuditMiddleware)), None
+        )
+        if middleware is None:
+            reasons.append(ProductionReadinessReason.AUDIT_MIDDLEWARE_REQUIRED)
+            return
+        if isinstance(middleware.sink, InMemoryAuditSink):
+            reasons.append(ProductionReadinessReason.AUDIT_SINK_DURABLE_REQUIRED)
+        if not middleware.fail_closed:
+            reasons.append(ProductionReadinessReason.AUDIT_FAIL_CLOSED_REQUIRED)
 
 
 class ProductionReadinessError(RuntimeError):
