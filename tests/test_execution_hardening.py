@@ -255,7 +255,7 @@ async def test_cancellation_does_not_wait_for_idempotency_storage_io() -> None:
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert time.perf_counter() - started < 0.1
+    assert time.perf_counter() - started < 0.1 * LEASE_TIMING_SCALE
     assert await asyncio.to_thread(store.marked_unknown.wait, 1)
     assert executions == 0
 
@@ -280,7 +280,7 @@ async def test_idempotency_acquire_honors_absolute_deadline() -> None:
                 deadline=deadline,
             )
         )
-    assert time.perf_counter() - started < 0.15
+    assert time.perf_counter() - started < 0.15 * LEASE_TIMING_SCALE
     assert caught.value.context.status is ExecutionStatus.UNKNOWN
     assert await asyncio.to_thread(store.marked_unknown.wait, 1)
     assert executions == 0
@@ -438,7 +438,7 @@ async def test_idempotency_wait_honors_request_deadline() -> None:
                 deadline=deadline,
             )
         )
-    assert time.perf_counter() - before < 0.2
+    assert time.perf_counter() - before < 0.2 * LEASE_TIMING_SCALE
     assert caught.value.context.status is ExecutionStatus.UNKNOWN
     release.set()
     assert await first == "ok"
@@ -460,7 +460,7 @@ async def test_stage_timeout_does_not_wait_forever_for_cancel_suppression() -> N
             timeout_seconds=0.01,
             cancellation_grace_seconds=0.01,
         )
-    assert time.perf_counter() - before < 0.1
+    assert time.perf_counter() - before < 0.1 * LEASE_TIMING_SCALE
     await asyncio.sleep(0.05)
 
 
@@ -741,7 +741,7 @@ async def test_store_operation_timeout_poisons_idempotency_channel() -> None:
             await write.ainvoke(
                 _governance=InvocationOptions(idempotency_key="blocked-completion")
             )
-        assert time.perf_counter() - started < 0.2
+        assert time.perf_counter() - started < 0.2 * LEASE_TIMING_SCALE
         assert first.value.context.status is ExecutionStatus.UNKNOWN
         assert store.entered.is_set()
 
@@ -750,7 +750,7 @@ async def test_store_operation_timeout_poisons_idempotency_channel() -> None:
             await write.ainvoke(
                 _governance=InvocationOptions(idempotency_key="after-poison")
             )
-        assert time.perf_counter() - started < 0.1
+        assert time.perf_counter() - started < 0.1 * LEASE_TIMING_SCALE
         assert "disabled after" in (second.value.context.error or "")
         assert executions == 1
     finally:

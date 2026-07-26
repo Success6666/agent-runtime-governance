@@ -29,6 +29,22 @@ from agent_runtime_governance.resilience import (
 from agent_runtime_governance.runtime import InvocationOptions, Runtime
 
 
+@pytest.fixture(autouse=True)
+def close_created_runtimes(monkeypatch):
+    runtime_type = Runtime
+    created: list[Runtime] = []
+
+    def factory(*args, **kwargs):
+        runtime = runtime_type(*args, **kwargs)
+        created.append(runtime)
+        return runtime
+
+    monkeypatch.setitem(globals(), "Runtime", factory)
+    yield
+    for runtime in reversed(created):
+        runtime.close()
+
+
 @pytest.mark.asyncio
 async def test_parameter_contract_fails_before_tool_execution() -> None:
     calls: list[int] = []
@@ -81,6 +97,7 @@ async def test_sqlite_idempotency_cache_is_reused_after_runtime_restart(tmp_path
         return {"value": value}
 
     assert await write.ainvoke(3, _governance=options) == {"value": 3}
+    first.close()
 
     restarted = Runtime(idempotency_store=SQLiteIdempotencyStore(path))
 
