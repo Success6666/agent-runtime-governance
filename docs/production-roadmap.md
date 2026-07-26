@@ -414,3 +414,7 @@ A milestone is complete only when all of the following are true:
 5. Release artifacts, dependency audit, SBOM, checksums, and provenance pass.
 6. The PyPI package installs and imports in a clean environment.
 7. Documentation separates measured facts, current limitations, and future work.
+8. A roadmap or milestone-planning pull request does not authorize
+   implementation. After that plan merges, the next milestone starts from a
+   separate implementation issue that fixes its scope, failure model, and
+   required evidence before any implementation pull request opens.
