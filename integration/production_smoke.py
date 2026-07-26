@@ -10,6 +10,7 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 from prometheus_client import CollectorRegistry, start_http_server
+from prometheus_client.parser import text_string_to_metric_families
 
 from agent_runtime_governance import (
     GovernanceDenied,
@@ -175,12 +176,39 @@ def run_prometheus_smoke() -> None:
     def ping() -> str:
         return "pong"
 
-    assert ping() == "pong"
-    start_http_server(19091, addr="127.0.0.1", registry=registry)
-    body = read_url("http://127.0.0.1:19091/metrics").decode("utf-8")
-    expected = 'arg_smoke_tool_calls_total{risk_tier="LOW",status="succeeded",tool="ping"} 1.0'
-    if expected not in body:
-        raise AssertionError("Prometheus metrics endpoint did not expose the governed call")
+    server = None
+    thread = None
+    try:
+        assert ping() == "pong"
+        server, thread = start_http_server(
+            19091, addr="127.0.0.1", registry=registry
+        )
+        body = read_url("http://127.0.0.1:19091/metrics").decode("utf-8")
+        required_labels = {
+            "risk_tier": "LOW",
+            "status": "succeeded",
+            "tool": "ping",
+        }
+        found = any(
+            sample.name == "arg_smoke_tool_calls_total"
+            and all(
+                sample.labels.get(key) == value
+                for key, value in required_labels.items()
+            )
+            for family in text_string_to_metric_families(body)
+            for sample in family.samples
+        )
+        if not found:
+            raise AssertionError(
+                "Prometheus metrics endpoint did not expose the governed call"
+            )
+    finally:
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+        if thread is not None:
+            thread.join(timeout=5)
+        runtime.close()
 
 
 def run_kind_smoke() -> None:

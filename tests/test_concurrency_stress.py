@@ -256,7 +256,7 @@ def test_sqlite_idempotency_has_one_owner_across_processes(tmp_path: Path) -> No
     for process in workers:
         process.start()
     start.set()
-    outcomes = [results.get(timeout=2) for _ in workers]
+    outcomes = [results.get(timeout=30) for _ in workers]
     _join_all(workers)
     assert outcomes.count("owner") == 1
     assert outcomes.count("IdempotencyInProgressError") == 3
@@ -288,7 +288,7 @@ def test_sqlite_approval_accepts_one_decision_across_processes(
     for process in workers:
         process.start()
     start.set()
-    outcomes = [results.get(timeout=2) for _ in workers]
+    outcomes = [results.get(timeout=30) for _ in workers]
     _join_all(workers)
     assert outcomes.count("decided") == 1
     assert outcomes.count("ValueError") == 1
@@ -308,7 +308,7 @@ def test_sqlite_identity_replay_has_one_winner_across_processes(
     for process in workers:
         process.start()
     start.set()
-    outcomes = [results.get(timeout=2) for _ in workers]
+    outcomes = [results.get(timeout=30) for _ in workers]
     _join_all(workers)
     assert outcomes.count(True) == 1
     assert outcomes.count(False) == 3

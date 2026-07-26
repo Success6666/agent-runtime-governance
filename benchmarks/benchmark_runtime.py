@@ -174,28 +174,40 @@ async def run_matrix(
     request_counts: Iterable[int], concurrency: int
 ) -> list[Measurement]:
     measurements: list[Measurement] = []
-    for requests in request_counts:
-        for scenario, runtime in build_scenarios(concurrency).items():
-            measurements.append(
-                await measure(
-                    runtime,
-                    scenario=scenario,
-                    requests=requests,
-                    concurrency=min(concurrency, requests),
+    scenarios = build_scenarios(concurrency)
+    try:
+        for requests in request_counts:
+            for scenario, runtime in scenarios.items():
+                measurements.append(
+                    await measure(
+                        runtime,
+                        scenario=scenario,
+                        requests=requests,
+                        concurrency=min(concurrency, requests),
+                    )
                 )
-            )
+    finally:
+        await asyncio.gather(*(runtime.aclose() for runtime in scenarios.values()))
     return measurements
 
 
 async def measure_admission_contention(
     *, waiters: int, permit_hold_seconds: float = 0.0
 ) -> AdmissionContentionMeasurement:
+    if waiters < 1:
+        raise ValueError("waiters must be at least 1")
     bulkhead = RuntimeBulkhead(1)
     initial = await bulkhead.acquire(1)
     latencies: list[float] = []
+    started_waiters = 0
+    all_waiters_started = asyncio.Event()
 
     async def contend() -> None:
+        nonlocal started_waiters
         started = perf_counter()
+        started_waiters += 1
+        if started_waiters == waiters:
+            all_waiters_started.set()
         lease = await bulkhead.acquire(max(5.0, waiters * permit_hold_seconds * 2))
         latencies.append((perf_counter() - started) * 1000)
         try:
@@ -204,7 +216,7 @@ async def measure_admission_contention(
             lease.release()
 
     tasks = [asyncio.create_task(contend()) for _ in range(waiters)]
-    await asyncio.sleep(0)
+    await all_waiters_started.wait()
     initial.release()
     await asyncio.gather(*tasks)
     ordered = sorted(latencies)

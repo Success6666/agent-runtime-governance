@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from enum import Enum, IntEnum
 
@@ -199,11 +200,12 @@ def test_expired_lease_becomes_unknown_and_is_not_reexecuted(tmp_path) -> None:
     store = SQLiteIdempotencyStore(path, lease_seconds=60)
     store.acquire("tenant/tool", "request-1", "a" * 64)
     expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
-    with sqlite3.connect(path) as connection:
-        connection.execute(
-            "UPDATE idempotency_records SET lease_expires_at = ?",
-            (expired,),
-        )
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute(
+                "UPDATE idempotency_records SET lease_expires_at = ?",
+                (expired,),
+            )
 
     recovered = SQLiteIdempotencyStore(path).acquire(
         "tenant/tool", "request-1", "a" * 64
