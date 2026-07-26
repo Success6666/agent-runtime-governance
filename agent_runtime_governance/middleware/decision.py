@@ -69,14 +69,20 @@ class DecisionMiddleware(GatingMiddleware):
             return context.append_history(
                 HistoryEntry(self.name, "skip", "human decision not required")
             )
+        action = context.bound_action
+        arguments = (
+            {"parameters": dict(action.parameters)}
+            if action is not None
+            else {
+                "args": list(context.tool_call.args),
+                "kwargs": dict(context.tool_call.kwargs),
+            }
+        )
         request = ApprovalRequest(
             trace_id=context.trace_id,
             request_id=context.request_id,
             tool_name=context.tool_call.name,
-            arguments={
-                "args": list(context.tool_call.args),
-                "kwargs": dict(context.tool_call.kwargs),
-            },
+            arguments=arguments,
             risk_tier=context.risk_tier.name,
             reason="tool requires human decision",
             expires_at=self._expires_at(),
@@ -85,9 +91,24 @@ class DecisionMiddleware(GatingMiddleware):
             subject=context.user,
             tenant=context.tenant,
             identity_issuer=_metadata_text(context.metadata, "identity_issuer"),
+            action_digest=(action.action_digest if action is not None else None),
         )
         if self._store is not None:
-            await asyncio.to_thread(self._store.pending, request)
+            try:
+                await asyncio.to_thread(self._store.pending, request)
+            except ValueError as exc:
+                decision = denial_for_request(request, str(exc), source=self.name)
+                return context.with_decision(decision).append_history(
+                    HistoryEntry(
+                        self.name,
+                        "deny",
+                        decision.reason,
+                        data={
+                            "request_id": request.request_id,
+                            "action_digest": request.action_digest,
+                        },
+                    )
+                )
         if self._provider is not None:
             decision = await self._decide(context, request)
             if self._store is not None:
@@ -150,6 +171,7 @@ class DecisionMiddleware(GatingMiddleware):
                     "arguments_digest": request.arguments_digest,
                     "policy_version": request.policy_version,
                     "policy_digest": request.policy_digest,
+                    "action_digest": request.action_digest,
                     "approver": decision.approver,
                 },
             )

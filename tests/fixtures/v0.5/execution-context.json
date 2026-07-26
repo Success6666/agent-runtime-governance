@@ -1,0 +1,37 @@
+{
+  "trace_id": "0123456789abcdef0123456789abcdef",
+  "span_id": "0123456789abcdef",
+  "parent_span_id": null,
+  "request_id": "legacy-context-1",
+  "task_id": null,
+  "conversation_id": null,
+  "user": "service-account",
+  "tenant": "tenant-a",
+  "permissions": [],
+  "input_text": "operate node-a",
+  "execution_mode": "mutating",
+  "idempotency_key": null,
+  "deadline": null,
+  "tool_call": {
+    "name": "operate",
+    "args": ["node-a"],
+    "kwargs": {}
+  },
+  "risk_tier": "HIGH",
+  "risk_score": 0.7,
+  "requires_approval": false,
+  "approval_granted": false,
+  "approval_request_id": null,
+  "approval_decision_id": null,
+  "status": "allowed",
+  "decision": null,
+  "history": [],
+  "metadata": {
+    "identity_verified": true,
+    "identity_issuer": "trusted-gateway",
+    "identity_subject": "service-account",
+    "identity_source": "static"
+  },
+  "result": null,
+  "error": null
+}

@@ -656,6 +656,9 @@ class SQLiteAuditSink:
 
 def context_event(context: ExecutionContext, *, stage: str) -> dict[str, Any]:
     context_data = context.to_dict()
+    action = context.bound_action
+    if action is not None:
+        context_data["bound_action"] = action.to_evidence_dict()
     context_data["tool_call"] = {
         "name": context.tool_call.name,
         "args": _safe_json_value(context.tool_call.args),
@@ -663,13 +666,18 @@ def context_event(context: ExecutionContext, *, stage: str) -> dict[str, Any]:
     }
     context_data["result"] = _safe_json_value(context.result)
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "stage": stage,
         "trace_id": context.trace_id,
         "span_id": context.span_id,
         "request_id": context.request_id,
         "tool_name": context.tool_call.name,
+        "contract_id": action.contract.contract_id if action is not None else None,
+        "contract_version": (
+            action.contract.contract_version if action is not None else None
+        ),
+        "action_digest": action.action_digest if action is not None else None,
         "risk_tier": context.risk_tier.name,
         "risk_score": context.risk_score,
         "status": context.status.value,

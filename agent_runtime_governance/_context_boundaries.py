@@ -78,6 +78,7 @@ def _request_state(context: ExecutionContext) -> tuple[object, ...]:
         context.execution_mode,
         context.idempotency_key,
         context.deadline,
+        context.bound_action,
     )
 
 

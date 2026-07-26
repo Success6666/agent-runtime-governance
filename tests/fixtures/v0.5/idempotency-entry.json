@@ -1,0 +1,8 @@
+{
+  "namespace": "tenant-a:operate",
+  "key": "legacy-idempotency-1",
+  "fingerprint": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "result": {
+    "status": "completed-by-v0.5"
+  }
+}

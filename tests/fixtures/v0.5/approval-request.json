@@ -1,0 +1,20 @@
+{
+  "trace_id": "0123456789abcdef0123456789abcdef",
+  "tool_name": "operate",
+  "arguments": {
+    "args": ["node-a"],
+    "kwargs": {}
+  },
+  "risk_tier": "HIGH",
+  "reason": "legacy v0.5 approval",
+  "request_id": "legacy-approval-1",
+  "issued_at": "2026-07-01T00:00:00+00:00",
+  "expires_at": "2030-07-01T00:00:00+00:00",
+  "arguments_digest": "1270f891097acdfd7e2fa04b657a3ea8699803e96f69176b96e52a4d062f0add",
+  "policy_version": "policy-v1",
+  "policy_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "subject": "service-account",
+  "tenant": "tenant-a",
+  "identity_issuer": "trusted-gateway",
+  "arguments_redacted": false
+}

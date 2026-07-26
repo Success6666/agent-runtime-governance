@@ -74,9 +74,12 @@ class InMemoryApprovalStore:
             if existing is None:
                 self._items[request.request_id] = StoredApproval(request=request)
                 return
-            if _validate_request(existing.request, request) is not None:
+            denial = _validate_request(existing.request, request)
+            if denial is not None:
                 raise ValueError(
-                    "approval request_id was reused for a different request"
+                    denial.reason
+                    if request.action_digest is not None
+                    else "approval request_id was reused for a different request"
                 )
 
     def decide(self, request_id: str, decision: DecisionRecord) -> DecisionRecord:
@@ -260,7 +263,11 @@ class SQLiteApprovalStore:
                 stored = ApprovalRequest.from_dict(json.loads(row[0]))
                 denial = _validate_request(stored, request)
                 if denial is not None:
-                    raise ValueError("approval request_id was reused for a different request")
+                    raise ValueError(
+                        denial.reason
+                        if request.action_digest is not None
+                        else "approval request_id was reused for a different request"
+                    )
             connection.commit()
 
     def decide(self, request_id: str, decision: DecisionRecord) -> DecisionRecord:
@@ -615,6 +622,16 @@ class SQLiteApprovalStore:
 
 
 def _validate_request(stored: ApprovalRequest, request: ApprovalRequest) -> DecisionRecord | None:
+    if request.action_digest is not None and stored.action_digest is None:
+        return denial_for_request(
+            request,
+            "approval.action_digest_missing: re-approval required",
+        )
+    if stored.action_digest != request.action_digest:
+        return denial_for_request(
+            request,
+            "approval.action_digest_mismatch: re-approval required",
+        )
     if stored.tool_name != request.tool_name:
         return denial_for_request(request, "approval request tool mismatch")
     if stored.arguments_digest != request.arguments_digest:

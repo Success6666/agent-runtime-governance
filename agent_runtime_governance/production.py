@@ -14,12 +14,27 @@ from .pipeline import Pipeline
 from .registry import ToolSpec
 
 _KEY_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_POLICY_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class IdentityDigestKeyProvider(Protocol):
     """Resolve tenant-scoped action identity keys without exposing them in reports."""
 
     def get_key(self, *, tenant: str, version: str) -> bytes: ...
+
+
+class PreconditionDigestProvider(Protocol):
+    """Resolve the current digest for contract-declared external preconditions."""
+
+    def get_digest(
+        self,
+        *,
+        contract: ActionContract,
+        parameters: Mapping[str, Any],
+        principal: str,
+        tenant: str,
+    ) -> str: ...
 
 
 class ProductionReadinessState(str, Enum):
@@ -33,9 +48,14 @@ class ProductionReadinessReason(str, Enum):
     CONTRACT_TOOL_MISMATCH = "contract.tool_mismatch"
     CONTRACT_EXECUTION_MODE_MISMATCH = "contract.execution_mode_mismatch"
     CONTRACT_PARAMETERS_SCHEMA_MISMATCH = "contract.parameters_schema_mismatch"
+    CONTRACT_RECEIPT_SCHEMA_MISMATCH = "contract.receipt_schema_mismatch"
     CONTRACT_PARAMETER_LIMIT_MISMATCH = "contract.parameter_limit_mismatch"
     IDENTITY_DIGEST_KEY_PROVIDER_REQUIRED = "identity_digest.key_provider_required"
     IDENTITY_DIGEST_KEY_VERSION_REQUIRED = "identity_digest.key_version_required"
+    POLICY_IDENTITY_REQUIRED = "policy.identity_required"
+    POLICY_MIDDLEWARE_IDENTITY_REQUIRED = "policy.middleware_identity_required"
+    POLICY_IDENTITY_MISMATCH = "policy.identity_mismatch"
+    PRECONDITION_PROVIDER_REQUIRED = "precondition.provider_required"
     IDENTITY_PROVIDER_REQUIRED = "identity.provider_required"
     IDENTITY_PROVIDER_NOT_TRUSTED = "identity.provider_not_trusted"
     VERIFIED_IDENTITY_REQUIRED = "identity.verification_required"
@@ -101,6 +121,11 @@ class ProductionProfile:
         default=None, repr=False, compare=False
     )
     identity_digest_key_version: str | None = None
+    policy_version: str | None = None
+    policy_digest: str | None = None
+    precondition_digest_provider: PreconditionDigestProvider | None = field(
+        default=None, repr=False, compare=False
+    )
     version: int = 1
 
     def __post_init__(self) -> None:
@@ -118,6 +143,25 @@ class ProductionProfile:
             type(key_version) is not str or not _KEY_VERSION.fullmatch(key_version)
         ):
             raise ValueError("identity_digest_key_version is invalid")
+        if (self.policy_version is None) != (self.policy_digest is None):
+            raise ValueError(
+                "policy_version and policy_digest must be configured together"
+            )
+        if self.policy_version is not None and not _POLICY_VERSION.fullmatch(
+            self.policy_version
+        ):
+            raise ValueError("policy_version is invalid")
+        if self.policy_digest is not None and not _SHA256.fullmatch(
+            self.policy_digest
+        ):
+            raise ValueError("policy_digest must be a SHA-256 hex digest")
+        precondition_provider = self.precondition_digest_provider
+        if precondition_provider is not None and not callable(
+            getattr(precondition_provider, "get_digest", None)
+        ):
+            raise TypeError(
+                "precondition_digest_provider must define get_digest(...)"
+            )
 
     def inventory(
         self, tools: Iterable[ToolSpec[Any, Any]]
@@ -168,6 +212,8 @@ class ProductionProfile:
                     ProductionReadinessReason.IDEMPOTENCY_DURABLE_REQUIRED
                 )
             self._audit_reasons(pipeline, reasons)
+            if any(tool.contract_id is not None for tool in entries):
+                self._policy_reasons(pipeline, reasons)
 
         if approval_required:
             self._approval_reasons(pipeline, reasons)
@@ -234,6 +280,12 @@ class ProductionProfile:
             and spec.max_parameters_bytes != contract.max_parameters_bytes
         ):
             reasons.append(ProductionReadinessReason.CONTRACT_PARAMETER_LIMIT_MISMATCH)
+        if spec.result_schema is not None and not _schemas_equal(
+            spec.result_schema, contract.receipt_schema
+        ):
+            reasons.append(
+                ProductionReadinessReason.CONTRACT_RECEIPT_SCHEMA_MISMATCH
+            )
         if self.identity_digest_key_provider is None:
             reasons.append(
                 ProductionReadinessReason.IDENTITY_DIGEST_KEY_PROVIDER_REQUIRED
@@ -242,7 +294,39 @@ class ProductionProfile:
             reasons.append(
                 ProductionReadinessReason.IDENTITY_DIGEST_KEY_VERSION_REQUIRED
             )
+        if self.policy_version is None or self.policy_digest is None:
+            reasons.append(ProductionReadinessReason.POLICY_IDENTITY_REQUIRED)
+        if (
+            contract.precondition_requirements
+            and self.precondition_digest_provider is None
+        ):
+            reasons.append(ProductionReadinessReason.PRECONDITION_PROVIDER_REQUIRED)
         return tuple(reasons)
+
+    def _policy_reasons(
+        self,
+        pipeline: Pipeline,
+        reasons: list[ProductionReadinessReason],
+    ) -> None:
+        for middleware in pipeline:
+            if not getattr(
+                middleware, "requires_action_policy_identity", False
+            ):
+                continue
+            identity = getattr(middleware, "action_policy_identity", None)
+            configured = identity() if callable(identity) else None
+            if configured is None:
+                reasons.append(
+                    ProductionReadinessReason.POLICY_MIDDLEWARE_IDENTITY_REQUIRED
+                )
+                continue
+            version, digest = configured
+            # The profile is the action identity source of truth. A policy
+            # middleware may only advertise that exact deployment identity.
+            if version != self.policy_version or digest != self.policy_digest:
+                reasons.append(
+                    ProductionReadinessReason.POLICY_IDENTITY_MISMATCH
+                )
 
     @staticmethod
     def _approval_reasons(

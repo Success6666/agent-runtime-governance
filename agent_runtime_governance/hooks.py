@@ -104,6 +104,7 @@ def _protected_state(context: ExecutionContext) -> tuple[object, ...]:
         context.execution_mode,
         context.idempotency_key,
         context.deadline,
+        context.bound_action,
         context.risk_tier,
         context.risk_score,
         context.requires_approval,
