@@ -1,0 +1,51 @@
+name: Publish CodeRabbit approval status
+
+on:
+  # zizmor: ignore[dangerous-triggers]
+  # This workflow uses pull_request_target only to publish a commit status.
+  # The checkout step below pins the trusted default branch, so fork-originated
+  # pull requests never execute workflow code from the PR head with write tokens.
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+
+concurrency:
+  group: coderabbit-approval-status-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  publish-coderabbit-approval-status:
+    if: >-
+      github.event_name != 'pull_request_review' ||
+      contains(fromJSON('["coderabbitai", "coderabbitai[bot]"]'), github.event.review.user.login)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read       # checkout the trusted default-branch script
+      pull-requests: read  # read PR head/state and reviews
+      issues: read         # read CodeRabbit rate-limit comments
+      statuses: write      # publish the CodeRabbit Approval commit status
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const publishCodeRabbitApprovalStatus = require(
+              "./.github/scripts/publish-coderabbit-approval-status.cjs"
+            );
+            const reviewEvent = context.eventName === "pull_request_review";
+            await publishCodeRabbitApprovalStatus({
+              github,
+              context,
+              core,
+              maxAttempts: reviewEvent ? 1 : 40,
+              intervalMs: reviewEvent ? 0 : 15000,
+              missingState:
+                reviewEvent && context.payload.action === "dismissed"
+                  ? "failure"
+                  : "pending",
+            });
