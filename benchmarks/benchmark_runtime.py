@@ -14,8 +14,10 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, Iterable
 
+from agent_runtime_governance.action_contracts import ActionContract
 from agent_runtime_governance.audit import AuditSink
 from agent_runtime_governance.context import ExecutionMode
+from agent_runtime_governance.identity import StaticIdentityProvider, VerifiedPrincipal
 from agent_runtime_governance.middleware import (
     AuditMiddleware,
     GatingMiddleware,
@@ -23,6 +25,7 @@ from agent_runtime_governance.middleware import (
     RuleMiddleware,
 )
 from agent_runtime_governance.plugins.opa import OPAClient, OPAMiddleware
+from agent_runtime_governance.production import ProductionProfile
 from agent_runtime_governance.resilience import RuntimeBulkhead, RuntimeLimits
 from agent_runtime_governance.runtime import Runtime
 from agent_runtime_governance.telemetry import OpenTelemetryMiddleware
@@ -52,8 +55,16 @@ class AdmissionContentionMeasurement:
 
 
 class NullAuditSink(AuditSink):
+    production_durable = True
+    production_integrity_protected = True
+
     def write(self, event) -> None:
         return None
+
+
+class BenchmarkKeyProvider:
+    def get_key(self, *, tenant: str, version: str) -> bytes:
+        return b"benchmark-identity-digest-key".ljust(32, b"0")
 
 
 class NoopSpan:
@@ -105,7 +116,7 @@ def build_scenarios(concurrency: int) -> dict[str, Runtime]:
         return OpenTelemetryMiddleware(NoopTracer())
 
     limits = RuntimeLimits(max_in_flight=max(128, concurrency))
-    definitions = {
+    definitions: dict[str, list[Any]] = {
         "baseline": [],
         "rule": [rule()],
         "rule_opa": [rule(), opa()],
@@ -113,10 +124,68 @@ def build_scenarios(concurrency: int) -> dict[str, Runtime]:
         "rule_opa_audit_otel": [rule(), opa(), audit(), otel()],
         "ten_gates": [PassGate(f"gate_{index}") for index in range(10)],
     }
-    return {
+    scenarios = {
         name: Runtime(middleware, limits=limits)
         for name, middleware in definitions.items()
     }
+    profile = ProductionProfile(
+        identity_digest_key_provider=BenchmarkKeyProvider(),
+        identity_digest_key_version="benchmark-v1",
+        policy_version="benchmark-policy-v1",
+        policy_digest="a" * 64,
+    )
+    principal = VerifiedPrincipal(
+        issuer="benchmark",
+        subject="benchmark-runner",
+        tenant="benchmark-tenant",
+        source="static",
+    )
+    for name in ("strict_baseline", "strict_bound_action"):
+        scenarios[name] = Runtime(
+            [AuditMiddleware(NullAuditSink(), fail_closed=True)],
+            identity_provider=StaticIdentityProvider(principal),
+            require_verified_identity=True,
+            production_profile=profile,
+            limits=limits,
+        )
+
+    contract = ActionContract(
+        contract_id="benchmark.echo",
+        contract_version=1,
+        tool_name="benchmark_echo",
+        execution_mode=ExecutionMode.READ_ONLY,
+        parameters_schema={
+            "type": "object",
+            "properties": {"value": {"type": "integer"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        },
+        effect_class="benchmark.read",
+    )
+    for name, runtime in scenarios.items():
+        _register_echo(
+            runtime,
+            action_contract=(
+                contract if name == "strict_bound_action" else None
+            ),
+        )
+        if name.startswith("strict_"):
+            runtime.seal_production()
+    return scenarios
+
+
+def _register_echo(
+    runtime: Runtime,
+    *,
+    action_contract: ActionContract | None,
+) -> None:
+    @runtime.tool(
+        name="benchmark_echo",
+        execution_mode=ExecutionMode.READ_ONLY,
+        action_contract=action_contract,
+    )
+    async def echo(value: int) -> int:
+        return value
 
 
 async def measure(
@@ -126,10 +195,6 @@ async def measure(
     requests: int,
     concurrency: int,
 ) -> Measurement:
-    @runtime.tool(name="benchmark_echo", execution_mode=ExecutionMode.READ_ONLY)
-    async def echo(value: int) -> int:
-        return value
-
     for index in range(min(50, requests)):
         await runtime.arun("benchmark_echo", index)
 

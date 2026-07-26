@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "comparison": {
+    "baseline": "strict_baseline",
+    "candidate": "strict_bound_action"
+  },
+  "limits": {
+    "mean_ms_ratio": 3.0,
+    "p95_ms_ratio": 3.0,
+    "p99_ms_ratio": 3.5,
+    "peak_memory_kib_ratio": 1.5
+  },
+  "minimum_requests": 1000
+}
