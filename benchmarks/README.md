@@ -50,12 +50,14 @@ Budget increases must be reviewed separately from the implementation that
 exceeds them. A feature pull request may keep or tighten the committed budget;
 it must not make its own regression pass by relaxing the threshold.
 
-The committed Windows/Python 3.12 release-candidate run at 1,000 requests and
-100-way concurrency measured the contracted scenario at 1.768x mean latency,
-1.853x p95 latency, 1.856x p99 latency, and 1.007x peak traced memory relative
-to its strict baseline. Each value is the median of three alternating paired
-samples. These ratios are point-in-time evidence from
-`results/v0.6.0-rc-windows-python312.json`, not universal service claims.
+The committed final Windows/Python 3.12 run at 1,000 requests and 100-way
+concurrency measured the contracted scenario at 1.553x mean latency, 1.720x
+p95 latency, 1.850x p99 latency, and 1.040x peak traced memory relative to its
+strict baseline. Each value is the median of three alternating paired samples.
+These ratios are point-in-time evidence from
+`results/v0.6.0-windows-python312.json`, not universal service claims. The
+earlier pre-release record remains in
+`results/v0.6.0-rc-windows-python312.json` for comparison.
 
 Results are not treated as universal performance claims. Compare runs on the
 same pinned environment and investigate regressions in both tail latency and

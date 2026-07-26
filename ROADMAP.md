@@ -14,6 +14,8 @@ The detailed production plan is in
   cancellation, contracts, reliable stores, real integration smoke
 - [x] v0.5.1: caller-metadata isolation, exact approval binding, and enforced
   middleware context authority
+- [x] v0.6.0: immutable action contracts across policy, approval, idempotency,
+  execution, telemetry, and audit
 
 ## Product direction
 
@@ -45,9 +47,8 @@ not an implementation detail.
 - [x] Migration path for v0.5 registrations
 - [x] Property, boundary, compatibility, and performance-regression tests
 
-Release verification and publication remain pending until the v0.6 candidate
-passes protected CI, CodeRabbit review, Docker smoke, package verification, and
-artifact provenance.
+The release path requires protected CI, CodeRabbit review, Docker smoke,
+package verification, artifact provenance, and PyPI Trusted Publishing.
 
 No reconciliation engine, distributed store, or new framework adapter enters
 this release.

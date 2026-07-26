@@ -33,17 +33,17 @@ Every shipped guarantee links to its regression test:
 | Idempotency keys are mandatory for idempotent mutating tools and bound to the parameter fingerprint | [`test_idempotency_key_is_bound_to_parameter_fingerprint`](tests/test_execution_hardening.py) |
 | JSONL audit is hash-chained and signable; deletion and tampering are detected | [`test_jsonl_audit_hash_chain_detects_deletion_and_tamper`](tests/test_audit_otel_hardening.py) |
 
-The unreleased v0.6 candidate binds one immutable action across the commit
-boundary. These claims are covered before release:
+v0.6 binds one immutable action across the final execution boundary. Every
+claim below is covered by a regression test or recorded benchmark:
 
-| v0.6 candidate behavior | Evidence |
+| Shipped in v0.6.0 | Evidence |
 | --- | --- |
 | The exact frozen parameter snapshot covered by `action_digest` reaches the tool body and cannot be replaced by middleware or hooks | [`test_exact_bound_snapshot_reaches_tool_and_audit`](tests/test_bound_action_runtime.py), [`test_middleware_cannot_replace_or_mutate_bound_action`](tests/test_bound_action_runtime.py) |
 | Key, policy, and external-precondition drift fail before tool entry | [`test_key_rotation_fails_before_tool_entry`](tests/test_bound_action_runtime.py), [`test_policy_identity_mismatch_fails_closed`](tests/test_bound_action_runtime.py), [`test_precondition_change_fails_before_tool_entry`](tests/test_bound_action_runtime.py) |
 | Approval and idempotency consume `action_digest`; v0.5 records remain readable but cannot authorize or satisfy a contracted v0.6 action | [`test_approval_is_bound_to_action_digest`](tests/test_bound_action_runtime.py), [`test_v05_approval_fails_closed_for_contracted_tool`](tests/test_bound_action_runtime.py), [`test_v05_compatibility.py`](tests/test_v05_compatibility.py) |
 | Success and terminal exception/timeout/cancellation paths retain the same action identity | [`test_exact_bound_snapshot_reaches_tool_and_audit`](tests/test_bound_action_runtime.py), [`test_exception_and_timeout_keep_bound_action_in_audit`](tests/test_bound_action_runtime.py), [`test_cancellation_keeps_bound_action_in_audit`](tests/test_bound_action_runtime.py) |
 | Audit evidence carries the action identity without duplicating raw parameters, and OpenTelemetry exports the same contract/action attributes | [`test_audit_bound_action_never_duplicates_raw_parameters`](tests/test_bound_action_runtime.py), [`test_opentelemetry_exports_bound_action_identity`](tests/test_audit_otel_hardening.py) |
-| At 1,000 requests and concurrency 100 on the recorded Windows/Python 3.12 host, the median of three alternating paired runs measured action bind plus verification at 1.768x mean, 1.853x p95, 1.856x p99, and 1.007x peak traced memory versus its strict baseline | [`v0.6.0-rc-windows-python312.json`](benchmarks/results/v0.6.0-rc-windows-python312.json), [`v0.6.0 budget`](benchmarks/budgets/v0.6.0.json) |
+| At 1,000 requests and concurrency 100 on the recorded Windows/Python 3.12 host, the median of three alternating paired runs measured action bind plus verification at 1.553x mean, 1.720x p95, 1.850x p99, and 1.040x peak traced memory versus its strict baseline | [`v0.6.0-windows-python312.json`](benchmarks/results/v0.6.0-windows-python312.json), [`v0.6.0 budget`](benchmarks/budgets/v0.6.0.json) |
 
 The v0.7-v1.0 direction adds deterministic reconciliation for `UNKNOWN`
 outcomes and portable evidence. The staged plan and its exit criteria are in
@@ -289,16 +289,15 @@ v0.5 establishes the production reliability baseline:
 - reliable JSONL and SQLite audit sinks with hash-chain verification;
 - bounded concurrency, external integration circuit breakers, and fault tests.
 
-The v0.6 candidate adds strict startup inventory and sealing, one
+v0.6 adds strict startup inventory and sealing, one
 `BoundAction.action_digest` across approval/idempotency/execution/audit,
 executor-boundary revalidation, policy and precondition identity checks, and
 versioned v0.5 migration readers. See
 [`docs/migration-v0.6.md`](docs/migration-v0.6.md) and the runnable
 [`strict_action_contract.py`](examples/strict_action_contract.py) example.
 
-The example is a v0.6 release-candidate source example, so run it from a
-checkout rather than against the current stable PyPI package. It hashes the
-exact policy artifact in `examples/policies/`, passes that identity through
+The example hashes the exact policy artifact in `examples/policies/`, passes
+that identity through
 `PolicyMiddleware` and `ProductionProfile`, seals the runtime, and persists
 signed audit plus idempotency state:
 
@@ -364,8 +363,10 @@ Its 100-waiter, zero-hold FIFO admission test measured 2.93 ms p99 wait time.
 This point-in-time result is regression evidence for that machine, not a
 cross-platform latency SLA.
 
-The v0.6 release-candidate measurement and enforced paired budget are in
-[`benchmarks/results/v0.6.0-rc-windows-python312.json`](benchmarks/results/v0.6.0-rc-windows-python312.json)
+The v0.6 final measurement, earlier pre-release measurement, and enforced
+paired budget are in
+[`benchmarks/results/v0.6.0-windows-python312.json`](benchmarks/results/v0.6.0-windows-python312.json),
+[`benchmarks/results/v0.6.0-rc-windows-python312.json`](benchmarks/results/v0.6.0-rc-windows-python312.json),
 and [`benchmarks/budgets/v0.6.0.json`](benchmarks/budgets/v0.6.0.json).
 
 ## Releases
@@ -380,6 +381,7 @@ and [`benchmarks/budgets/v0.6.0.json`](benchmarks/budgets/v0.6.0.json).
 | v0.4.2 | Fail-closed CodeRabbit review verification for the current commit |
 | v0.5.0 | Production reliability: idempotency, identity, durable approvals, audit, deadlines, cancellation, contracts, real integration smoke |
 | v0.5.1 | Security hardening: caller metadata isolation and exact approval binding |
+| v0.6.0 | Immutable action contracts from admission through approval, idempotency, executor revalidation, telemetry, and audit |
 
 Released versions are preserved as immutable Git tags. See
 [CHANGELOG.md](CHANGELOG.md) for the detailed compatibility and security notes.
