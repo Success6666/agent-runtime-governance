@@ -166,3 +166,34 @@ def test_opa_plugin_registers_real_middleware() -> None:
 
     assert operate() is True
     assert "opa" in manager.builder.services
+
+    identified = PluginManager()
+    identified.load(
+        OPAPlugin(
+            client,
+            policy_version="bundle-v1",
+            policy_digest="a" * 64,
+        )
+    )
+    middleware = identified.build().pipeline.middlewares[0]
+    assert middleware.action_policy_identity() == ("bundle-v1", "a" * 64)
+
+
+def test_opa_policy_identity_is_strict_and_reportable() -> None:
+    client = OPAClient(
+        "http://localhost:8181",
+        "agent/allow",
+        transport=lambda payload: {"result": True},
+    )
+    middleware = OPAMiddleware(
+        client,
+        policy_version="bundle-v1",
+        policy_digest="a" * 64,
+    )
+    assert middleware.action_policy_identity() == ("bundle-v1", "a" * 64)
+    with pytest.raises(ValueError, match="provided together"):
+        OPAMiddleware(client, policy_version="bundle-v1")
+    with pytest.raises(ValueError, match="policy_version"):
+        OPAMiddleware(client, policy_version="bad policy", policy_digest="a" * 64)
+    with pytest.raises(ValueError, match="policy_digest"):
+        OPAMiddleware(client, policy_version="bundle-v1", policy_digest="A" * 64)

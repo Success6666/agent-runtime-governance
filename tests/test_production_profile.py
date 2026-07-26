@@ -47,6 +47,8 @@ def contract(
     execution_mode: ExecutionMode = ExecutionMode.MUTATING,
     schema: dict | None = None,
     max_parameters_bytes: int = 4096,
+    precondition_requirements: tuple[str, ...] = (),
+    receipt_schema: dict | None = None,
 ) -> ActionContract:
     return ActionContract(
         contract_id="ops.operate",
@@ -61,6 +63,8 @@ def contract(
             "additionalProperties": False,
         },
         effect_class="service.change",
+        precondition_requirements=precondition_requirements,
+        receipt_schema=receipt_schema,
         max_parameters_bytes=max_parameters_bytes,
     )
 
@@ -254,11 +258,54 @@ def test_contracted_tool_requires_key_provider_and_public_version() -> None:
     )
 
 
+def test_contract_precondition_requires_provider() -> None:
+    runtime = Runtime()
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.MUTATING,
+        action_contract=contract(
+            precondition_requirements=("resource.etag",)
+        ),
+    )
+    def operate(target: str) -> bool:
+        return bool(target)
+
+    entry = strict_profile().inventory(runtime.registry.list()).tools[0]
+    assert entry.reasons == (
+        ProductionReadinessReason.PRECONDITION_PROVIDER_REQUIRED,
+    )
+
+
+def test_contract_receipt_must_match_registered_result_schema() -> None:
+    runtime = Runtime()
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.MUTATING,
+        result_schema={"type": "boolean"},
+        action_contract=contract(receipt_schema={"type": "string"}),
+    )
+    def operate(target: str) -> bool:
+        return bool(target)
+
+    entry = strict_profile().inventory(runtime.registry.list()).tools[0]
+    assert entry.reasons == (
+        ProductionReadinessReason.CONTRACT_RECEIPT_SCHEMA_MISMATCH,
+    )
+
+
 def test_profile_rejects_invalid_key_configuration() -> None:
     with pytest.raises(TypeError, match="get_key"):
         ProductionProfile(identity_digest_key_provider=object())  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="key_version"):
         ProductionProfile(identity_digest_key_version="bad version")
+    with pytest.raises(ValueError, match="configured together"):
+        ProductionProfile(policy_version="policy-v1")
+    with pytest.raises(ValueError, match="policy_version"):
+        ProductionProfile(policy_version="bad policy", policy_digest="a" * 64)
+    with pytest.raises(ValueError, match="policy_digest"):
+        ProductionProfile(policy_version="policy-v1", policy_digest="A" * 64)
+    with pytest.raises(TypeError, match="get_digest"):
+        ProductionProfile(precondition_digest_provider=object())  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="unsupported"):
         ProductionProfile(version=2)
     with pytest.raises(TypeError, match="integer"):
