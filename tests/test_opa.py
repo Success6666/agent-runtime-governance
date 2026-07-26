@@ -106,7 +106,11 @@ def test_opa_client_refuses_real_http_redirect_without_visiting_target() -> None
                 "Location",
                 f"http://127.0.0.1:{self.server.server_port}/target",
             )
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
             self.end_headers()
+            self.wfile.flush()
+            self.close_connection = True
 
         def do_GET(self) -> None:  # noqa: N802
             target_hits.append(self.headers.get("Authorization"))
@@ -126,9 +130,14 @@ def test_opa_client_refuses_real_http_redirect_without_visiting_target() -> None
             "agent/allow",
             headers={"Authorization": "Bearer secret"},
         )
-        with pytest.raises(HTTPError) as caught:
+        # On Windows the local stack can report the deliberately abandoned
+        # redirect response as a socket abort before urllib exposes HTTP 302.
+        with pytest.raises(
+            (HTTPError, ConnectionAbortedError, ConnectionResetError)
+        ) as caught:
             client.evaluate(ExecutionContext.create(ToolCall("operate")))
-        assert caught.value.code == 302
+        if isinstance(caught.value, HTTPError):
+            assert caught.value.code == 302
         assert target_hits == []
     finally:
         server.shutdown()
