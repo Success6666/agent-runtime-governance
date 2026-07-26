@@ -4,6 +4,15 @@ This guide covers the operational contract for v0.5. Applications remain
 responsible for tool-specific authorization, business rollback, and data
 retention requirements.
 
+The unreleased v0.6 strict profile adds an explicit registration and sealing
+lifecycle. Configure `ProductionProfile`, register every tool, call
+`seal_production()`, and expose readiness or accept traffic only after the
+returned report has `ready=True`. Compatibility runtimes can call
+`production_readiness(profile)` to generate a migration inventory without
+changing v0.5 execution behavior. See
+[`ADR 0004`](adr/0004-strict-production-sealing.md) for the exact trust and
+capability boundary.
+
 ## Required configuration
 
 - Classify every tool as `READ_ONLY`, `IDEMPOTENT`, or `MUTATING`. The default

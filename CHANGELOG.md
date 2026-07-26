@@ -18,12 +18,19 @@ All notable changes are documented here.
   material while keeping the key and raw identity values out of serialized
   actions, evidence, and representations. Parameter contract errors omit
   rejected values to avoid secret disclosure.
+- A versioned strict-production profile with deterministic registry inventory,
+  fail-closed runtime sealing, explicit adapter capability declarations, and
+  stable redacted readiness reason codes.
 
 ### Changed
 
 - Added the dependency-free `rfc8785` encoder for the new action-contract
   domain. Existing v0.5 identity, approval, and idempotency encodings remain
   unchanged until the versioned runtime migration phase.
+- Side-effecting tool registrations can carry an `ActionContract`; strict
+  runtimes reject traffic until the complete registry and required durable,
+  trusted, integrity-protected components pass startup validation. Non-strict
+  construction remains compatible and can emit the same migration inventory.
 
 ## [0.5.1] - 2026-07-26
 
