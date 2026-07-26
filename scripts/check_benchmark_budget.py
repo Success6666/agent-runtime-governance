@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -31,14 +32,42 @@ def evaluate(result: dict[str, Any], budget: dict[str, Any]) -> list[str]:
             continue
         for metric, maximum in budget["limits"].items():
             source = metric.removesuffix("_ratio")
-            denominator = float(baseline[source])
-            if denominator <= 0:
-                failures.append(f"baseline {source} must be positive")
+            try:
+                denominator = float(baseline[source])
+            except (KeyError, TypeError, ValueError):
+                failures.append(f"baseline {source} must be finite and positive")
                 continue
-            ratio = float(candidate[source]) / denominator
-            if ratio > float(maximum):
+            try:
+                numerator = float(candidate[source])
+            except (KeyError, TypeError, ValueError):
                 failures.append(
-                    f"{source} ratio {ratio:.3f} exceeds {float(maximum):.3f} "
+                    f"candidate {source} must be finite and non-negative"
+                )
+                continue
+            try:
+                limit = float(maximum)
+            except (TypeError, ValueError):
+                failures.append(
+                    f"budget limit for {source} must be finite and non-negative"
+                )
+                continue
+            if not math.isfinite(denominator) or denominator <= 0:
+                failures.append(f"baseline {source} must be finite and positive")
+                continue
+            if not math.isfinite(numerator) or numerator < 0:
+                failures.append(
+                    f"candidate {source} must be finite and non-negative"
+                )
+                continue
+            if not math.isfinite(limit) or limit < 0:
+                failures.append(
+                    f"budget limit for {source} must be finite and non-negative"
+                )
+                continue
+            ratio = numerator / denominator
+            if ratio > limit:
+                failures.append(
+                    f"{source} ratio {ratio:.3f} exceeds {limit:.3f} "
                     f"at {requests} requests"
                 )
     return failures

@@ -49,6 +49,8 @@ KIND_NODE_IMAGE = (
 
 
 class SmokeIdentityDigestKeyProvider:
+    """Deterministic non-secret key provider for this smoke harness only."""
+
     def get_key(self, *, tenant: str, version: str) -> bytes:
         return hashlib.sha256(
             f"production-smoke:{version}:{tenant}".encode("utf-8")
@@ -108,17 +110,19 @@ def run_opa_smoke(keep_containers: bool) -> None:
         ).hexdigest()
         with TemporaryDirectory(prefix="arg-v06-opa-") as temporary:
             state = Path(temporary)
-            allowed, sink = _strict_opa_runtime(
-                state / "allowed",
-                permissions=frozenset({"admin"}),
-                policy_digest=policy_digest,
-            )
-            denied, _ = _strict_opa_runtime(
-                state / "denied",
-                permissions=frozenset(),
-                policy_digest=policy_digest,
-            )
-            try:
+            with contextlib.ExitStack() as stack:
+                allowed, sink = _strict_opa_runtime(
+                    state / "allowed",
+                    permissions=frozenset({"admin"}),
+                    policy_digest=policy_digest,
+                )
+                stack.callback(allowed.close)
+                denied, _ = _strict_opa_runtime(
+                    state / "denied",
+                    permissions=frozenset(),
+                    policy_digest=policy_digest,
+                )
+                stack.callback(denied.close)
                 result = allowed.invoke(
                     "delete_file",
                     _governance=InvocationOptions(
@@ -129,19 +133,19 @@ def run_opa_smoke(keep_containers: bool) -> None:
                 event = sink.read_verified()[-1]
                 assert event["contract_id"] == "smoke.delete-file"
                 assert event["action_digest"]
-                with contextlib.suppress(GovernanceDenied):
+                try:
                     denied.invoke(
                         "delete_file",
                         _governance=InvocationOptions(
                             idempotency_key="opa-smoke-deny-1"
                         ),
                     )
+                except GovernanceDenied:
+                    pass
+                else:
                     raise AssertionError(
                         "OPA did not deny a non-admin contracted call"
                     )
-            finally:
-                allowed.close()
-                denied.close()
     finally:
         if not keep_containers:
             cleanup_container(name)

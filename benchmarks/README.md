@@ -51,8 +51,8 @@ exceeds them. A feature pull request may keep or tighten the committed budget;
 it must not make its own regression pass by relaxing the threshold.
 
 The committed Windows/Python 3.12 release-candidate run at 1,000 requests and
-100-way concurrency measured the contracted scenario at 1.940x mean latency,
-2.232x p95 latency, 2.337x p99 latency, and 0.996x peak traced memory relative
+100-way concurrency measured the contracted scenario at 1.768x mean latency,
+1.853x p95 latency, 1.856x p99 latency, and 1.007x peak traced memory relative
 to its strict baseline. Each value is the median of three alternating paired
 samples. These ratios are point-in-time evidence from
 `results/v0.6.0-rc-windows-python312.json`, not universal service claims.
