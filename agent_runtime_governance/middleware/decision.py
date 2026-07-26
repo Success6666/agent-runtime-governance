@@ -5,6 +5,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from time import monotonic
 
+from .._metadata import metadata_text as _metadata_text
 from ..approval_store import ApprovalStore
 from ..context import ExecutionContext, HistoryEntry
 from ..decisions import (
@@ -75,11 +76,11 @@ class DecisionMiddleware(GatingMiddleware):
             risk_tier=context.risk_tier.name,
             reason="tool requires human decision",
             expires_at=self._expires_at(),
-            policy_version=_metadata_text(context, "policy_version"),
-            policy_digest=_metadata_text(context, "policy_digest"),
+            policy_version=_metadata_text(context.metadata, "policy_version"),
+            policy_digest=_metadata_text(context.metadata, "policy_digest"),
             subject=context.user,
             tenant=context.tenant,
-            identity_issuer=_metadata_text(context, "identity_issuer"),
+            identity_issuer=_metadata_text(context.metadata, "identity_issuer"),
         )
         if self._store is not None:
             await asyncio.to_thread(self._store.pending, request)
@@ -165,7 +166,7 @@ class DecisionMiddleware(GatingMiddleware):
                 tool_name=context.tool_call.name,
                 subject=context.user,
                 tenant=context.tenant,
-                identity_issuer=_metadata_text(context, "identity_issuer"),
+                identity_issuer=_metadata_text(context.metadata, "identity_issuer"),
             )
             return context.with_decision(decision).append_history(
                 HistoryEntry(
@@ -290,10 +291,5 @@ class DecisionMiddleware(GatingMiddleware):
         return (
             datetime.now(timezone.utc) + timedelta(seconds=self._approval_ttl_seconds)
         ).isoformat()
-
-def _metadata_text(context: ExecutionContext, key: str) -> str | None:
-    value = context.metadata.get(key)
-    return None if value is None else str(value)
-
 
 ApprovalMiddleware = DecisionMiddleware
