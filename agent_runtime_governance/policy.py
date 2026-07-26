@@ -38,6 +38,7 @@ class SimplePolicy:
 class PolicyMiddleware(GatingMiddleware):
     name = "policy"
     priority = 20
+    requires_action_policy_identity = True
 
     def __init__(
         self,
@@ -46,9 +47,16 @@ class PolicyMiddleware(GatingMiddleware):
         version: str | None = None,
         digest: str | None = None,
     ) -> None:
+        if (version is None) != (digest is None):
+            raise ValueError("policy version and digest must be provided together")
         self.policy = policy
         self.version = version
         self.digest = digest
+
+    def action_policy_identity(self) -> tuple[str, str] | None:
+        if self.version is None or self.digest is None:
+            return None
+        return self.version, self.digest
 
     async def process(self, context: ExecutionContext) -> ExecutionContext:
         tool = context.tool_call.name

@@ -135,10 +135,37 @@ class OPAMiddleware(GatingMiddleware):
     name = "opa"
     priority = 30
     replayable = False
+    requires_action_policy_identity = True
 
-    def __init__(self, client: OPAClient, *, fail_closed: bool = True) -> None:
+    def __init__(
+        self,
+        client: OPAClient,
+        *,
+        fail_closed: bool = True,
+        policy_version: str | None = None,
+        policy_digest: str | None = None,
+    ) -> None:
+        if (policy_version is None) != (policy_digest is None):
+            raise ValueError(
+                "OPA policy_version and policy_digest must be provided together"
+            )
+        if policy_version is not None and not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}", policy_version
+        ):
+            raise ValueError("OPA policy_version is invalid")
+        if policy_digest is not None and not re.fullmatch(
+            r"[0-9a-f]{64}", policy_digest
+        ):
+            raise ValueError("OPA policy_digest must be a SHA-256 hex digest")
         self.client = client
         self.fail_closed = fail_closed
+        self.policy_version = policy_version
+        self.policy_digest = policy_digest
+
+    def action_policy_identity(self) -> tuple[str, str] | None:
+        if self.policy_version is None or self.policy_digest is None:
+            return None
+        return self.policy_version, self.policy_digest
 
     async def process(self, context: ExecutionContext) -> ExecutionContext:
         try:

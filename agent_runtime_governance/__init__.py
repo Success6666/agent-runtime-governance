@@ -94,6 +94,7 @@ from .plugins import (
 from .policy import PolicyMiddleware, SimplePolicy
 from .production import (
     IdentityDigestKeyProvider,
+    PreconditionDigestProvider,
     ProductionProfile,
     ProductionReadinessError,
     ProductionReadinessReason,
@@ -179,6 +180,7 @@ __all__ = [
     "IdentityProvider",
     "IdentityDigestKeyProvider",
     "IdentityReplayStore",
+    "PreconditionDigestProvider",
     "InMemoryAuditSink",
     "InMemoryApprovalStore",
     "InMemoryIdentityReplayStore",

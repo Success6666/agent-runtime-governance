@@ -69,6 +69,8 @@ def strict_profile() -> ProductionProfile:
     return ProductionProfile(
         identity_digest_key_provider=KeyProvider(),
         identity_digest_key_version="2026-07",
+        policy_version="policy-v1",
+        policy_digest="a" * 64,
     )
 
 
@@ -248,6 +250,7 @@ def test_contracted_tool_requires_key_provider_and_public_version() -> None:
     assert entry.reasons == (
         ProductionReadinessReason.IDENTITY_DIGEST_KEY_PROVIDER_REQUIRED,
         ProductionReadinessReason.IDENTITY_DIGEST_KEY_VERSION_REQUIRED,
+        ProductionReadinessReason.POLICY_IDENTITY_REQUIRED,
     )
 
 

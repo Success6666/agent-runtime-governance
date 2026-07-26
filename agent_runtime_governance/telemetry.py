@@ -195,6 +195,21 @@ class OpenTelemetryMiddleware(ObservingMiddleware):
             "arg.request_id": context.request_id,
             "arg.tool.name": context.tool_call.name,
             "arg.risk.tier": context.risk_tier.name,
+            "arg.action.digest": (
+                context.bound_action.action_digest
+                if context.bound_action is not None
+                else None
+            ),
+            "arg.action.contract.id": (
+                context.bound_action.contract.contract_id
+                if context.bound_action is not None
+                else None
+            ),
+            "arg.action.contract.version": (
+                context.bound_action.contract.contract_version
+                if context.bound_action is not None
+                else None
+            ),
         }
         attributes = {key: value for key, value in attributes.items() if value is not None}
         start_span = getattr(self._tracer, "start_span", None)

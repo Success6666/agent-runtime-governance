@@ -15,7 +15,8 @@ from typing import Any, Callable, Iterable, Mapping, ParamSpec, TypeVar
 
 from ._context_boundaries import validate_middleware_transition
 from ._metadata import metadata_text as _metadata_text
-from .action_contracts import ActionContract
+from ._serialization import thaw as _thaw
+from .action_contracts import ActionContract, BoundAction
 from .context import (
     ExecutionContext,
     ExecutionMode,
@@ -84,6 +85,10 @@ _RUNTIME_METADATA_KEYS = frozenset({"duration_ms"})
 class RunResult:
     value: Any
     context: ExecutionContext
+
+
+class _ActionBindingError(RuntimeError):
+    """Internal fail-closed admission error with a non-sensitive message."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -445,9 +450,18 @@ class Runtime:
             normalized_parameters = self._prepare_parameters(
                 spec, args, kwargs, context.deadline
             )
+            context = await self._bind_action(
+                spec, context, normalized_parameters
+            )
+            if context.bound_action is not None:
+                normalized_parameters = context.bound_action.parameters
             execution_args, execution_kwargs = materialize_call(
                 spec.function, normalized_parameters
             )
+        except _ActionBindingError as exc:
+            context = self._deny_action_binding(context, str(exc))
+            context = await self._run_observers(context, post=True)
+            raise GovernanceDenied(context) from exc
         except (ContractValidationError, StageTimeoutError, ValueError) as exc:
             if context.denied:
                 context = context.append_history(
@@ -495,6 +509,17 @@ class Runtime:
                 context = await self._release_approvals(context)
                 context = await self._run_observers(context, post=True)
                 raise GovernanceDenied(context)
+            try:
+                context = await self._revalidate_bound_action(
+                    spec,
+                    context,
+                    execution_args,
+                    execution_kwargs,
+                )
+            except GovernanceDenied as exc:
+                context = await self._release_approvals(exc.context)
+                context = await self._run_observers(context, post=True)
+                raise GovernanceDenied(context) from exc
         except asyncio.CancelledError as exc:
             context = await asyncio.shield(self._release_approvals(context))
             context = await self._handle_cancellation(context, started, uncertain=False)
@@ -508,7 +533,9 @@ class Runtime:
                 context.execution_mode is ExecutionMode.IDEMPOTENT
                 and context.idempotency_key
             ):
-                fingerprint = self._fingerprint(spec.name, normalized_parameters)
+                fingerprint = self._idempotency_fingerprint(
+                    context, spec.name, normalized_parameters
+                )
                 try:
                     claim = await self._acquire_idempotency(
                         self._idempotency_namespace(context),
@@ -540,7 +567,9 @@ class Runtime:
                             self.limits.cancellation_grace_seconds
                         ),
                     )
-                    value = self._normalize_result(spec, value)
+                    value = self._normalize_result(
+                        spec, value, context.bound_action
+                    )
                     self._enforce_size_limit("result", value, spec.max_result_bytes)
                     context = await self._commit_approvals(context)
                     context = self._enforce_required_approval(context)
@@ -601,6 +630,12 @@ class Runtime:
                 current = self._enforce_required_approval(current)
                 if current.denied:
                     raise GovernanceDenied(current)
+                current = await self._revalidate_bound_action(
+                    spec,
+                    current,
+                    execution_args,
+                    execution_kwargs,
+                )
 
                 def mark_started() -> None:
                     nonlocal execution_started
@@ -655,7 +690,7 @@ class Runtime:
                 call = wrapped
             context, value = await self._with_deadline(context, call)
             tool_returned = True
-            value = self._normalize_result(spec, value)
+            value = self._normalize_result(spec, value, context.bound_action)
             self._enforce_size_limit("result", value, spec.max_result_bytes)
             await self._stop_idempotency_heartbeat(
                 heartbeat_task, raise_on_failure=True
@@ -769,7 +804,15 @@ class Runtime:
         context = await self._create_context(spec, args, kwargs, _governance)
         started = perf_counter()
         try:
-            self._prepare_parameters(spec, args, kwargs, context.deadline)
+            normalized_parameters = self._prepare_parameters(
+                spec, args, kwargs, context.deadline
+            )
+            context = await self._bind_action(
+                spec, context, normalized_parameters
+            )
+        except _ActionBindingError as exc:
+            context = self._deny_action_binding(context, str(exc))
+            return await self._run_observers(context, post=True)
         except (ContractValidationError, StageTimeoutError, ValueError) as exc:
             context = self._failed_context(context, exc, started)
             context = await self._run_observers(context, post=True)
@@ -808,12 +851,16 @@ class Runtime:
             requires_approval=spec.requires_approval,
             execution_mode=spec.execution_mode,
         )
-        self._prepare_parameters(
+        normalized_parameters = self._prepare_parameters(
             spec,
             clean.tool_call.args,
             dict(clean.tool_call.kwargs),
             clean.deadline,
         )
+        try:
+            clean = await self._bind_action(spec, clean, normalized_parameters)
+        except _ActionBindingError as exc:
+            return self._deny_action_binding(clean, str(exc))
         clean = self._enforce_idempotency_key(clean)
         if clean.denied:
             return clean
@@ -1128,6 +1175,155 @@ class Runtime:
         self._enforce_size_limit("parameters", normalized, spec.max_parameters_bytes)
         return normalized
 
+    async def _bind_action(
+        self,
+        spec: ToolSpec[Any, Any],
+        context: ExecutionContext,
+        parameters: Mapping[str, Any],
+    ) -> ExecutionContext:
+        if spec.action_contract is None or context.denied:
+            return context
+        try:
+            action = await self._build_bound_action(spec, context, parameters)
+            return context.bind_action(action).evolve(
+                metadata={
+                    **context.metadata,
+                    "policy_version": action.policy_version,
+                    "policy_digest": action.policy_digest,
+                }
+            )
+        except (ContractValidationError, TypeError, ValueError, StageTimeoutError) as exc:
+            raise _ActionBindingError("action.binding_failed") from exc
+        except Exception as exc:
+            raise _ActionBindingError("action.binding_provider_failed") from exc
+
+    async def _build_bound_action(
+        self,
+        spec: ToolSpec[Any, Any],
+        context: ExecutionContext,
+        parameters: Mapping[str, Any],
+    ) -> BoundAction:
+        contract = spec.action_contract
+        profile = self.production_profile
+        if contract is None:
+            raise ValueError("action contract is not configured")
+        if profile is None:
+            raise ValueError("production profile is required for contracted tools")
+        key_provider = profile.identity_digest_key_provider
+        key_version = profile.identity_digest_key_version
+        issuer = _metadata_text(context.metadata, "identity_issuer")
+        if (
+            key_provider is None
+            or key_version is None
+            or profile.policy_version is None
+            or profile.policy_digest is None
+            or issuer is None
+            or context.user is None
+            or context.tenant is None
+        ):
+            raise ValueError("contract binding prerequisites are unavailable")
+        key = await self._call_binding_provider(
+            key_provider.get_key,
+            stage="identity digest key",
+            deadline=context.deadline,
+            tenant=context.tenant,
+            version=key_version,
+        )
+        precondition_digest: str | None = None
+        if contract.precondition_requirements:
+            provider = profile.precondition_digest_provider
+            if provider is None:
+                raise ValueError("precondition digest provider is required")
+            precondition_digest = await self._call_binding_provider(
+                provider.get_digest,
+                stage="action precondition",
+                deadline=context.deadline,
+                contract=contract,
+                parameters=parameters,
+                principal=context.user,
+                tenant=context.tenant,
+            )
+        return contract.bind(
+            parameters,
+            identity_issuer=issuer,
+            principal=context.user,
+            tenant=context.tenant,
+            identity_digest_key=key,
+            identity_digest_key_version=key_version,
+            policy_version=profile.policy_version,
+            policy_digest=profile.policy_digest,
+            precondition_digest=precondition_digest,
+        )
+
+    async def _call_binding_provider(
+        self,
+        callback: Callable[..., Any],
+        *,
+        stage: str,
+        deadline: datetime | None,
+        **kwargs: Any,
+    ) -> Any:
+        timeout = self._bounded_timeout(
+            deadline,
+            self.limits.middleware_timeout_seconds,
+            stage,
+        )
+        return await await_stage(
+            asyncio.to_thread(callback, **kwargs),
+            stage=stage,
+            timeout_seconds=timeout,
+            cancellation_grace_seconds=self.limits.cancellation_grace_seconds,
+        )
+
+    async def _revalidate_bound_action(
+        self,
+        spec: ToolSpec[Any, Any],
+        context: ExecutionContext,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> ExecutionContext:
+        expected = context.bound_action
+        if expected is None:
+            return context
+        try:
+            actual_parameters = self._prepare_parameters(
+                spec, args, kwargs, context.deadline
+            )
+            actual = await self._build_bound_action(
+                spec, context, _thaw(actual_parameters)
+            )
+        except Exception as exc:
+            denied = self._deny_action_binding(
+                context, "action.executor_revalidation_failed"
+            )
+            raise GovernanceDenied(denied) from exc
+        if actual.action_digest != expected.action_digest:
+            denied = self._deny_action_binding(
+                context, "action.executor_digest_mismatch"
+            )
+            raise GovernanceDenied(denied)
+        return context
+
+    @staticmethod
+    def _deny_action_binding(
+        context: ExecutionContext, reason: str
+    ) -> ExecutionContext:
+        decision = DecisionRecord(DecisionOutcome.DENY, reason, "action_contract")
+        return context.with_decision(decision).append_history(
+            HistoryEntry(
+                "action_contract",
+                "deny",
+                reason,
+                data={
+                    "action_digest": (
+                        context.bound_action.action_digest
+                        if context.bound_action is not None
+                        else None
+                    )
+                },
+            )
+        )
+
     @classmethod
     def _fingerprint(cls, name: str, parameters: dict[str, Any]) -> str:
         payload = canonical_json_bytes(
@@ -1135,19 +1331,51 @@ class Runtime:
         )
         return hashlib.sha256(payload).hexdigest()
 
+    @classmethod
+    def _idempotency_fingerprint(
+        cls,
+        context: ExecutionContext,
+        name: str,
+        parameters: Mapping[str, Any],
+    ) -> str:
+        if context.bound_action is not None:
+            return context.bound_action.action_digest
+        return cls._fingerprint(name, dict(parameters))
+
     @staticmethod
     def _idempotency_namespace(context: ExecutionContext) -> str:
+        if context.bound_action is not None:
+            action = context.bound_action
+            return (
+                "action/v1:"
+                f"{action.tenant_digest}:{action.contract.contract_id}"
+            )
         tenant = context.tenant or "global"
         return f"{tenant}:{context.tool_call.name}"
 
     @staticmethod
-    def _normalize_result(spec: ToolSpec[Any, Any], value: Any) -> Any:
+    def _normalize_result(
+        spec: ToolSpec[Any, Any],
+        value: Any,
+        action: BoundAction | None = None,
+    ) -> Any:
         if (
             spec.result_schema is not None
             or spec.max_result_bytes is not None
             or spec.execution_mode is ExecutionMode.IDEMPOTENT
+            or (
+                action is not None
+                and action.contract.receipt_schema is not None
+            )
         ):
-            return validate_instance(value, spec.result_schema, label="result")
+            normalized = validate_instance(value, spec.result_schema, label="result")
+            if action is not None and action.contract.receipt_schema is not None:
+                normalized = validate_instance(
+                    normalized,
+                    action.contract.receipt_schema,
+                    label="action receipt",
+                )
+            return normalized
         return value
 
     async def _acquire_idempotency(
@@ -1614,8 +1842,15 @@ class Runtime:
             or decision.subject != context.user
             or decision.tenant != context.tenant
             or decision.identity_issuer != expected_identity_issuer
+            or (
+                context.bound_action is not None
+                and decision.action_digest
+                != context.bound_action.action_digest
+            )
         ):
             return False
+        if context.bound_action is not None:
+            return True
         expected_digest = digest_arguments(
             {
                 "args": list(context.tool_call.args),

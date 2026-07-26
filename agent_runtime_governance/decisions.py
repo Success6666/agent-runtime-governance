@@ -42,6 +42,7 @@ class DecisionRecord:
     identity_issuer: str | None = None
     risk_tier: str | None = None
     policy_digest: str | None = None
+    action_digest: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.outcome, DecisionOutcome):
@@ -67,6 +68,7 @@ class DecisionRecord:
             r"[0-9a-f]{64}", self.arguments_digest
         ):
             raise ValueError("arguments_digest must be a SHA-256 hex digest")
+        _validate_optional_digest("action_digest", self.action_digest)
 
     def bind_to(
         self,
@@ -87,6 +89,7 @@ class DecisionRecord:
         _reject_mismatch(
             "identity_issuer", self.identity_issuer, request.identity_issuer
         )
+        _reject_mismatch("action_digest", self.action_digest, request.action_digest)
         if self.expires_at and request.expires_at:
             if _parse_datetime(self.expires_at) > _parse_datetime(request.expires_at):
                 raise ValueError("approval decision outlives its request")
@@ -114,6 +117,7 @@ class DecisionRecord:
             subject=request.subject,
             tenant=request.tenant,
             identity_issuer=request.identity_issuer,
+            action_digest=request.action_digest,
         )
 
     def is_expired(self, now: datetime | None = None) -> bool:
@@ -146,6 +150,7 @@ class DecisionRecord:
             "subject": self.subject,
             "tenant": self.tenant,
             "identity_issuer": self.identity_issuer,
+            "action_digest": self.action_digest,
         }
 
     @classmethod
@@ -167,6 +172,7 @@ class DecisionRecord:
             subject=_optional_str(data.get("subject")),
             tenant=_optional_str(data.get("tenant")),
             identity_issuer=_optional_str(data.get("identity_issuer")),
+            action_digest=_optional_str(data.get("action_digest")),
         )
 
 
@@ -187,6 +193,7 @@ class ApprovalRequest:
     identity_issuer: str | None = None
     arguments_redacted: bool = False
     policy_digest: str | None = None
+    action_digest: str | None = None
 
     def __post_init__(self) -> None:
         _validate_identifier("trace_id", self.trace_id)
@@ -200,6 +207,7 @@ class ApprovalRequest:
         _validate_optional_identifier("subject", self.subject)
         _validate_optional_identifier("tenant", self.tenant)
         _validate_optional_identifier("identity_issuer", self.identity_issuer)
+        _validate_optional_digest("action_digest", self.action_digest)
         issued = _parse_datetime(self.issued_at)
         if self.expires_at is not None:
             expires = _parse_datetime(self.expires_at)
@@ -235,6 +243,7 @@ class ApprovalRequest:
             "tenant": self.tenant,
             "identity_issuer": self.identity_issuer,
             "arguments_redacted": self.arguments_redacted,
+            "action_digest": self.action_digest,
         }
 
     @classmethod
@@ -255,6 +264,7 @@ class ApprovalRequest:
             tenant=_optional_str(data.get("tenant")),
             identity_issuer=_optional_str(data.get("identity_issuer")),
             arguments_redacted=bool(data.get("arguments_redacted", False)),
+            action_digest=_optional_str(data.get("action_digest")),
         )
 
 
@@ -359,6 +369,11 @@ def _validate_optional_identifier(name: str, value: str | None) -> None:
 def _validate_optional_risk_tier(value: str | None) -> None:
     if value is not None and value not in {"LOW", "MEDIUM", "HIGH", "CRITICAL"}:
         raise ValueError("risk_tier must be LOW, MEDIUM, HIGH, or CRITICAL")
+
+
+def _validate_optional_digest(name: str, value: str | None) -> None:
+    if value is not None and not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise ValueError(f"{name} must be a SHA-256 hex digest")
 
 
 def _validate_text(name: str, value: str, *, maximum: int) -> None:

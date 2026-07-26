@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum, IntEnum
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 from uuid import uuid4
 
 from ._serialization import freeze as _freeze
@@ -12,6 +12,9 @@ from ._serialization import json_safe as _json_safe
 from ._serialization import thaw as _thaw
 from .decisions import DecisionOutcome, DecisionRecord
 from .errors import ContextMutationError
+
+if TYPE_CHECKING:
+    from .action_contracts import BoundAction
 
 
 class RiskTier(IntEnum):
@@ -94,6 +97,7 @@ _IDENTITY_FIELDS = frozenset(
         "execution_mode",
         "idempotency_key",
         "deadline",
+        "bound_action",
         "history",
     }
 )
@@ -115,6 +119,7 @@ class ExecutionContext:
     execution_mode: ExecutionMode = ExecutionMode.MUTATING
     idempotency_key: str | None = None
     deadline: datetime | None = None
+    bound_action: BoundAction | None = None
     risk_tier: RiskTier = RiskTier.LOW
     risk_score: float = 0.0
     requires_approval: bool = False
@@ -129,6 +134,11 @@ class ExecutionContext:
     error: str | None = None
 
     def __post_init__(self) -> None:
+        if self.bound_action is not None:
+            from .action_contracts import BoundAction
+
+            if not isinstance(self.bound_action, BoundAction):
+                raise TypeError("bound_action must be a BoundAction")
         if not 0.0 <= self.risk_score <= 1.0:
             raise ValueError("risk_score must be between 0.0 and 1.0")
         if self.idempotency_key is not None and not self.idempotency_key.strip():
@@ -221,6 +231,18 @@ class ExecutionContext:
     def append_history(self, entry: HistoryEntry) -> "ExecutionContext":
         return replace(self, history=(*self.history, entry))
 
+    def bind_action(self, action: BoundAction) -> "ExecutionContext":
+        """Attach the runtime-created action identity exactly once."""
+        from .action_contracts import BoundAction
+
+        if not isinstance(action, BoundAction):
+            raise TypeError("action must be a BoundAction")
+        if self.bound_action is not None:
+            if self.bound_action == action:
+                return self
+            raise ContextMutationError("bound action cannot be replaced")
+        return replace(self, bound_action=action)
+
     def with_decision(self, decision: DecisionRecord) -> "ExecutionContext":
         status = (
             ExecutionStatus.DENIED
@@ -251,6 +273,9 @@ class ExecutionContext:
             "execution_mode": self.execution_mode.value,
             "idempotency_key": self.idempotency_key,
             "deadline": self.deadline.isoformat() if self.deadline else None,
+            "bound_action": (
+                self.bound_action.to_dict() if self.bound_action is not None else None
+            ),
             "tool_call": self.tool_call.to_dict(),
             "risk_tier": self.risk_tier.name,
             "risk_score": self.risk_score,
@@ -298,7 +323,11 @@ class ExecutionContext:
                 if requires_approval is None
                 else requires_approval
             ),
-            metadata={},
+            metadata={
+                key: value
+                for key, value in self.metadata.items()
+                if key.startswith("identity_")
+            },
         )
 
     @classmethod
@@ -330,6 +359,11 @@ class ExecutionContext:
                 if data.get("deadline")
                 else None
             ),
+            bound_action=(
+                _bound_action_from_dict(data["bound_action"])
+                if data.get("bound_action") is not None
+                else None
+            ),
             tool_call=ToolCall(
                 name=tool_data["name"],
                 args=tuple(tool_data.get("args", [])),
@@ -357,3 +391,11 @@ class ExecutionContext:
             result=data.get("result"),
             error=data.get("error"),
         )
+
+
+def _bound_action_from_dict(value: Any) -> BoundAction:
+    from .action_contracts import BoundAction
+
+    if not isinstance(value, Mapping):
+        raise TypeError("bound_action must be an object")
+    return BoundAction.from_dict(value)
