@@ -284,19 +284,28 @@ def pull_image(image: str, *, attempts: int = 3) -> None:
     delay = 2.0
     last_output = ""
     for attempt in range(1, attempts + 1):
-        result = run(
-            ["docker", "pull", image],
-            check=False,
-            capture=True,
-            timeout=240,
-        )
-        if result.returncode == 0:
-            return
-        last_output = result.stdout or ""
+        try:
+            result = run(
+                ["docker", "pull", image],
+                check=False,
+                capture=True,
+                timeout=240,
+            )
+        except subprocess.TimeoutExpired as exc:
+            output = exc.output if exc.output is not None else ""
+            if isinstance(output, bytes):
+                output = output.decode("utf-8", errors="replace")
+            last_output = output
+            failure = f"timed out after {exc.timeout:.0f}s"
+        else:
+            if result.returncode == 0:
+                return
+            last_output = result.stdout or ""
+            failure = f"exit code {result.returncode}"
         if attempt < attempts:
             print(
-                f"docker pull failed for {image} "
-                f"(attempt {attempt}/{attempts}); retrying in {delay:.0f}s"
+                f"docker pull failed for {image} ({failure}; "
+                f"attempt {attempt}/{attempts}); retrying in {delay:.0f}s"
             )
             time.sleep(delay)
             delay *= 2
