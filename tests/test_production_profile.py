@@ -17,6 +17,8 @@ from agent_runtime_governance import (
     InMemoryIdempotencyStore,
     InvocationOptions,
     JSONLAuditSink,
+    OPAClient,
+    OPAMiddleware,
     PolicyMiddleware,
     ProductionProfile,
     ProductionReadinessError,
@@ -686,6 +688,45 @@ def test_unidentified_policy_middleware_prevents_production_sealing(tmp_path) ->
         runtime.seal_production()
     assert (
         ProductionReadinessReason.POLICY_MIDDLEWARE_IDENTITY_REQUIRED
+        in caught.value.report.runtime_reasons
+    )
+
+
+def test_fail_open_opa_prevents_production_sealing(tmp_path) -> None:
+    runtime = Runtime(
+        [
+            OPAMiddleware(
+                OPAClient(
+                    "http://localhost:8181",
+                    "agent/allow",
+                    transport=lambda payload: {"result": True},
+                ),
+                fail_closed=False,
+                policy_version="policy-v1",
+                policy_digest="a" * 64,
+            ),
+            AuditMiddleware(
+                JSONLAuditSink(tmp_path / "audit.jsonl", sign_key=b"a" * 32),
+                fail_closed=True,
+            ),
+        ],
+        idempotency_store=SQLiteIdempotencyStore(tmp_path / "idempotency.db"),
+        identity_provider=StaticIdentityProvider(_principal()),
+        require_verified_identity=True,
+        production_profile=strict_profile(),
+    )
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.MUTATING,
+        action_contract=contract(),
+    )
+    def operate(target: str) -> bool:
+        return bool(target)
+
+    with pytest.raises(ProductionReadinessError) as caught:
+        runtime.seal_production()
+    assert (
+        ProductionReadinessReason.POLICY_FAIL_CLOSED_REQUIRED
         in caught.value.report.runtime_reasons
     )
 

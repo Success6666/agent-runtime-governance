@@ -45,6 +45,7 @@ from agent_runtime_governance.middleware.decision import DecisionMiddleware
 
 HMAC_KEY = "test-identity-key-32-bytes-long!!"
 WRONG_HMAC_KEY = "wrong-identity-key-32-bytes-long!"
+POLICY_DIGEST_V2 = "d" * 64
 
 
 def make_request(**changes: object) -> ApprovalRequest:
@@ -202,6 +203,28 @@ def test_sqlite_store_recovers_pending_decision_after_restart(tmp_path) -> None:
     assert decision.outcome is DecisionOutcome.ALLOW
     assert restored.get(request.request_id).status is ApprovalStatus.CONSUMED
     restored.close()
+
+
+def test_sqlite_store_rejects_action_digest_mismatch_without_consuming(tmp_path) -> None:
+    request = make_request(action_digest="a" * 64)
+    store = SQLiteApprovalStore(tmp_path / "approvals.db")
+    store.pending(request)
+    store.decide(
+        request.request_id,
+        DecisionRecord(DecisionOutcome.ALLOW, "ok", "human"),
+    )
+
+    mismatch = store.consume(make_request(action_digest="b" * 64))
+    assert mismatch.outcome is DecisionOutcome.DENY
+    assert mismatch.reason == (
+        "approval.action_digest_mismatch: re-approval required"
+    )
+    assert store.get(request.request_id).status is ApprovalStatus.DECIDED
+
+    accepted = store.consume(request)
+    assert accepted.outcome is DecisionOutcome.ALLOW
+    assert store.get(request.request_id).status is ApprovalStatus.CONSUMED
+    store.close()
 
 
 def test_decision_middleware_keeps_legacy_callback_compatible() -> None:
@@ -428,7 +451,7 @@ def test_policy_or_risk_change_after_approval_invalidates_grant() -> None:
             PolicyMiddleware(
                 SimplePolicy(risk_overrides={"operate": RiskTier.CRITICAL}),
                 version="policy-v2",
-                digest="digest-v2",
+                digest=POLICY_DIGEST_V2,
             ),
         ]
     )
@@ -453,7 +476,7 @@ def test_policy_and_risk_are_bound_when_evaluated_before_approval() -> None:
             PolicyMiddleware(
                 SimplePolicy(risk_overrides={"operate": RiskTier.CRITICAL}),
                 version="policy-v2",
-                digest="digest-v2",
+                digest=POLICY_DIGEST_V2,
             ),
             DecisionMiddleware(HumanDecisionProvider(lambda context, request: True)),
         ]
@@ -468,7 +491,7 @@ def test_policy_and_risk_are_bound_when_evaluated_before_approval() -> None:
     assert result.value == "executed"
     assert result.context.decision.risk_tier == RiskTier.CRITICAL.name
     assert result.context.decision.policy_version == "policy-v2"
-    assert result.context.decision.policy_digest == "digest-v2"
+    assert result.context.decision.policy_digest == POLICY_DIGEST_V2
 
 
 @pytest.mark.parametrize("mutation", ["risk", "policy", "approval"])

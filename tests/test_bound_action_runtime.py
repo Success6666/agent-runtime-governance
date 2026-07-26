@@ -39,11 +39,30 @@ from agent_runtime_governance.middleware import GatingMiddleware
 class RotatingKeyProvider:
     def __init__(self) -> None:
         self.key = b"k" * 32
+        self.calls = 0
 
     def get_key(self, *, tenant: str, version: str) -> bytes:
+        self.calls += 1
         assert tenant == "tenant-a"
         assert version == "key-v1"
         return self.key
+
+
+class InvalidKeyProvider(RotatingKeyProvider):
+    def get_key(self, *, tenant: str, version: str) -> bytes:
+        return b"short"
+
+
+class FailingKeyProvider(RotatingKeyProvider):
+    def get_key(self, *, tenant: str, version: str) -> bytes:
+        raise RuntimeError("kms unavailable")
+
+
+class FailsOnRevalidationKeyProvider(RotatingKeyProvider):
+    def get_key(self, *, tenant: str, version: str) -> bytes:
+        if self.calls == 1:
+            raise RuntimeError("kms unavailable during executor revalidation")
+        return super().get_key(tenant=tenant, version=version)
 
 
 class MutablePreconditionProvider:
@@ -159,7 +178,7 @@ def _runtime(
 @pytest.mark.asyncio
 async def test_exact_bound_snapshot_reaches_tool_and_audit(tmp_path) -> None:
     received: list[object] = []
-    runtime, sink, _ = _runtime(tmp_path)
+    runtime, sink, keys = _runtime(tmp_path)
 
     @runtime.tool(
         name="operate",
@@ -186,6 +205,73 @@ async def test_exact_bound_snapshot_reaches_tool_and_audit(tmp_path) -> None:
     assert {event["action_digest"] for event in events} == {action.action_digest}
     assert {event["contract_id"] for event in events} == {"ops.operate"}
     assert all("parameters" not in event["context"]["bound_action"] for event in events)
+    assert keys.calls == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("key_provider", "reason"),
+    [
+        (InvalidKeyProvider(), "action.binding_failed"),
+        (FailingKeyProvider(), "action.binding_provider_failed"),
+    ],
+)
+async def test_binding_provider_failure_denies_before_tool_entry(
+    tmp_path, key_provider, reason: str
+) -> None:
+    calls: list[str] = []
+    runtime, sink, _ = _runtime(tmp_path, key_provider=key_provider)
+
+    @runtime.tool(
+        name="operate",
+        execution_mode=ExecutionMode.MUTATING,
+        action_contract=_contract(),
+    )
+    def operate(target: str) -> bool:
+        calls.append(target)
+        return True
+
+    runtime.seal_production()
+    with pytest.raises(GovernanceDenied) as caught:
+        await runtime.arun("operate", "node-a")
+
+    assert calls == []
+    assert caught.value.context.bound_action is None
+    assert caught.value.context.decision is not None
+    assert caught.value.context.decision.reason == reason
+    event = sink.read_verified()[-1]
+    assert event["decision"] == "deny"
+    assert event["context"]["decision"]["source"] == "action_contract"
+
+
+@pytest.mark.asyncio
+async def test_revalidation_provider_failure_denies_before_tool_entry(tmp_path) -> None:
+    calls: list[str] = []
+    runtime, sink, _ = _runtime(
+        tmp_path, key_provider=FailsOnRevalidationKeyProvider()
+    )
+
+    @runtime.tool(
+        name="operate",
+        execution_mode=ExecutionMode.MUTATING,
+        action_contract=_contract(),
+    )
+    def operate(target: str) -> bool:
+        calls.append(target)
+        return True
+
+    runtime.seal_production()
+    with pytest.raises(GovernanceDenied) as caught:
+        await runtime.arun("operate", "node-a")
+
+    context = caught.value.context
+    assert calls == []
+    assert context.bound_action is not None
+    assert context.decision is not None
+    assert context.decision.reason == "action.executor_revalidation_failed"
+    event = sink.read_verified()[-1]
+    assert event["action_digest"] == context.bound_action.action_digest
+    assert event["decision"] == "deny"
 
 
 @pytest.mark.asyncio
@@ -444,7 +530,12 @@ async def test_middleware_cannot_replace_or_mutate_bound_action(tmp_path) -> Non
         await runtime.arun("operate", "node-a")
 
     assert calls == []
-    assert any("request identity" in entry.reason for entry in caught.value.context.history)
+    assert caught.value.context.decision is not None
+    assert caught.value.context.decision.source == "runtime"
+    assert any(
+        entry.middleware == "replace_action" and entry.outcome == "error"
+        for entry in caught.value.context.history
+    )
 
 
 @pytest.mark.asyncio

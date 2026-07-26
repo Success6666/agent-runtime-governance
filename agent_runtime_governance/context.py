@@ -16,6 +16,11 @@ from .errors import ContextMutationError
 if TYPE_CHECKING:
     from .action_contracts import BoundAction
 
+_GOVERNANCE_METADATA_PREFIXES = ("approval_", "identity_", "policy_")
+_REPLAY_RUNTIME_METADATA_KEYS = frozenset(
+    {"duration_ms", "replay_mode", "replay_authoritative"}
+)
+
 
 class RiskTier(IntEnum):
     LOW = 1
@@ -326,7 +331,8 @@ class ExecutionContext:
             metadata={
                 key: value
                 for key, value in self.metadata.items()
-                if key.startswith("identity_")
+                if key.lower() not in _REPLAY_RUNTIME_METADATA_KEYS
+                and not key.lower().startswith(_GOVERNANCE_METADATA_PREFIXES)
             },
         )
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Mapping
@@ -49,6 +50,12 @@ class PolicyMiddleware(GatingMiddleware):
     ) -> None:
         if (version is None) != (digest is None):
             raise ValueError("policy version and digest must be provided together")
+        if version is not None and not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}", version
+        ):
+            raise ValueError("policy version is invalid")
+        if digest is not None and not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("policy digest must be a SHA-256 hex digest")
         self.policy = policy
         self.version = version
         self.digest = digest

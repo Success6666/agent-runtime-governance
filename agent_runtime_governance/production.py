@@ -55,6 +55,7 @@ class ProductionReadinessReason(str, Enum):
     POLICY_IDENTITY_REQUIRED = "policy.identity_required"
     POLICY_MIDDLEWARE_IDENTITY_REQUIRED = "policy.middleware_identity_required"
     POLICY_IDENTITY_MISMATCH = "policy.identity_mismatch"
+    POLICY_FAIL_CLOSED_REQUIRED = "policy.fail_closed_required"
     PRECONDITION_PROVIDER_REQUIRED = "precondition.provider_required"
     IDENTITY_PROVIDER_REQUIRED = "identity.provider_required"
     IDENTITY_PROVIDER_NOT_TRUSTED = "identity.provider_not_trusted"
@@ -313,6 +314,12 @@ class ProductionProfile:
                 middleware, "requires_action_policy_identity", False
             ):
                 continue
+            if getattr(
+                middleware, "requires_fail_closed_in_production", False
+            ) and not getattr(middleware, "fail_closed", False):
+                reasons.append(
+                    ProductionReadinessReason.POLICY_FAIL_CLOSED_REQUIRED
+                )
             identity = getattr(middleware, "action_policy_identity", None)
             configured = identity() if callable(identity) else None
             if configured is None:

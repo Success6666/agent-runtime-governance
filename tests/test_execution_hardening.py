@@ -597,6 +597,59 @@ async def test_replay_uses_current_execution_mode() -> None:
 
 
 @pytest.mark.asyncio
+async def test_replay_preserves_correlation_metadata_but_strips_governance() -> None:
+    runtime = Runtime()
+
+    @runtime.tool(parameters_schema={"type": "object"})
+    def operate() -> None:
+        return None
+
+    recorded = ExecutionContext.create(
+        ToolCall("operate"),
+        metadata={
+            "correlation_id": "incident-42",
+            "identity_verified": True,
+            "approval_granted": True,
+            "policy_digest": "forged",
+            "duration_ms": 10,
+        },
+    )
+    replayed = await runtime.areplay(recorded)
+
+    assert replayed.metadata["correlation_id"] == "incident-42"
+    assert replayed.metadata["replay_mode"] == "analysis"
+    assert replayed.metadata["replay_authoritative"] is False
+    assert "identity_verified" not in replayed.metadata
+    assert "approval_granted" not in replayed.metadata
+    assert "policy_digest" not in replayed.metadata
+    assert "duration_ms" not in replayed.metadata
+
+
+@pytest.mark.asyncio
+async def test_replay_returns_stable_denial_for_invalid_recorded_parameters() -> None:
+    runtime = Runtime()
+
+    @runtime.tool(
+        parameters_schema={
+            "type": "object",
+            "properties": {"count": {"type": "integer"}},
+            "required": ["count"],
+            "additionalProperties": False,
+        }
+    )
+    def operate(count: int) -> None:
+        return None
+
+    recorded = ExecutionContext.create(ToolCall("operate", ("invalid",)))
+    replayed = await runtime.areplay(recorded)
+
+    assert replayed.denied
+    assert replayed.decision is not None
+    assert replayed.decision.source == "replay"
+    assert replayed.decision.reason == "replay.parameter_validation_failed"
+
+
+@pytest.mark.asyncio
 async def test_preview_and_replay_enforce_required_idempotency_key() -> None:
     runtime = Runtime()
 
