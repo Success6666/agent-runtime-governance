@@ -60,6 +60,10 @@ class DecisionMiddleware(GatingMiddleware):
         self._reservations: dict[str, tuple[ApprovalRequest, str, float]] = {}
         self._reservation_lock = threading.Lock()
 
+    @property
+    def store(self) -> ApprovalStore | None:
+        return self._store
+
     async def process(self, context: ExecutionContext) -> ExecutionContext:
         if not context.requires_approval:
             return context.append_history(
@@ -109,9 +113,7 @@ class DecisionMiddleware(GatingMiddleware):
             )
             decision = reservation.decision
             if reservation.token is not None:
-                self._remember_reservation(
-                    context.trace_id, request, reservation.token
-                )
+                self._remember_reservation(context.trace_id, request, reservation.token)
         try:
             if request.is_expired():
                 raise ValueError("approval request expired")
@@ -124,7 +126,9 @@ class DecisionMiddleware(GatingMiddleware):
             and not decision.approver
         ):
             decision = denial_for_request(
-                request, "approval allow decision requires an approver", source=self.name
+                request,
+                "approval allow decision requires an approver",
+                source=self.name,
             )
         if decision.outcome is not DecisionOutcome.ALLOW:
             context = await self.release_approval(context)
@@ -247,9 +251,7 @@ class DecisionMiddleware(GatingMiddleware):
                 now + self._reservation_ttl_seconds,
             )
 
-    def _pop_reservation(
-        self, trace_id: str
-    ) -> tuple[ApprovalRequest, str] | None:
+    def _pop_reservation(self, trace_id: str) -> tuple[ApprovalRequest, str] | None:
         with self._reservation_lock:
             reservation = self._reservations.pop(trace_id, None)
         if reservation is None:
@@ -284,12 +286,15 @@ class DecisionMiddleware(GatingMiddleware):
             )
         except ValueError:
             return denial_for_request(
-                request, "decision provider returned an invalid decision", source=self.name
+                request,
+                "decision provider returned an invalid decision",
+                source=self.name,
             )
 
     def _expires_at(self) -> str | None:
         return (
             datetime.now(timezone.utc) + timedelta(seconds=self._approval_ttl_seconds)
         ).isoformat()
+
 
 ApprovalMiddleware = DecisionMiddleware

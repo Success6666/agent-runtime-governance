@@ -4,11 +4,22 @@ import pytest
 
 from agent_runtime_governance import (
     ActionContract,
+    AuditMiddleware,
     ExecutionMode,
+    InMemoryAuditSink,
+    InMemoryIdempotencyStore,
+    InvocationOptions,
+    JSONLAuditSink,
     ProductionProfile,
+    ProductionReadinessError,
     ProductionReadinessReason,
     ProductionReadinessState,
+    RegistryError,
     Runtime,
+    RuntimeBuilder,
+    SQLiteIdempotencyStore,
+    StaticIdentityProvider,
+    VerifiedPrincipal,
 )
 
 
@@ -188,3 +199,152 @@ def test_profile_rejects_invalid_key_configuration() -> None:
         ProductionProfile(identity_digest_key_version="bad version")
     with pytest.raises(ValueError, match="unsupported"):
         ProductionProfile(version=2)
+
+
+def test_strict_runtime_rejects_traffic_until_sealed(tmp_path) -> None:
+    calls: list[str] = []
+    runtime = Runtime(
+        [AuditMiddleware(JSONLAuditSink(tmp_path / "audit.jsonl"), fail_closed=True)],
+        idempotency_store=SQLiteIdempotencyStore(tmp_path / "idempotency.db"),
+        identity_provider=StaticIdentityProvider(_principal()),
+        require_verified_identity=True,
+        production_profile=strict_profile(),
+    )
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.MUTATING,
+        action_contract=contract(),
+    )
+    def operate(target: str) -> bool:
+        calls.append(target)
+        return True
+
+    with pytest.raises(ProductionReadinessError, match="not sealed") as caught:
+        runtime.invoke("operate", "node-a")
+
+    assert caught.value.report.ready is True
+    assert calls == []
+    report = runtime.seal_production()
+    assert report.ready is True
+    assert runtime.production_sealed is True
+    assert runtime.production_report == report
+    assert operate("node-a", _governance=InvocationOptions()) is True
+    assert calls == ["node-a"]
+
+
+def test_failed_seal_reports_all_runtime_requirements() -> None:
+    runtime = Runtime(
+        idempotency_store=InMemoryIdempotencyStore(),
+        production_profile=strict_profile(),
+    )
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.MUTATING,
+        action_contract=contract(),
+    )
+    def operate(target: str) -> bool:
+        return bool(target)
+
+    with pytest.raises(ProductionReadinessError) as caught:
+        runtime.seal_production()
+
+    assert caught.value.report.runtime_reasons == (
+        ProductionReadinessReason.IDENTITY_PROVIDER_REQUIRED,
+        ProductionReadinessReason.VERIFIED_IDENTITY_REQUIRED,
+        ProductionReadinessReason.IDEMPOTENCY_DURABLE_REQUIRED,
+        ProductionReadinessReason.AUDIT_MIDDLEWARE_REQUIRED,
+    )
+    assert runtime.production_sealed is False
+    assert runtime.registry.is_sealed is False
+
+
+def test_sealed_registry_rejects_late_registration(tmp_path) -> None:
+    runtime = _ready_runtime(tmp_path)
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.MUTATING,
+        action_contract=contract(),
+    )
+    def operate(target: str) -> bool:
+        return bool(target)
+
+    runtime.seal_production()
+
+    with pytest.raises(RegistryError, match="registry is sealed"):
+
+        @runtime.tool(name="late", execution_mode=ExecutionMode.READ_ONLY)
+        def late() -> bool:
+            return True
+
+
+def test_non_strict_runtime_remains_compatible() -> None:
+    runtime = Runtime()
+
+    @runtime.tool()
+    def operate() -> str:
+        return "ok"
+
+    assert operate() == "ok"
+    report = runtime.production_readiness(strict_profile())
+    assert report.ready is False
+    assert report.tools[0].state is ProductionReadinessState.MIGRATION_ONLY
+
+
+def test_builder_propagates_strict_profile(tmp_path) -> None:
+    profile = strict_profile()
+    runtime = (
+        RuntimeBuilder(
+            idempotency_store=SQLiteIdempotencyStore(tmp_path / "idempotency.db"),
+            identity_provider=StaticIdentityProvider(_principal()),
+            require_verified_identity=True,
+        )
+        .with_production_profile(profile)
+        .add_middleware(
+            AuditMiddleware(JSONLAuditSink(tmp_path / "audit.jsonl"), fail_closed=True)
+        )
+        .build()
+    )
+
+    assert runtime.production_profile is profile
+    assert runtime.production_sealed is False
+
+
+def test_in_memory_audit_is_rejected_even_when_fail_closed() -> None:
+    runtime = Runtime(
+        [AuditMiddleware(InMemoryAuditSink(), fail_closed=True)],
+        idempotency_store=object(),  # type: ignore[arg-type]
+        identity_provider=StaticIdentityProvider(_principal()),
+        require_verified_identity=True,
+        production_profile=strict_profile(),
+    )
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.MUTATING,
+        action_contract=contract(),
+    )
+    def operate(target: str) -> bool:
+        return bool(target)
+
+    report = runtime.production_readiness()
+    assert report.runtime_reasons == (
+        ProductionReadinessReason.AUDIT_SINK_DURABLE_REQUIRED,
+    )
+
+
+def _principal() -> VerifiedPrincipal:
+    return VerifiedPrincipal(
+        issuer="trusted-gateway",
+        subject="service-account",
+        tenant="tenant-a",
+        source="static",
+    )
+
+
+def _ready_runtime(tmp_path) -> Runtime:
+    return Runtime(
+        [AuditMiddleware(JSONLAuditSink(tmp_path / "audit.jsonl"), fail_closed=True)],
+        idempotency_store=SQLiteIdempotencyStore(tmp_path / "idempotency.db"),
+        identity_provider=StaticIdentityProvider(_principal()),
+        require_verified_identity=True,
+        production_profile=strict_profile(),
+    )

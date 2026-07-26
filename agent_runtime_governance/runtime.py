@@ -49,6 +49,11 @@ from .middleware.base import (
     MiddlewareKind,
 )
 from .pipeline import Pipeline
+from .production import (
+    ProductionProfile,
+    ProductionReadinessError,
+    ProductionReadinessReport,
+)
 from .registry import (
     GovernedTool,
     IdempotencyClaim,
@@ -120,13 +125,19 @@ class Runtime:
         limits: RuntimeLimits | None = None,
         sync_executor: Executor | None = None,
         idempotency_executor: Executor | None = None,
+        production_profile: ProductionProfile | None = None,
     ) -> None:
-        self.pipeline = pipeline if isinstance(pipeline, Pipeline) else Pipeline(pipeline)
+        self.pipeline = (
+            pipeline if isinstance(pipeline, Pipeline) else Pipeline(pipeline)
+        )
         self.hooks = hooks or HookRegistry()
         self.registry = ToolRegistry()
         self.idempotency_store = idempotency_store or InMemoryIdempotencyStore()
         self.identity_provider = identity_provider
         self.require_verified_identity = require_verified_identity
+        self.production_profile = production_profile
+        self._production_report: ProductionReadinessReport | None = None
+        self._production_sealed = production_profile is None
         self.limits = limits or RuntimeLimits()
         self._bulkhead = RuntimeBulkhead(self.limits.max_in_flight)
         self._async_tool_bulkhead = RuntimeBulkhead(self.limits.max_in_flight)
@@ -141,9 +152,7 @@ class Runtime:
             max_workers=min(4, self.limits.max_in_flight),
             thread_name_prefix="arg-idempotency",
         )
-        self._idempotency_bulkhead = RuntimeBulkhead(
-            min(4, self.limits.max_in_flight)
-        )
+        self._idempotency_bulkhead = RuntimeBulkhead(min(4, self.limits.max_in_flight))
         self._idempotency_poison_lock = Lock()
         self._idempotency_poison: BaseException | None = None
         self._idempotency_draining = 0
@@ -188,6 +197,37 @@ class Runtime:
         self, point: HookPoint, *, critical: bool = False
     ) -> Callable[[HookCallback], HookCallback]:
         return self.hooks.decorator(point, critical=critical)
+
+    @property
+    def production_sealed(self) -> bool:
+        return self._production_sealed
+
+    @property
+    def production_report(self) -> ProductionReadinessReport | None:
+        return self._production_report
+
+    def production_readiness(
+        self, profile: ProductionProfile | None = None
+    ) -> ProductionReadinessReport:
+        selected = profile or self.production_profile or ProductionProfile()
+        return selected.evaluate(
+            self.registry.list(),
+            pipeline=self.pipeline,
+            idempotency_store=self.idempotency_store,
+            identity_provider=self.identity_provider,
+            require_verified_identity=self.require_verified_identity,
+        )
+
+    def seal_production(self) -> ProductionReadinessReport:
+        if self.production_profile is None:
+            raise ValueError("production_profile is not configured")
+        report = self.production_readiness()
+        if not report.ready:
+            raise ProductionReadinessError(report)
+        self.registry.seal()
+        self._production_report = report
+        self._production_sealed = True
+        return report
 
     def before_tool(
         self, callback: HookCallback | None = None, *, critical: bool = False
@@ -265,6 +305,8 @@ class Runtime:
     ) -> RunResult:
         if self._closed:
             raise RuntimeError("runtime is closed")
+        if self.production_profile is not None and not self._production_sealed:
+            raise ProductionReadinessError(self.production_readiness())
         options = _governance or InvocationOptions()
         spec = self.registry.get(name)
         try:
@@ -356,16 +398,17 @@ class Runtime:
                 raise GovernanceDenied(context)
         except asyncio.CancelledError as exc:
             context = await asyncio.shield(self._release_approvals(context))
-            context = await self._handle_cancellation(
-                context, started, uncertain=False
-            )
+            context = await self._handle_cancellation(context, started, uncertain=False)
             raise GovernanceCancelledError(context) from exc
         claim: IdempotencyClaim | None = None
         heartbeat_task: asyncio.Task[None] | None = None
         tool_returned = False
         execution_started = False
         try:
-            if context.execution_mode is ExecutionMode.IDEMPOTENT and context.idempotency_key:
+            if (
+                context.execution_mode is ExecutionMode.IDEMPOTENT
+                and context.idempotency_key
+            ):
                 fingerprint = self._fingerprint(spec.name, normalized_parameters)
                 try:
                     claim = await self._acquire_idempotency(
@@ -487,9 +530,7 @@ class Runtime:
 
             call: ExecutionCall = execute_tool
             execution_middlewares = [
-                item
-                for item in self.pipeline
-                if item.kind is MiddlewareKind.EXECUTION
+                item for item in self.pipeline if item.kind is MiddlewareKind.EXECUTION
             ]
             for middleware in reversed(execution_middlewares):
                 next_call = call
@@ -543,24 +584,22 @@ class Runtime:
                 ),
             )
             context = await self._settle_idempotency(claim, context, cause)
-            context = await self._emit_hook(HookPoint.ON_ERROR, context, allow_critical=False)
+            context = await self._emit_hook(
+                HookPoint.ON_ERROR, context, allow_critical=False
+            )
             context = await self._run_observers(context, post=True)
             raise ToolExecutionError(context, cause) from cause
         except GovernanceDenied as exc:
             await self._stop_idempotency_heartbeat(
                 heartbeat_task, raise_on_failure=False
             )
-            context = await self._settle_idempotency(
-                claim, exc.context, exc
-            )
+            context = await self._settle_idempotency(claim, exc.context, exc)
             claim = None
             context = await self._run_observers(context, post=True)
             raise GovernanceDenied(context) from exc
         except asyncio.CancelledError as exc:
             await asyncio.shield(
-                self._stop_idempotency_heartbeat(
-                    heartbeat_task, raise_on_failure=False
-                )
+                self._stop_idempotency_heartbeat(heartbeat_task, raise_on_failure=False)
             )
             context = await self._handle_cancellation(
                 context,
@@ -589,11 +628,16 @@ class Runtime:
                 ),
             )
             context = await self._settle_idempotency(claim, context, exc)
-            context = await self._emit_hook(HookPoint.ON_ERROR, context, allow_critical=False)
+            context = await self._emit_hook(
+                HookPoint.ON_ERROR, context, allow_critical=False
+            )
             context = await self._run_observers(context, post=True)
             raise ToolExecutionError(context, exc) from exc
 
-        metadata = {**context.metadata, "duration_ms": (perf_counter() - started) * 1000}
+        metadata = {
+            **context.metadata,
+            "duration_ms": (perf_counter() - started) * 1000,
+        }
         context = context.evolve(
             status=ExecutionStatus.SUCCEEDED,
             result=value,
@@ -646,9 +690,7 @@ class Runtime:
             return await self._release_approvals(context)
         except asyncio.CancelledError as exc:
             context = await asyncio.shield(self._release_approvals(context))
-            context = await self._handle_cancellation(
-                context, started, uncertain=False
-            )
+            context = await self._handle_cancellation(context, started, uncertain=False)
             raise GovernanceCancelledError(context) from exc
 
     async def areplay(self, context: ExecutionContext) -> ExecutionContext:
@@ -751,7 +793,9 @@ class Runtime:
         error: CapacityExceededError | StageTimeoutError,
     ) -> None:
         metadata = _caller_metadata(options.metadata)
-        identity_pending = self.identity_provider is not None or self.require_verified_identity
+        identity_pending = (
+            self.identity_provider is not None or self.require_verified_identity
+        )
         if identity_pending:
             metadata.update(
                 {
@@ -942,9 +986,7 @@ class Runtime:
         return min(configured, remaining)
 
     @classmethod
-    def _enforce_size_limit(
-        cls, label: str, value: Any, limit: int | None
-    ) -> None:
+    def _enforce_size_limit(cls, label: str, value: Any, limit: int | None) -> None:
         if limit is None:
             return
         actual = len(canonical_json_bytes(value, label=label))
@@ -960,7 +1002,9 @@ class Runtime:
         deadline: datetime | None,
     ) -> dict[str, Any]:
         # Validate the absolute deadline even for an empty middleware pipeline.
-        self._bounded_timeout(deadline, self.limits.middleware_timeout_seconds, "request")
+        self._bounded_timeout(
+            deadline, self.limits.middleware_timeout_seconds, "request"
+        )
         bound_parameters = bind_arguments(spec.function, args, kwargs)
         if (
             spec.parameters_schema is not None
@@ -1357,7 +1401,9 @@ class Runtime:
                         )
                         continue
                     context = context.append_history(
-                        HistoryEntry(middleware.name, "error", f"observer ignored: {exc}")
+                        HistoryEntry(
+                            middleware.name, "error", f"observer ignored: {exc}"
+                        )
                     )
                     continue
                 decision = DecisionRecord(
@@ -1372,9 +1418,7 @@ class Runtime:
             context = context.evolve(status=ExecutionStatus.ALLOWED)
         return context
 
-    async def _commit_approvals(
-        self, context: ExecutionContext
-    ) -> ExecutionContext:
+    async def _commit_approvals(self, context: ExecutionContext) -> ExecutionContext:
         for middleware in self.pipeline:
             commit = getattr(middleware, "commit_approval", None)
             if callable(commit):
@@ -1393,9 +1437,7 @@ class Runtime:
                     break
         return context
 
-    async def _release_approvals(
-        self, context: ExecutionContext
-    ) -> ExecutionContext:
+    async def _release_approvals(self, context: ExecutionContext) -> ExecutionContext:
         for middleware in self.pipeline:
             release = getattr(middleware, "release_approval", None)
             if callable(release):
@@ -1458,12 +1500,10 @@ class Runtime:
             or decision.request_id != context.request_id
             or decision.tool_name != context.tool_call.name
             or decision.risk_tier != context.risk_tier.name
-            or decision.policy_version != _metadata_text(
-                context.metadata, "policy_version"
-            )
-            or decision.policy_digest != _metadata_text(
-                context.metadata, "policy_digest"
-            )
+            or decision.policy_version
+            != _metadata_text(context.metadata, "policy_version")
+            or decision.policy_digest
+            != _metadata_text(context.metadata, "policy_digest")
             or decision.subject != context.user
             or decision.tenant != context.tenant
             or decision.identity_issuer != expected_identity_issuer
@@ -1572,9 +1612,7 @@ class Runtime:
         if not context.denied:
             context = context.evolve(
                 status=(
-                    ExecutionStatus.UNKNOWN
-                    if uncertain
-                    else ExecutionStatus.FAILED
+                    ExecutionStatus.UNKNOWN if uncertain else ExecutionStatus.FAILED
                 ),
                 error=(
                     "CancelledError: execution outcome is unknown"
@@ -1619,9 +1657,7 @@ class Runtime:
             )
         return context
 
-    async def _abort_observers(
-        self, context: ExecutionContext
-    ) -> ExecutionContext:
+    async def _abort_observers(self, context: ExecutionContext) -> ExecutionContext:
         for middleware in self.pipeline:
             abort = getattr(middleware, "abort", None)
             if not callable(abort):
@@ -1707,12 +1743,19 @@ class Runtime:
         *,
         uncertain: bool = False,
     ) -> ExecutionContext:
-        metadata = {**context.metadata, "duration_ms": (perf_counter() - started) * 1000}
+        metadata = {
+            **context.metadata,
+            "duration_ms": (perf_counter() - started) * 1000,
+        }
         status = (
             ExecutionStatus.UNKNOWN
             if isinstance(
                 exc,
-                (TimeoutError, IdempotencyOutcomeUnknownError, IdempotencyInProgressError),
+                (
+                    TimeoutError,
+                    IdempotencyOutcomeUnknownError,
+                    IdempotencyInProgressError,
+                ),
             )
             or uncertain
             else ExecutionStatus.FAILED

@@ -52,9 +52,7 @@ class ToolSpec(Generic[P, R]):
 
     def __post_init__(self) -> None:
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.:-]{0,127}", self.name):
-            raise ValueError(
-                "tool name must be a 1-128 character stable identifier"
-            )
+            raise ValueError("tool name must be a 1-128 character stable identifier")
         if not callable(self.function):
             raise TypeError("tool function must be callable")
         if self.action_contract is not None and not isinstance(
@@ -69,10 +67,16 @@ class ToolSpec(Generic[P, R]):
                 raise ValueError(f"{name} must be greater than zero")
         if self.parameters_schema is not None:
             validate_schema(self.parameters_schema, label="parameters")
-            object.__setattr__(self, "parameters_schema", _freeze_schema(deepcopy(self.parameters_schema)))
+            object.__setattr__(
+                self,
+                "parameters_schema",
+                _freeze_schema(deepcopy(self.parameters_schema)),
+            )
         if self.result_schema is not None:
             validate_schema(self.result_schema, label="result")
-            object.__setattr__(self, "result_schema", _freeze_schema(deepcopy(self.result_schema)))
+            object.__setattr__(
+                self, "result_schema", _freeze_schema(deepcopy(self.result_schema))
+            )
 
 
 class IdempotencyConflictError(RuntimeError):
@@ -151,9 +155,7 @@ class InMemoryIdempotencyStore:
         self._completed: OrderedDict[tuple[str, str], float] = OrderedDict()
         self._lock = Lock()
 
-    def acquire(
-        self, namespace: str, key: str, fingerprint: str
-    ) -> IdempotencyClaim:
+    def acquire(self, namespace: str, key: str, fingerprint: str) -> IdempotencyClaim:
         storage_key = (namespace, key)
         with self._lock:
             self._evict_completed(monotonic())
@@ -206,9 +208,7 @@ class InMemoryIdempotencyStore:
         if not claim.owner:
             raise RuntimeError("only an idempotency owner can renew a claim")
 
-    def _remember_completed(
-        self, storage_key: tuple[str, str], now: float
-    ) -> None:
+    def _remember_completed(self, storage_key: tuple[str, str], now: float) -> None:
         self._completed[storage_key] = now
         self._completed.move_to_end(storage_key)
 
@@ -254,9 +254,7 @@ class SQLiteIdempotencyStore:
         self.timeout_seconds = timeout_seconds
         self._initialize()
 
-    def acquire(
-        self, namespace: str, key: str, fingerprint: str
-    ) -> IdempotencyClaim:
+    def acquire(self, namespace: str, key: str, fingerprint: str) -> IdempotencyClaim:
         self._validate_identifier("namespace", namespace)
         self._validate_identifier("key", key)
         if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
@@ -333,14 +331,18 @@ class SQLiteIdempotencyStore:
                         )
                     )
             else:
-                future.set_exception(RuntimeError(f"invalid idempotency state {state!r}"))
+                future.set_exception(
+                    RuntimeError(f"invalid idempotency state {state!r}")
+                )
             connection.commit()
             return IdempotencyClaim(namespace, key, fingerprint, False, future)
 
     def complete(self, claim: IdempotencyClaim, result: Any) -> None:
         if not claim.owner:
             return
-        encoded = canonical_json_bytes(result, label="idempotency result").decode("utf-8")
+        encoded = canonical_json_bytes(result, label="idempotency result").decode(
+            "utf-8"
+        )
         self._transition(claim, "completed", result_json=encoded)
         if not claim.future.done():
             claim.future.set_result(json.loads(encoded))
@@ -508,7 +510,6 @@ def _freeze_schema(value: Any) -> Any:
     return value
 
 
-
 class GovernedTool(Generic[P, R]):
     def __init__(self, runtime: "Runtime", spec: ToolSpec[P, R]) -> None:
         self.runtime = runtime
@@ -526,8 +527,11 @@ class GovernedTool(Generic[P, R]):
 class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, ToolSpec[Any, Any]] = {}
+        self._sealed = False
 
     def register(self, spec: ToolSpec[Any, Any]) -> None:
+        if self._sealed:
+            raise RegistryError("tool registry is sealed")
         if spec.name in self._tools:
             raise RegistryError(f"tool {spec.name!r} is already registered")
         self._tools[spec.name] = spec
@@ -540,3 +544,10 @@ class ToolRegistry:
 
     def list(self) -> tuple[ToolSpec[Any, Any], ...]:
         return tuple(self._tools.values())
+
+    @property
+    def is_sealed(self) -> bool:
+        return self._sealed
+
+    def seal(self) -> None:
+        self._sealed = True
