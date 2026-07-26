@@ -1,0 +1,8 @@
+{
+  "required_permissions": {
+    "set_service_state": [
+      "ops.write"
+    ]
+  },
+  "version": "strict-action-example-policy-v1"
+}

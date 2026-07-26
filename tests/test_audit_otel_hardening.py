@@ -9,7 +9,7 @@ from urllib.error import HTTPError
 
 import pytest
 
-from agent_runtime_governance import Runtime
+from agent_runtime_governance import ActionContract, Runtime
 from agent_runtime_governance.audit import JSONLAuditSink, SQLiteAuditSink
 from agent_runtime_governance.context import (
     ExecutionContext,
@@ -627,6 +627,42 @@ def test_opentelemetry_does_not_export_raw_error_details() -> None:
     span = tracer.spans[0]
     assert "arg.error" not in span.attributes
     assert all("production-secret" not in str(exc) for exc in span.exceptions)
+
+
+def test_opentelemetry_exports_bound_action_identity() -> None:
+    tracer = FakeCurrentTracer()
+    middleware = OpenTelemetryMiddleware(tracer)
+    contract = ActionContract(
+        contract_id="ops.danger",
+        contract_version=1,
+        tool_name="danger",
+        execution_mode=ExecutionMode.MUTATING,
+        parameters_schema={
+            "type": "object",
+            "properties": {"target": {"type": "string"}},
+            "required": ["target"],
+            "additionalProperties": False,
+        },
+        effect_class="service.change",
+    )
+    action = contract.bind(
+        {"target": "node-a"},
+        identity_issuer="trusted-gateway",
+        principal="service-account",
+        tenant="tenant-a",
+        identity_digest_key=b"k" * 32,
+        identity_digest_key_version="key-v1",
+        policy_version="policy-v1",
+        policy_digest="a" * 64,
+    )
+    context = make_context().bind_action(action)
+
+    asyncio.run(middleware.process(context))
+
+    attributes = tracer.spans[0].attributes
+    assert attributes["arg.action.digest"] == action.action_digest
+    assert attributes["arg.action.contract.id"] == "ops.danger"
+    assert attributes["arg.action.contract.version"] == 1
 
 
 def test_opentelemetry_abort_finishes_and_forgets_active_span() -> None:

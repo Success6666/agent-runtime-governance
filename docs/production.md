@@ -1,17 +1,19 @@
 # Production Operations
 
-This guide covers the operational contract for v0.5. Applications remain
+This guide covers the operational contract for v0.5 and the unreleased v0.6
+candidate. Applications remain
 responsible for tool-specific authorization, business rollback, and data
 retention requirements.
 
-The unreleased v0.6 strict profile adds an explicit registration and sealing
-lifecycle. Configure `ProductionProfile`, register every tool, call
+The v0.6 strict profile adds an explicit registration and sealing lifecycle.
+Configure `ProductionProfile`, register every tool, call
 `seal_production()`, and expose readiness or accept traffic only after the
 returned report has `ready=True`. Compatibility runtimes can call
 `production_readiness(profile)` to generate a migration inventory without
 changing v0.5 execution behavior. See
 [`ADR 0004`](adr/0004-strict-production-sealing.md) for the exact trust and
-capability boundary.
+capability boundary and [`ADR 0005`](adr/0005-single-bound-action.md) for the
+runtime identity decision.
 
 ## Required configuration
 
@@ -30,6 +32,15 @@ capability boundary.
 - Keep identity and audit HMAC keys in a secret manager. Rotate identity keys by
   adding a new `kid`, switching issuers, waiting for the maximum envelope
   lifetime, and only then removing the old key.
+- Configure a public identity-digest key version plus an explicit policy
+  version and SHA-256 digest of the exact immutable policy artifact. Do not
+  hash a human label. Policy-bearing middleware must advertise the same
+  identity. Contracts with external preconditions require a bounded provider
+  that returns the current digest.
+- For `YAMLPolicyLoader`, use `PolicyDocument.artifact_digest` and
+  `artifact_middleware()` in the strict profile. `PolicyDocument.digest` is a
+  formatting-independent semantic digest retained for compatibility and policy
+  drift comparison; it is not deployment-artifact identity.
 
 SQLite stores coordinate multiple processes on one host. They are not a
 distributed database. Deployments spanning hosts must provide store adapters
@@ -61,10 +72,15 @@ a new idempotency key.
 
 ## Approval recovery
 
-Approval requests bind the trace, tool call digest, identity, expiry, and
-decision. On restart, reload pending requests from the durable store and reject
+Contracted approval requests bind `action_digest`, identity, policy, risk, and
+expiry. On restart, reload pending requests from the durable store and reject
 expired, tampered, already-consumed, or mismatched decisions. Approval channels
 must authenticate the reviewer independently of user-supplied context.
+
+Approvals written by v0.5 do not contain `action_digest`. They remain readable
+but fail closed for contracted tools and must be reissued. Follow
+[`migration-v0.6.md`](migration-v0.6.md); do not copy a legacy allow decision
+into a v0.6 request.
 
 The runtime reserves an approved decision during governance and commits it at
 the execution boundary. Later gate or hook denial releases the reservation;
@@ -90,12 +106,38 @@ errors, decision reasons, and known secret keys. Add domain-specific sensitive
 keys and patterns before production traffic. Disabling redaction is appropriate
 only for isolated test data.
 
+Full context/replay snapshots retain normalized tool parameters and therefore
+have a higher confidentiality classification than parameter-free audit
+evidence. Hash chains and HMAC signatures do not encrypt them. Production
+snapshot stores and backups require encryption at rest and in transit,
+least-privilege ACLs, independent encryption/HMAC keys, bounded retention, and
+verified deletion from replicas. Treat `from_dict()` as parsing only.
+`Runtime.areplay()` is non-authoritative policy analysis and deliberately does
+not create `BoundAction`. For a current bound preview, verify the snapshot chain
+externally and call `Runtime.apreview()` with freshly verified identity claims;
+do not promote replay output into authorization evidence.
+
+Precondition providers receive the contract, exact normalized parameters,
+verified principal, and tenant. They must return a lowercase SHA-256 digest,
+finish within the middleware/deadline budget, and fail closed on stale,
+missing, or ambiguous state. Entry-time revalidation narrows TOCTOU exposure
+but cannot make an external write atomic. Strongly consistent side effects must
+send an ETag, version, CAS predicate, or transaction condition to the target
+system and have that system reject a changed state.
+
 ## External services
 
 - OPA is fail closed and validates response shape and size. Use TLS and enable
   circuit breaking explicitly by passing a positive `failure_threshold` to
   `OPAClient`; the default value `0` leaves circuit breaking disabled. Alert on
   transport, schema, and latency failures.
+  For contracted strict runtimes, configure `policy_version` and
+  `policy_digest` on `OPAMiddleware` and use the same values in
+  `ProductionProfile`; an absent or mismatched identity blocks sealing. Tie the
+  values to the exact signed OPA bundle bytes or admitted OCI manifest digest,
+  never a revision label. Deployment admission must verify the artifact and
+  loaded OPA revision. The runtime checks configuration equality but cannot
+  independently attest remote policy bytes.
 - OpenTelemetry export is observing and should not carry raw arguments or
   identity claims. v0.5 verifies in-process async/thread context propagation and
   OTLP export. `ExecutionContext.trace_id` and `span_id` are governance IDs, not
@@ -125,6 +167,10 @@ AUDIT_SITE_PACKAGES=$(
 /tmp/arg-pip-audit-tool/bin/pip-audit --path "$AUDIT_SITE_PACKAGES"
 python integration/production_smoke.py --skip-kind
 python integration/production_smoke.py
+python benchmarks/benchmark_runtime.py --requests 1000 --concurrency 100 \
+  --output benchmarks/results/release-candidate.json
+python scripts/check_benchmark_budget.py \
+  benchmarks/results/release-candidate.json
 python -m build
 ```
 

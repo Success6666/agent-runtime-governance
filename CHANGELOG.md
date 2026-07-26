@@ -21,6 +21,14 @@ All notable changes are documented here.
 - A versioned strict-production profile with deterministic registry inventory,
   fail-closed runtime sealing, explicit adapter capability declarations, and
   stable redacted readiness reason codes.
+- One immutable `BoundAction` carried through context, approval, versioned
+  idempotency, executor-boundary revalidation, OpenTelemetry, and schema-v3
+  audit evidence.
+- Strict policy-identity and external-precondition readiness checks, contract
+  receipt validation, v0.5 context/approval/idempotency compatibility fixtures,
+  and a documented migration and rollback procedure.
+- A paired strict-runtime benchmark, committed release-candidate measurement,
+  and CI-enforced latency and memory regression budget.
 
 ### Changed
 
@@ -42,12 +50,24 @@ All notable changes are documented here.
   run middleware before a strict runtime is sealed.
 - Identity replay-store durability validation now applies to any identity
   provider exposing a `replay_store`, not just the built-in HMAC provider.
+- Contracted approvals now bind `action_digest`; v0.5 approvals remain readable
+  but require re-approval. Contracted idempotency uses the isolated
+  `action/v1` namespace and cannot reuse a v0.5 result.
+- The exact frozen parameter snapshot covered by `action_digest` now
+  materializes the tool call. Key, policy, precondition, contract, or parameter
+  drift denies before tool entry.
 
 ### Fixed
 
 - The production smoke test's pinned image pulls now treat a hung
   `docker pull` (`subprocess.TimeoutExpired`) as a retryable failure instead
   of aborting before the retry/backoff logic engages.
+- Contracted idempotency partitions are stable across identity-key and contract
+  version rotation, and fixed-length contract partitions accept every valid
+  `contract_id` supported by `ActionContract` and SQLite stores.
+- Deterministic replay is explicitly non-authoritative and no longer mints a
+  `BoundAction` from persisted identity fields; current binding requires the
+  trusted identity path through `apreview()`.
 
 ## [0.5.1] - 2026-07-26
 
