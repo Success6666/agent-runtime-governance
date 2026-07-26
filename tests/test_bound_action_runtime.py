@@ -27,6 +27,7 @@ from agent_runtime_governance import (
     RuntimeLimits,
     SimplePolicy,
     SQLiteApprovalStore,
+    SQLiteIdempotencyStore,
     StaticIdentityProvider,
     VerifiedPrincipal,
 )
@@ -87,12 +88,13 @@ def _principal() -> VerifiedPrincipal:
 
 def _contract(
     *,
+    contract_id: str = "ops.operate",
     execution_mode: ExecutionMode = ExecutionMode.MUTATING,
     preconditions: tuple[str, ...] = (),
     receipt_schema: Mapping[str, Any] | None = None,
 ) -> ActionContract:
     return ActionContract(
-        contract_id="ops.operate",
+        contract_id=contract_id,
         contract_version=1,
         tool_name="operate",
         execution_mode=execution_mode,
@@ -293,13 +295,51 @@ async def test_contracted_idempotency_uses_versioned_action_identity(tmp_path) -
     action = result.context.bound_action
 
     assert action is not None
-    assert store.acquisitions == [
-        (
-            f"action/v1:{action.tenant_digest}:ops.operate",
-            "request-1",
-            action.action_digest,
-        )
-    ]
+    namespace, key, fingerprint = store.acquisitions[0]
+    assert namespace.startswith("action/v1:")
+    assert action.tenant_digest not in namespace
+    assert action.contract.contract_id not in namespace
+    assert len(namespace) == 139
+    assert key == "request-1"
+    assert fingerprint == action.action_digest
+
+
+@pytest.mark.asyncio
+async def test_identity_key_rotation_cannot_bypass_idempotency_record(tmp_path) -> None:
+    store = RecordingIdempotencyStore()
+    keys = RotatingKeyProvider()
+    runtime, _, _ = _runtime(
+        tmp_path,
+        key_provider=keys,
+        idempotency_store=store,
+    )
+    calls: list[str] = []
+
+    @runtime.tool(
+        name="operate",
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        action_contract=_contract(execution_mode=ExecutionMode.IDEMPOTENT),
+    )
+    def operate(target: str) -> str:
+        calls.append(target)
+        return target
+
+    runtime.seal_production()
+    options = InvocationOptions(idempotency_key="request-1")
+    first = await runtime.arun("operate", "node-a", _governance=options)
+    assert first.context.bound_action is not None
+    keys.key = b"r" * 32
+
+    with pytest.raises(GovernanceDenied) as denied:
+        await runtime.arun("operate", "node-a", _governance=options)
+
+    assert calls == ["node-a"]
+    assert denied.value.context.decision is not None
+    assert denied.value.context.decision.source == "idempotency"
+    assert len(store.acquisitions) == 2
+    assert store.acquisitions[0][0] == store.acquisitions[1][0]
+    assert store.acquisitions[0][2] == first.context.bound_action.action_digest
+    assert store.acquisitions[0][2] != store.acquisitions[1][2]
 
 
 @pytest.mark.asyncio
@@ -329,6 +369,36 @@ async def test_legacy_idempotency_namespace_cannot_satisfy_action_claim(tmp_path
     assert result.value == "v0.6-result"
     assert calls == ["node-a"]
     assert store.acquisitions[-1][0].startswith("action/v1:")
+
+
+@pytest.mark.parametrize("contract_id", ["ops@operate", "c" * 256])
+@pytest.mark.asyncio
+async def test_legal_contract_id_fits_sqlite_idempotency_namespace(
+    tmp_path,
+    contract_id: str,
+) -> None:
+    store = SQLiteIdempotencyStore(tmp_path / "idempotency.db")
+    runtime, _, _ = _runtime(tmp_path, idempotency_store=store)
+
+    @runtime.tool(
+        name="operate",
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        action_contract=_contract(
+            contract_id=contract_id,
+            execution_mode=ExecutionMode.IDEMPOTENT,
+        ),
+    )
+    def operate(target: str) -> str:
+        return target
+
+    runtime.seal_production()
+    result = await runtime.arun(
+        "operate",
+        "node-a",
+        _governance=InvocationOptions(idempotency_key="request-1"),
+    )
+
+    assert result.value == "node-a"
 
 
 @pytest.mark.asyncio

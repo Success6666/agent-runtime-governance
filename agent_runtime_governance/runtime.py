@@ -840,7 +840,13 @@ class Runtime:
             raise GovernanceCancelledError(context) from exc
 
     async def areplay(self, context: ExecutionContext) -> ExecutionContext:
-        """Reapply deterministic middleware to a recorded request identity."""
+        """Reapply deterministic middleware as non-authoritative analysis.
+
+        Replay never executes a tool or creates an executor-authoritative
+        ``BoundAction`` from persisted identity fields. Use :meth:`apreview`
+        with current trusted identity claims when a fresh action binding is
+        required.
+        """
         if self._closed:
             raise RuntimeError("runtime is closed")
         if self._production_profile is not None and not self._production_sealed:
@@ -851,16 +857,21 @@ class Runtime:
             requires_approval=spec.requires_approval,
             execution_mode=spec.execution_mode,
         )
-        normalized_parameters = self._prepare_parameters(
+        clean = clean.evolve(
+            metadata={
+                "replay_mode": "analysis",
+                "replay_authoritative": False,
+            }
+        )
+        self._prepare_parameters(
             spec,
             clean.tool_call.args,
             dict(clean.tool_call.kwargs),
             clean.deadline,
         )
-        try:
-            clean = await self._bind_action(spec, clean, normalized_parameters)
-        except _ActionBindingError as exc:
-            return self._deny_action_binding(clean, str(exc))
+        # Parameter preparation is retained so analysis sees the same defaults
+        # and contract validation as admission. Persisted identity metadata is
+        # intentionally insufficient to mint a new BoundAction.
         clean = self._enforce_idempotency_key(clean)
         if clean.denied:
             return clean
@@ -1346,9 +1357,32 @@ class Runtime:
     def _idempotency_namespace(context: ExecutionContext) -> str:
         if context.bound_action is not None:
             action = context.bound_action
+            tenant = context.tenant
+            if tenant is None:
+                raise ValueError("verified tenant is required for action idempotency")
+            tenant_partition = hashlib.sha256(
+                canonical_json_bytes(
+                    {
+                        "domain": "arg.idempotency-tenant-partition",
+                        "version": 1,
+                        "tenant": tenant,
+                    },
+                    label="idempotency tenant partition",
+                )
+            ).hexdigest()
+            contract_partition = hashlib.sha256(
+                canonical_json_bytes(
+                    {
+                        "domain": "arg.idempotency-contract-partition",
+                        "version": 1,
+                        "contract_id": action.contract.contract_id,
+                    },
+                    label="idempotency contract partition",
+                )
+            ).hexdigest()
             return (
                 "action/v1:"
-                f"{action.tenant_digest}:{action.contract.contract_id}"
+                f"{tenant_partition}:{contract_partition}"
             )
         tenant = context.tenant or "global"
         return f"{tenant}:{context.tool_call.name}"
