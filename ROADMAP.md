@@ -19,8 +19,9 @@ The detailed production plan is in
 
 The next releases focus on **Action Commit Safety for AI Agents**:
 
-> The approved action is the executed action; uncertain side effects are not
-> blindly retried; and recovery produces verifiable evidence.
+> The approved action is the executed action; uncertain side effects are
+> recorded as `UNKNOWN` and automatic reuse is blocked while the idempotency
+> record is retained; and recovery produces verifiable evidence.
 
 Lightweight deployment, framework independence, approval, audit, idempotency,
 and telemetry remain required foundations. They are not treated as unique
@@ -30,8 +31,10 @@ The runtime is embedded inside existing agent frameworks as a governance
 layer. It complements framework-native approval flows instead of replacing
 the host framework.
 
-The commit-boundary gap is publicly acknowledged by larger projects and is
-expected to narrow. Delivery speed for v0.6 and v0.7 is part of the strategy,
+The [Microsoft Agent Governance Toolkit's versioned limitations](https://github.com/microsoft/agent-governance-toolkit/blob/2962693358c26201f2bbc13a54b5966af933accf/docs/LIMITATIONS.md)
+explicitly distinguish attempted actions and allow/deny audit from verified
+real-world outcomes and list outcome attestation as planned. That adjacent gap
+is expected to narrow. Delivery speed for v0.6 and v0.7 is part of the strategy,
 not an implementation detail.
 
 ## v0.6 - Action Contracts

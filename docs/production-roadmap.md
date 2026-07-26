@@ -81,7 +81,7 @@ signal, not proof that this project or no other project solves the entire
 problem. The intended differentiation is the tested combination of a unified
 bound action, intent-bound approval, explicit `UNKNOWN` reconciliation, and
 cross-framework evidence consistency:
-[Microsoft known limitations](https://github.com/microsoft/agent-governance-toolkit/blob/main/docs/LIMITATIONS.md).
+[Microsoft known limitations at commit `2962693`](https://github.com/microsoft/agent-governance-toolkit/blob/2962693358c26201f2bbc13a54b5966af933accf/docs/LIMITATIONS.md).
 
 Two boundary observations recorded on 2026-07-26 qualify that opening:
 
@@ -89,11 +89,12 @@ Two boundary observations recorded on 2026-07-26 qualify that opening:
   attestation schemas alongside the planned-outcome-attestation statement, so
   the overlap window should be treated as narrowing rather than static.
   Delivery speed for v0.6 and v0.7 is therefore strategic, not incidental.
-- [HumanLayer](https://humanlayer.dev), a human-approval SDK with far wider
-  adoption than this project, now markets an AI coding product rather than the
-  approval SDK. Standalone approval flows were not a durable wedge on their
-  own, which supports scoping this project to the commit boundary rather than
-  to approval alone.
+- [HumanLayer's versioned SDK notice](https://github.com/humanlayer/humanlayer/blob/bdea199c/humanlayer.md)
+  states that its SDK documentation is being superseded by CodeLayer and that
+  the SDKs were removed. This documents a product-positioning pivot; it does
+  not prove that approval is an invalid category. It does suggest that approval
+  alone may be a less durable differentiator, supporting this project's narrower
+  emphasis on the commit boundary.
 
 ## Target users
 
