@@ -548,7 +548,9 @@ async def test_human_provider_applies_configured_approver_to_full_record() -> No
 
 
 @pytest.mark.asyncio
-async def test_pruned_approval_reservation_denies_at_delayed_execution_boundary() -> None:
+async def test_pruned_approval_reservation_denies_at_delayed_execution_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class Provider:
         async def decide(self, context, request):
             return DecisionRecord(
@@ -558,15 +560,20 @@ async def test_pruned_approval_reservation_denies_at_delayed_execution_boundary(
                 approver="operator",
             )
 
+    clock = {"value": 0.0}
+    monkeypatch.setattr(
+        "agent_runtime_governance.middleware.decision.monotonic",
+        lambda: clock["value"],
+    )
     middleware = DecisionMiddleware(
         Provider(),
         store=InMemoryApprovalStore(),
-        reservation_ttl_seconds=0.001,
+        reservation_ttl_seconds=1.0,
     )
     first = await middleware.process(_context(approval=True))
     assert first.decision.outcome is DecisionOutcome.ALLOW
     assert middleware.active_reservation_count == 1
-    await asyncio.sleep(0.01)
+    clock["value"] = 2.0
     second_context = ExecutionContext.create(
         ToolCall("delete_file"),
         request_id="request-second",
