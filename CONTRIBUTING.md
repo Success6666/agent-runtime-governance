@@ -20,12 +20,9 @@ the same branch rules as everyone else.
 
 GitHub prohibits pull request authors from approving their own changes. While
 the repository has one maintainer, merges therefore rely on the linked issue,
-all required CI/security checks, the `CodeRabbit Approval` status for the
-current head commit, and resolved review threads without a human approval
-count. The status publisher executes only trusted default-branch code and
-updates one commit-status context across repeated review events. Add one
-required code-owner and last-push approval as soon as a second maintainer is
-available.
+all required CI/security checks, a current CodeRabbit approval, and resolved
+review threads without a human approval count. Add one required code-owner and
+last-push approval as soon as a second maintainer is available.
 
 ## Local validation
 
