@@ -127,15 +127,15 @@ class Runtime:
         idempotency_executor: Executor | None = None,
         production_profile: ProductionProfile | None = None,
     ) -> None:
-        self.pipeline = (
+        self._pipeline = (
             pipeline if isinstance(pipeline, Pipeline) else Pipeline(pipeline)
         )
         self.hooks = hooks or HookRegistry()
         self.registry = ToolRegistry()
-        self.idempotency_store = idempotency_store or InMemoryIdempotencyStore()
-        self.identity_provider = identity_provider
-        self.require_verified_identity = require_verified_identity
-        self.production_profile = production_profile
+        self._idempotency_store = idempotency_store or InMemoryIdempotencyStore()
+        self._identity_provider = identity_provider
+        self._require_verified_identity = require_verified_identity
+        self._production_profile = production_profile
         self._production_report: ProductionReadinessReport | None = None
         self._production_sealed = production_profile is None
         self._production_seal_lock = Lock()
@@ -206,6 +206,69 @@ class Runtime:
     @property
     def production_report(self) -> ProductionReadinessReport | None:
         return self._production_report
+
+    def _guard_sealed_mutation(self, attribute: str) -> None:
+        """Reject reassignment of governance components once sealed."""
+
+        if self._production_profile is not None and self._production_sealed:
+            raise RuntimeError(
+                "runtime is sealed for production; "
+                f"{attribute} cannot be reassigned"
+            )
+
+    @property
+    def pipeline(self) -> Pipeline:
+        return self._pipeline
+
+    @pipeline.setter
+    def pipeline(self, value: Pipeline | Iterable[Middleware]) -> None:
+        with self._production_seal_lock:
+            self._guard_sealed_mutation("pipeline")
+            self._pipeline = (
+                value if isinstance(value, Pipeline) else Pipeline(value)
+            )
+
+    @property
+    def idempotency_store(self) -> IdempotencyStore:
+        return self._idempotency_store
+
+    @idempotency_store.setter
+    def idempotency_store(self, value: IdempotencyStore) -> None:
+        with self._production_seal_lock:
+            self._guard_sealed_mutation("idempotency_store")
+            self._idempotency_store = value
+
+    @property
+    def identity_provider(self) -> IdentityProvider | None:
+        return self._identity_provider
+
+    @identity_provider.setter
+    def identity_provider(self, value: IdentityProvider | None) -> None:
+        with self._production_seal_lock:
+            self._guard_sealed_mutation("identity_provider")
+            self._identity_provider = value
+
+    @property
+    def require_verified_identity(self) -> bool:
+        return self._require_verified_identity
+
+    @require_verified_identity.setter
+    def require_verified_identity(self, value: bool) -> None:
+        with self._production_seal_lock:
+            self._guard_sealed_mutation("require_verified_identity")
+            self._require_verified_identity = value
+
+    @property
+    def production_profile(self) -> ProductionProfile | None:
+        return self._production_profile
+
+    @production_profile.setter
+    def production_profile(self, value: ProductionProfile | None) -> None:
+        with self._production_seal_lock:
+            self._guard_sealed_mutation("production_profile")
+            self._production_profile = value
+            self._production_sealed = value is None
+            self._production_report = None
 
     def production_readiness(
         self, profile: ProductionProfile | None = None
@@ -678,6 +741,10 @@ class Runtime:
         **kwargs: Any,
     ) -> ExecutionContext:
         """Evaluate governance without executing the tool."""
+        if self._closed:
+            raise RuntimeError("runtime is closed")
+        if self._production_profile is not None and not self._production_sealed:
+            raise ProductionReadinessError(self.production_readiness())
         spec = self.registry.get(name)
         context = await self._create_context(spec, args, kwargs, _governance)
         started = perf_counter()
@@ -711,6 +778,10 @@ class Runtime:
 
     async def areplay(self, context: ExecutionContext) -> ExecutionContext:
         """Reapply deterministic middleware to a recorded request identity."""
+        if self._closed:
+            raise RuntimeError("runtime is closed")
+        if self._production_profile is not None and not self._production_sealed:
+            raise ProductionReadinessError(self.production_readiness())
         spec = self.registry.get(context.tool_call.name)
         clean = context.reset_for_replay(
             risk_tier=spec.risk,

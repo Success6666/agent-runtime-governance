@@ -8,6 +8,7 @@ from agent_runtime_governance import (
     ActionContract,
     AuditMiddleware,
     DecisionMiddleware,
+    ExecutionContext,
     ExecutionMode,
     HMACClaimsIdentityProvider,
     InMemoryApprovalStore,
@@ -27,6 +28,7 @@ from agent_runtime_governance import (
     SQLiteIdempotencyStore,
     SQLiteIdentityReplayStore,
     StaticIdentityProvider,
+    ToolCall,
     ToolSpec,
     VerifiedPrincipal,
 )
@@ -693,6 +695,149 @@ def test_unmarked_identity_provider_is_not_trusted(tmp_path) -> None:
     assert runtime.production_readiness().runtime_reasons == (
         ProductionReadinessReason.IDENTITY_PROVIDER_NOT_TRUSTED,
     )
+
+
+def test_sealed_runtime_rejects_component_reassignment(tmp_path) -> None:
+    runtime = _ready_runtime(tmp_path)
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.MUTATING,
+        action_contract=contract(),
+    )
+    def operate(target: str) -> bool:
+        return bool(target)
+
+    runtime.seal_production()
+    original_pipeline = runtime.pipeline
+    original_store = runtime.idempotency_store
+    original_provider = runtime.identity_provider
+    original_profile = runtime.production_profile
+
+    with pytest.raises(RuntimeError, match="sealed for production"):
+        runtime.pipeline = []
+    with pytest.raises(RuntimeError, match="sealed for production"):
+        runtime.idempotency_store = InMemoryIdempotencyStore()
+    with pytest.raises(RuntimeError, match="sealed for production"):
+        runtime.identity_provider = None
+    with pytest.raises(RuntimeError, match="sealed for production"):
+        runtime.require_verified_identity = False
+    with pytest.raises(RuntimeError, match="sealed for production"):
+        runtime.production_profile = None
+
+    assert runtime.pipeline is original_pipeline
+    assert runtime.idempotency_store is original_store
+    assert runtime.identity_provider is original_provider
+    assert runtime.require_verified_identity is True
+    assert runtime.production_profile is original_profile
+    assert runtime.production_sealed is True
+
+
+def test_unsealed_strict_runtime_allows_component_configuration(tmp_path) -> None:
+    runtime = _ready_runtime(tmp_path)
+
+    runtime.identity_provider = StaticIdentityProvider(_principal())
+    runtime.require_verified_identity = True
+    runtime.idempotency_store = SQLiteIdempotencyStore(
+        tmp_path / "idempotency-2.db"
+    )
+
+    report = runtime.seal_production()
+    assert report.ready is True
+
+
+def test_assigning_production_profile_re_arms_fail_closed_gate() -> None:
+    runtime = Runtime()
+
+    @runtime.tool()
+    def operate() -> bool:
+        return True
+
+    runtime.production_profile = strict_profile()
+
+    assert runtime.production_sealed is False
+    with pytest.raises(ProductionReadinessError):
+        runtime.invoke("operate")
+
+
+async def test_strict_runtime_rejects_preview_until_sealed(tmp_path) -> None:
+    runtime = _ready_runtime(tmp_path)
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.MUTATING,
+        action_contract=contract(),
+    )
+    def operate(target: str) -> bool:
+        return bool(target)
+
+    with pytest.raises(ProductionReadinessError, match="not sealed"):
+        await runtime.apreview("operate", "node-a")
+
+    runtime.seal_production()
+    context = await runtime.apreview(
+        "operate", "node-a", _governance=InvocationOptions()
+    )
+    assert context.denied is False
+
+
+async def test_strict_runtime_rejects_replay_until_sealed(tmp_path) -> None:
+    runtime = _ready_runtime(tmp_path)
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.MUTATING,
+        action_contract=contract(),
+    )
+    def operate(target: str) -> bool:
+        return bool(target)
+
+    recorded = ExecutionContext.create(ToolCall("operate", ("node-a",)))
+
+    with pytest.raises(ProductionReadinessError, match="not sealed"):
+        await runtime.areplay(recorded)
+
+    runtime.seal_production()
+    replayed = await runtime.areplay(recorded)
+    assert replayed.trace_id == recorded.trace_id
+
+
+def test_identity_replay_durability_applies_to_third_party_providers(
+    tmp_path,
+) -> None:
+    class ThirdPartyProvider:
+        production_trusted = True
+
+        def __init__(self) -> None:
+            self.replay_store = object()
+
+        def verify(self, claims=None):
+            return _principal()
+
+    provider = ThirdPartyProvider()
+    runtime = Runtime(
+        [
+            AuditMiddleware(
+                JSONLAuditSink(tmp_path / "audit.jsonl", sign_key=b"a" * 32),
+                fail_closed=True,
+            )
+        ],
+        idempotency_store=SQLiteIdempotencyStore(tmp_path / "idempotency.db"),
+        identity_provider=provider,
+        require_verified_identity=True,
+        production_profile=strict_profile(),
+    )
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.MUTATING,
+        action_contract=contract(),
+    )
+    def operate(target: str) -> bool:
+        return bool(target)
+
+    assert runtime.production_readiness().runtime_reasons == (
+        ProductionReadinessReason.IDENTITY_REPLAY_DURABLE_REQUIRED,
+    )
+
+    provider.replay_store = SQLiteIdentityReplayStore(tmp_path / "replay.db")
+    assert runtime.production_readiness().runtime_reasons == ()
 
 
 def _principal() -> VerifiedPrincipal:
