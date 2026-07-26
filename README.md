@@ -16,7 +16,7 @@ network timeout and charges a customer twice. A reviewer approves one tool
 call, and something different executes because arguments or governance state
 changed between approval and execution. Agent Runtime Governance is an
 embeddable, framework-agnostic Python runtime that closes both gaps at the
-commit boundary - the moment a proposed tool call is about to touch the real
+final execution boundary - the moment a proposed tool call is about to touch the real
 world within the configured storage guarantees. It runs inside the agent stack
 you already use rather than replacing it. The default in-memory idempotency
 store has bounded TTL/LRU retention and does not survive restarts; longer-lived
@@ -43,7 +43,7 @@ boundary. These claims are covered before release:
 | Approval and idempotency consume `action_digest`; v0.5 records remain readable but cannot authorize or satisfy a contracted v0.6 action | [`test_approval_is_bound_to_action_digest`](tests/test_bound_action_runtime.py), [`test_v05_approval_fails_closed_for_contracted_tool`](tests/test_bound_action_runtime.py), [`test_v05_compatibility.py`](tests/test_v05_compatibility.py) |
 | Success and terminal exception/timeout/cancellation paths retain the same action identity | [`test_exact_bound_snapshot_reaches_tool_and_audit`](tests/test_bound_action_runtime.py), [`test_exception_and_timeout_keep_bound_action_in_audit`](tests/test_bound_action_runtime.py), [`test_cancellation_keeps_bound_action_in_audit`](tests/test_bound_action_runtime.py) |
 | Audit evidence carries the action identity without duplicating raw parameters, and OpenTelemetry exports the same contract/action attributes | [`test_audit_bound_action_never_duplicates_raw_parameters`](tests/test_bound_action_runtime.py), [`test_opentelemetry_exports_bound_action_identity`](tests/test_audit_otel_hardening.py) |
-| At 1,000 requests and concurrency 100 on the recorded Windows/Python 3.12 host, the median of three alternating paired runs measured action bind plus verification at 1.940x mean, 2.232x p95, 2.337x p99, and 0.996x peak traced memory versus its strict baseline | [`v0.6.0-rc-windows-python312.json`](benchmarks/results/v0.6.0-rc-windows-python312.json), [`v0.6.0 budget`](benchmarks/budgets/v0.6.0.json) |
+| At 1,000 requests and concurrency 100 on the recorded Windows/Python 3.12 host, the median of three alternating paired runs measured action bind plus verification at 1.768x mean, 1.853x p95, 1.856x p99, and 1.007x peak traced memory versus its strict baseline | [`v0.6.0-rc-windows-python312.json`](benchmarks/results/v0.6.0-rc-windows-python312.json), [`v0.6.0 budget`](benchmarks/budgets/v0.6.0.json) |
 
 The v0.7-v1.0 direction adds deterministic reconciliation for `UNKNOWN`
 outcomes and portable evidence. The staged plan and its exit criteria are in
@@ -110,7 +110,7 @@ delete_file(
 
 Human approval, policy interception, audit, retries, and telemetry are
 industry baseline; this project does not claim to have invented them. The
-narrow claim is the commit boundary. Rows cite each project's own public
+narrow claim is the governed execution boundary. Rows cite each project's own public
 documentation and describe scope, not quality.
 
 | Alternative | What it provides | Where this project is narrower and deeper |

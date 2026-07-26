@@ -48,6 +48,11 @@ All notable changes are documented here.
 - `Runtime.apreview` and `Runtime.areplay` enforce the same fail-closed
   sealing gate as `Runtime.arun`, so governance previews and replays cannot
   run middleware before a strict runtime is sealed.
+- Policy middleware identities are validated at construction, and strict
+  production sealing rejects policy middleware configured to fail open.
+- Non-authoritative replay preserves caller correlation metadata, removes
+  governance metadata, and returns a stable denial for invalid recorded
+  parameters instead of leaking parser or contract exceptions.
 - Identity replay-store durability validation now applies to any identity
   provider exposing a `replay_store`, not just the built-in HMAC provider.
 - Contracted approvals now bind `action_digest`; v0.5 approvals remain readable
@@ -68,6 +73,11 @@ All notable changes are documented here.
 - Deterministic replay is explicitly non-authoritative and no longer mints a
   `BoundAction` from persisted identity fields; current binding requires the
   trusted identity path through `apreview()`.
+- Contract binding providers are queried at admission and once at the final
+  executor boundary; the redundant intermediate revalidation call was removed
+  without weakening the final TOCTOU check.
+- Benchmark collection and release-budget evaluation reject invalid repetition
+  counts, missing pairs, non-finite values, negative values, and invalid limits.
 
 ## [0.5.1] - 2026-07-26
 

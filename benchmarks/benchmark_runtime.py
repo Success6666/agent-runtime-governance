@@ -25,6 +25,7 @@ from agent_runtime_governance.middleware import (
     RuleMiddleware,
 )
 from agent_runtime_governance.plugins.opa import OPAClient, OPAMiddleware
+from agent_runtime_governance.policy import PolicyMiddleware, SimplePolicy
 from agent_runtime_governance.production import ProductionProfile
 from agent_runtime_governance.resilience import RuntimeBulkhead, RuntimeLimits
 from agent_runtime_governance.runtime import Runtime
@@ -145,7 +146,14 @@ def build_scenarios(concurrency: int) -> dict[str, Runtime]:
     )
     for name in ("strict_baseline", "strict_bound_action"):
         scenarios[name] = Runtime(
-            [AuditMiddleware(NullAuditSink(), fail_closed=True)],
+            [
+                PolicyMiddleware(
+                    SimplePolicy(),
+                    version="benchmark-policy-v1",
+                    digest="a" * 64,
+                ),
+                AuditMiddleware(NullAuditSink(), fail_closed=True),
+            ],
             identity_provider=StaticIdentityProvider(principal),
             require_verified_identity=True,
             production_profile=profile,
@@ -269,6 +277,8 @@ async def run_matrix(
     *,
     paired_repetitions: int = 3,
 ) -> list[Measurement]:
+    if paired_repetitions < 1 or paired_repetitions % 2 == 0:
+        raise ValueError("paired_repetitions must be a positive odd integer")
     measurements: list[Measurement] = []
     scenarios = build_scenarios(concurrency)
     try:
