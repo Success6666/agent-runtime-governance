@@ -53,6 +53,9 @@ class AuditSink(Protocol):
 
 
 class InMemoryAuditSink:
+    production_durable = False
+    production_integrity_protected = False
+
     def __init__(self) -> None:
         self.events: list[dict[str, Any]] = []
         self._lock = threading.Lock()
@@ -143,6 +146,8 @@ class _AuditCodec:
 class JSONLAuditSink:
     """Durable, hash-chained JSONL audit sink with cross-process rotation."""
 
+    production_durable = True
+
     def __init__(
         self,
         path: str | Path,
@@ -177,6 +182,10 @@ class JSONLAuditSink:
         )
         self._lock = FileLock(str(self.path) + ".lock", timeout=lock_timeout)
         self._state_path = Path(str(self.path) + ".state")
+
+    @property
+    def production_integrity_protected(self) -> bool:
+        return self._codec.key is not None and len(self._codec.key) >= 32
 
     def write(self, event: Mapping[str, Any]) -> None:
         with self._lock:
@@ -524,6 +533,8 @@ class JSONLAuditSink:
 class SQLiteAuditSink:
     """Transactional audit sink for multi-process production runtimes."""
 
+    production_durable = True
+
     def __init__(
         self,
         path: str | Path,
@@ -548,6 +559,10 @@ class SQLiteAuditSink:
             allow_paths=allow_paths,
         )
         self._initialize()
+
+    @property
+    def production_integrity_protected(self) -> bool:
+        return self._codec.key is not None and len(self._codec.key) >= 32
 
     def write(self, event: Mapping[str, Any]) -> None:
         with self._connect() as connection:

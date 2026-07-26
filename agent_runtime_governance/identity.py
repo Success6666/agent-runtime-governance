@@ -71,6 +71,8 @@ class IdentityProvider(Protocol):
 class StaticIdentityProvider:
     """Returns a pre-verified principal from an already trusted host boundary."""
 
+    production_trusted = True
+
     def __init__(self, principal: VerifiedPrincipal) -> None:
         self._principal = principal
 
@@ -84,6 +86,8 @@ class IdentityReplayStore(Protocol):
 
 class InMemoryIdentityReplayStore:
     """Process-local replay protection for signed identity envelopes."""
+
+    production_durable = False
 
     def __init__(self) -> None:
         self._claims: dict[tuple[str, str], datetime] = {}
@@ -104,6 +108,8 @@ class InMemoryIdentityReplayStore:
 
 class SQLiteIdentityReplayStore:
     """Cross-process replay protection backed by an atomic SQLite insert."""
+
+    production_durable = True
 
     def __init__(self, path: str | Path, *, timeout_seconds: float = 30.0) -> None:
         if timeout_seconds <= 0:
@@ -151,6 +157,8 @@ class SQLiteIdentityReplayStore:
 
 class HMACClaimsIdentityProvider:
     """Verifies short-lived, audience-bound HMAC identity envelopes."""
+
+    production_trusted = True
 
     def __init__(
         self,

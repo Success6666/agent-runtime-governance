@@ -61,6 +61,9 @@ class ApprovalStore(Protocol):
 
 
 class InMemoryApprovalStore:
+    production_durable = False
+    production_integrity_protected = False
+
     def __init__(self) -> None:
         self._items: dict[str, StoredApproval] = {}
         self._lock = threading.RLock()
@@ -205,6 +208,8 @@ class InMemoryApprovalStore:
 class SQLiteApprovalStore:
     """Durable, cross-process approval state with atomic single consumption."""
 
+    production_durable = True
+
     def __init__(
         self,
         path: str | Path,
@@ -223,6 +228,10 @@ class SQLiteApprovalStore:
         )
         self.store_arguments = store_arguments
         self._initialize()
+
+    @property
+    def production_integrity_protected(self) -> bool:
+        return self._sign_key is not None and len(self._sign_key) >= 32
 
     def pending(self, request: ApprovalRequest) -> None:
         with self._connect() as connection:

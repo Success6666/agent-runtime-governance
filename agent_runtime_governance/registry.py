@@ -139,6 +139,8 @@ class InMemoryIdempotencyStore:
     outcomes must survive process restarts or cache eviction.
     """
 
+    production_durable = False
+
     def __init__(
         self,
         *,
@@ -234,6 +236,8 @@ class SQLiteIdempotencyStore:
     automatically re-executed. Operators must reconcile the external side effect
     before deleting or otherwise resolving that record.
     """
+
+    production_durable = True
 
     _IDENTIFIER = re.compile(r"^[A-Za-z0-9._:/-]{1,256}$")
 
