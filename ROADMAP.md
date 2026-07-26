@@ -47,8 +47,9 @@ not an implementation detail.
 - [x] Migration path for v0.5 registrations
 - [x] Property, boundary, compatibility, and performance-regression tests
 
-The release path requires protected CI, CodeRabbit review, Docker smoke,
-package verification, artifact provenance, and PyPI Trusted Publishing.
+The release path requires CI checks enforced by branch protection, CodeRabbit
+review, Docker smoke, package verification, artifact provenance, and PyPI
+Trusted Publishing.
 
 No reconciliation engine, distributed store, or new framework adapter enters
 this release.
