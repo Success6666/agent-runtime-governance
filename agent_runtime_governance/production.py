@@ -7,14 +7,12 @@ from typing import Any, Iterable, Mapping, Protocol
 
 from ._serialization import thaw as _thaw
 from .action_contracts import ActionContract
-from .approval_store import InMemoryApprovalStore
-from .audit import InMemoryAuditSink
 from .context import ExecutionMode
-from .identity import HMACClaimsIdentityProvider, InMemoryIdentityReplayStore
+from .identity import HMACClaimsIdentityProvider
 from .middleware.audit import AuditMiddleware
 from .middleware.decision import DecisionMiddleware
 from .pipeline import Pipeline
-from .registry import InMemoryIdempotencyStore, ToolSpec
+from .registry import ToolSpec
 
 _KEY_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -40,13 +38,16 @@ class ProductionReadinessReason(str, Enum):
     IDENTITY_DIGEST_KEY_PROVIDER_REQUIRED = "identity_digest.key_provider_required"
     IDENTITY_DIGEST_KEY_VERSION_REQUIRED = "identity_digest.key_version_required"
     IDENTITY_PROVIDER_REQUIRED = "identity.provider_required"
+    IDENTITY_PROVIDER_NOT_TRUSTED = "identity.provider_not_trusted"
     VERIFIED_IDENTITY_REQUIRED = "identity.verification_required"
     IDENTITY_REPLAY_DURABLE_REQUIRED = "identity.replay_store_durable_required"
     IDEMPOTENCY_DURABLE_REQUIRED = "idempotency.durable_store_required"
     APPROVAL_MIDDLEWARE_REQUIRED = "approval.middleware_required"
     APPROVAL_STORE_DURABLE_REQUIRED = "approval.durable_store_required"
+    APPROVAL_INTEGRITY_REQUIRED = "approval.integrity_protection_required"
     AUDIT_MIDDLEWARE_REQUIRED = "audit.middleware_required"
     AUDIT_SINK_DURABLE_REQUIRED = "audit.durable_sink_required"
+    AUDIT_INTEGRITY_REQUIRED = "audit.integrity_protection_required"
     AUDIT_FAIL_CLOSED_REQUIRED = "audit.fail_closed_required"
 
 
@@ -149,12 +150,16 @@ class ProductionProfile:
         if side_effecting:
             if identity_provider is None:
                 reasons.append(ProductionReadinessReason.IDENTITY_PROVIDER_REQUIRED)
+            elif not _capability(identity_provider, "production_trusted"):
+                reasons.append(
+                    ProductionReadinessReason.IDENTITY_PROVIDER_NOT_TRUSTED
+                )
             if not require_verified_identity:
                 reasons.append(ProductionReadinessReason.VERIFIED_IDENTITY_REQUIRED)
-            if isinstance(idempotency_store, InMemoryIdempotencyStore):
+            if not _capability(idempotency_store, "production_durable"):
                 reasons.append(ProductionReadinessReason.IDEMPOTENCY_DURABLE_REQUIRED)
-            if isinstance(identity_provider, HMACClaimsIdentityProvider) and isinstance(
-                identity_provider.replay_store, InMemoryIdentityReplayStore
+            if isinstance(identity_provider, HMACClaimsIdentityProvider) and not _capability(
+                identity_provider.replay_store, "production_durable"
             ):
                 reasons.append(
                     ProductionReadinessReason.IDENTITY_REPLAY_DURABLE_REQUIRED
@@ -246,10 +251,14 @@ class ProductionProfile:
         if middleware is None:
             reasons.append(ProductionReadinessReason.APPROVAL_MIDDLEWARE_REQUIRED)
             return
-        if middleware.store is None or isinstance(
-            middleware.store, InMemoryApprovalStore
+        if middleware.store is None or not _capability(
+            middleware.store, "production_durable"
         ):
             reasons.append(ProductionReadinessReason.APPROVAL_STORE_DURABLE_REQUIRED)
+        elif not _capability(
+            middleware.store, "production_integrity_protected"
+        ):
+            reasons.append(ProductionReadinessReason.APPROVAL_INTEGRITY_REQUIRED)
 
     @staticmethod
     def _audit_reasons(
@@ -261,8 +270,12 @@ class ProductionProfile:
         if middleware is None:
             reasons.append(ProductionReadinessReason.AUDIT_MIDDLEWARE_REQUIRED)
             return
-        if isinstance(middleware.sink, InMemoryAuditSink):
+        if not _capability(middleware.sink, "production_durable"):
             reasons.append(ProductionReadinessReason.AUDIT_SINK_DURABLE_REQUIRED)
+        elif not _capability(
+            middleware.sink, "production_integrity_protected"
+        ):
+            reasons.append(ProductionReadinessReason.AUDIT_INTEGRITY_REQUIRED)
         if not middleware.fail_closed:
             reasons.append(ProductionReadinessReason.AUDIT_FAIL_CLOSED_REQUIRED)
 
@@ -280,3 +293,7 @@ class ProductionReadinessError(RuntimeError):
 
 def _schemas_equal(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
     return _thaw(left) == _thaw(right)
+
+
+def _capability(value: Any, name: str) -> bool:
+    return getattr(value, name, False) is True

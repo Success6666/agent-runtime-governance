@@ -5,7 +5,10 @@ import pytest
 from agent_runtime_governance import (
     ActionContract,
     AuditMiddleware,
+    DecisionMiddleware,
     ExecutionMode,
+    HMACClaimsIdentityProvider,
+    InMemoryApprovalStore,
     InMemoryAuditSink,
     InMemoryIdempotencyStore,
     InvocationOptions,
@@ -17,7 +20,9 @@ from agent_runtime_governance import (
     RegistryError,
     Runtime,
     RuntimeBuilder,
+    SQLiteApprovalStore,
     SQLiteIdempotencyStore,
+    SQLiteIdentityReplayStore,
     StaticIdentityProvider,
     VerifiedPrincipal,
 )
@@ -204,7 +209,12 @@ def test_profile_rejects_invalid_key_configuration() -> None:
 def test_strict_runtime_rejects_traffic_until_sealed(tmp_path) -> None:
     calls: list[str] = []
     runtime = Runtime(
-        [AuditMiddleware(JSONLAuditSink(tmp_path / "audit.jsonl"), fail_closed=True)],
+        [
+            AuditMiddleware(
+                JSONLAuditSink(tmp_path / "audit.jsonl", sign_key=b"a" * 32),
+                fail_closed=True,
+            )
+        ],
         idempotency_store=SQLiteIdempotencyStore(tmp_path / "idempotency.db"),
         identity_provider=StaticIdentityProvider(_principal()),
         require_verified_identity=True,
@@ -310,9 +320,12 @@ def test_builder_propagates_strict_profile(tmp_path) -> None:
 
 
 def test_in_memory_audit_is_rejected_even_when_fail_closed() -> None:
+    class DurableStore:
+        production_durable = True
+
     runtime = Runtime(
         [AuditMiddleware(InMemoryAuditSink(), fail_closed=True)],
-        idempotency_store=object(),  # type: ignore[arg-type]
+        idempotency_store=DurableStore(),  # type: ignore[arg-type]
         identity_provider=StaticIdentityProvider(_principal()),
         require_verified_identity=True,
         production_profile=strict_profile(),
@@ -331,6 +344,183 @@ def test_in_memory_audit_is_rejected_even_when_fail_closed() -> None:
     )
 
 
+def test_unsigned_audit_sink_is_rejected(tmp_path) -> None:
+    runtime = Runtime(
+        [AuditMiddleware(JSONLAuditSink(tmp_path / "audit.jsonl"), fail_closed=True)],
+        idempotency_store=SQLiteIdempotencyStore(tmp_path / "idempotency.db"),
+        identity_provider=StaticIdentityProvider(_principal()),
+        require_verified_identity=True,
+        production_profile=strict_profile(),
+    )
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.MUTATING,
+        action_contract=contract(),
+    )
+    def operate(target: str) -> bool:
+        return bool(target)
+
+    assert runtime.production_readiness().runtime_reasons == (
+        ProductionReadinessReason.AUDIT_INTEGRITY_REQUIRED,
+    )
+
+
+@pytest.mark.parametrize(
+    ("middleware", "reason"),
+    [
+        (None, ProductionReadinessReason.APPROVAL_MIDDLEWARE_REQUIRED),
+        (
+            DecisionMiddleware(store=InMemoryApprovalStore()),
+            ProductionReadinessReason.APPROVAL_STORE_DURABLE_REQUIRED,
+        ),
+    ],
+)
+def test_approval_requires_durable_middleware(tmp_path, middleware, reason) -> None:
+    middlewares = [
+        AuditMiddleware(
+            JSONLAuditSink(tmp_path / "audit.jsonl", sign_key=b"a" * 32),
+            fail_closed=True,
+        )
+    ]
+    if middleware is not None:
+        middlewares.insert(0, middleware)
+    runtime = Runtime(
+        middlewares,
+        idempotency_store=SQLiteIdempotencyStore(tmp_path / "idempotency.db"),
+        identity_provider=StaticIdentityProvider(_principal()),
+        require_verified_identity=True,
+        production_profile=strict_profile(),
+    )
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.MUTATING,
+        requires_approval=True,
+        action_contract=contract(),
+    )
+    def operate(target: str) -> bool:
+        return bool(target)
+
+    assert reason in runtime.production_readiness().runtime_reasons
+
+
+def test_unsigned_durable_approval_store_is_rejected(tmp_path) -> None:
+    runtime = Runtime(
+        [
+            DecisionMiddleware(store=SQLiteApprovalStore(tmp_path / "approvals.db")),
+            AuditMiddleware(
+                JSONLAuditSink(tmp_path / "audit.jsonl", sign_key=b"a" * 32),
+                fail_closed=True,
+            ),
+        ],
+        idempotency_store=SQLiteIdempotencyStore(tmp_path / "idempotency.db"),
+        identity_provider=StaticIdentityProvider(_principal()),
+        require_verified_identity=True,
+        production_profile=strict_profile(),
+    )
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.MUTATING,
+        requires_approval=True,
+        action_contract=contract(),
+    )
+    def operate(target: str) -> bool:
+        return bool(target)
+
+    assert runtime.production_readiness().runtime_reasons == (
+        ProductionReadinessReason.APPROVAL_INTEGRITY_REQUIRED,
+    )
+
+
+def test_signed_durable_approval_store_is_ready(tmp_path) -> None:
+    runtime = Runtime(
+        [
+            DecisionMiddleware(
+                store=SQLiteApprovalStore(
+                    tmp_path / "approvals.db", sign_key=b"p" * 32
+                )
+            ),
+            AuditMiddleware(
+                JSONLAuditSink(tmp_path / "audit.jsonl", sign_key=b"a" * 32),
+                fail_closed=True,
+            ),
+        ],
+        idempotency_store=SQLiteIdempotencyStore(tmp_path / "idempotency.db"),
+        identity_provider=StaticIdentityProvider(_principal()),
+        require_verified_identity=True,
+        production_profile=strict_profile(),
+    )
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.MUTATING,
+        requires_approval=True,
+        action_contract=contract(),
+    )
+    def operate(target: str) -> bool:
+        return bool(target)
+
+    assert runtime.seal_production().ready is True
+
+
+def test_non_fail_closed_audit_is_rejected(tmp_path) -> None:
+    runtime = Runtime(
+        [
+            AuditMiddleware(
+                JSONLAuditSink(tmp_path / "audit.jsonl", sign_key=b"a" * 32),
+                fail_closed=False,
+            )
+        ],
+        idempotency_store=SQLiteIdempotencyStore(tmp_path / "idempotency.db"),
+        identity_provider=StaticIdentityProvider(_principal()),
+        require_verified_identity=True,
+        production_profile=strict_profile(),
+    )
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.MUTATING,
+        action_contract=contract(),
+    )
+    def operate(target: str) -> bool:
+        return bool(target)
+
+    assert runtime.production_readiness().runtime_reasons == (
+        ProductionReadinessReason.AUDIT_FAIL_CLOSED_REQUIRED,
+    )
+
+
+def test_hmac_identity_requires_durable_replay_store(tmp_path) -> None:
+    provider = HMACClaimsIdentityProvider(
+        b"i" * 32,
+        expected_issuer="gateway",
+        expected_audience="runtime",
+    )
+    runtime = Runtime(
+        [
+            AuditMiddleware(
+                JSONLAuditSink(tmp_path / "audit.jsonl", sign_key=b"a" * 32),
+                fail_closed=True,
+            )
+        ],
+        idempotency_store=SQLiteIdempotencyStore(tmp_path / "idempotency.db"),
+        identity_provider=provider,
+        require_verified_identity=True,
+        production_profile=strict_profile(),
+    )
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.MUTATING,
+        action_contract=contract(),
+    )
+    def operate(target: str) -> bool:
+        return bool(target)
+
+    assert runtime.production_readiness().runtime_reasons == (
+        ProductionReadinessReason.IDENTITY_REPLAY_DURABLE_REQUIRED,
+    )
+
+    provider.replay_store = SQLiteIdentityReplayStore(tmp_path / "replay.db")
+    assert runtime.production_readiness().runtime_reasons == ()
+
+
 def _principal() -> VerifiedPrincipal:
     return VerifiedPrincipal(
         issuer="trusted-gateway",
@@ -342,7 +532,12 @@ def _principal() -> VerifiedPrincipal:
 
 def _ready_runtime(tmp_path) -> Runtime:
     return Runtime(
-        [AuditMiddleware(JSONLAuditSink(tmp_path / "audit.jsonl"), fail_closed=True)],
+        [
+            AuditMiddleware(
+                JSONLAuditSink(tmp_path / "audit.jsonl", sign_key=b"a" * 32),
+                fail_closed=True,
+            )
+        ],
         idempotency_store=SQLiteIdempotencyStore(tmp_path / "idempotency.db"),
         identity_provider=StaticIdentityProvider(_principal()),
         require_verified_identity=True,
