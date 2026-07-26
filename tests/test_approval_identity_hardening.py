@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -351,6 +352,29 @@ def test_hmac_identity_rejects_replay_and_supports_key_rotation(tmp_path) -> Non
     assert restarted.verify(rotated).subject == "alice"
 
 
+def test_identity_replay_claim_survives_clock_skew_acceptance_window(
+    tmp_path,
+) -> None:
+    now = datetime.now(timezone.utc)
+    claims = identity_claims(
+        iat=(now - timedelta(seconds=30)).timestamp(),
+        nbf=(now - timedelta(seconds=30)).timestamp(),
+        exp=(now - timedelta(seconds=1)).timestamp(),
+    )
+    envelope = HMACClaimsIdentityProvider.sign_claims(claims, HMAC_KEY)
+    provider = HMACClaimsIdentityProvider(
+        HMAC_KEY,
+        expected_issuer="gateway",
+        expected_audience="agent-runtime",
+        clock_skew_seconds=30.0,
+        replay_store=SQLiteIdentityReplayStore(tmp_path / "clock-skew-replay.db"),
+    )
+
+    assert provider.verify(envelope).subject == "alice"
+    with pytest.raises(ValueError, match="already used"):
+        provider.verify(envelope)
+
+
 def test_hmac_identity_enforces_key_and_claim_size_limits() -> None:
     with pytest.raises(ValueError, match="at least 32 bytes"):
         HMACClaimsIdentityProvider(
@@ -425,11 +449,12 @@ def test_sqlite_approval_redacts_secrets_and_detects_tampering(tmp_path) -> None
     assert restored.request.arguments == {}
     assert restored.request.arguments_redacted is True
 
-    with sqlite3.connect(path) as connection:
-        connection.execute(
-            "UPDATE approvals SET status = 'consumed' WHERE request_id = ?",
-            (request.request_id,),
-        )
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute(
+                "UPDATE approvals SET status = 'consumed' WHERE request_id = ?",
+                (request.request_id,),
+            )
     with pytest.raises(ValueError, match="integrity"):
         store.get(request.request_id)
 

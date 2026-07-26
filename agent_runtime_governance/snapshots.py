@@ -551,22 +551,14 @@ class SnapshotMiddleware(ObservingMiddleware):
             return context
         created_at = datetime.now(timezone.utc).isoformat()
         if isinstance(self.store, AtomicSnapshotStore):
-            preliminary = context.append_history(
-                HistoryEntry(
-                    self.name,
-                    "record",
-                    f"recorded {stage} snapshot",
-                    data={"stage": stage},
-                )
-            )
             snapshot = await asyncio.to_thread(
                 self.store.write_context,
                 trace_id=context.trace_id,
                 stage=stage,
-                context=preliminary,
+                context=context,
                 created_at=created_at,
-                policy_version=preliminary.metadata.get("policy_version"),
-                policy_digest=preliminary.metadata.get("policy_digest"),
+                policy_version=context.metadata.get("policy_version"),
+                policy_digest=context.metadata.get("policy_digest"),
             )
             return snapshot.context
         sequence = self._local_sequence(context.trace_id)
@@ -630,8 +622,8 @@ def _context_with_sequence(
     return context.append_history(
         HistoryEntry(
             SnapshotMiddleware.name,
-            "sequence",
-            "snapshot sequence assigned",
+            "record",
+            f"recorded {stage} snapshot",
             data={"stage": stage, "sequence": sequence},
         )
     )
@@ -639,14 +631,22 @@ def _context_with_sequence(
 
 def _snapshot_hash(payload: Mapping[str, Any]) -> str:
     encoded = json.dumps(
-        payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
 def _snapshot_signature(payload: Mapping[str, Any], key: bytes) -> str:
     encoded = json.dumps(
-        payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
     ).encode("utf-8")
     return hmac.new(key, encoded, hashlib.sha256).hexdigest()
 

@@ -461,8 +461,28 @@ class JSONLAuditSink:
             with path.open("r", encoding="utf-8") as stream:
                 for line in stream:
                     if line.strip():
-                        value = json.loads(line)
-                        return value if isinstance(value, dict) else None
+                        try:
+                            value = json.loads(line)
+                        except json.JSONDecodeError as exc:
+                            raise AuditIntegrityError(
+                                f"invalid audit JSON at head of {path.name}"
+                            ) from exc
+                        if not isinstance(value, dict):
+                            raise AuditIntegrityError(
+                                f"audit event at head of {path.name} must be an object"
+                            )
+                        sequence = value.get("sequence")
+                        prev_hash = value.get("prev_hash")
+                        if (
+                            isinstance(sequence, bool)
+                            or not isinstance(sequence, int)
+                            or sequence < 0
+                            or not isinstance(prev_hash, str)
+                        ):
+                            raise AuditIntegrityError(
+                                f"invalid audit anchor at head of {path.name}"
+                            )
+                        return value
         return None
 
     def _segment_paths(self) -> list[Path]:
@@ -654,7 +674,13 @@ def _event_hash(event: Mapping[str, Any]) -> str:
 
 
 def _canonical_json(value: Mapping[str, Any]) -> str:
-    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
 
 
 def redact_sensitive_data(

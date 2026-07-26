@@ -6,7 +6,7 @@ import ssl
 from collections.abc import Callable, Mapping
 from typing import Any
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
 from ..context import ExecutionContext, ExecutionStatus, HistoryEntry
 from ..middleware.base import ObservingMiddleware
@@ -68,13 +68,20 @@ class SlackWebhookNotifier:
                 },
                 method="POST",
             )
-            with urlopen(
-                request, timeout=self.timeout_seconds, context=self.ssl_context
-            ) as response:
+            opener = build_opener(
+                _RejectRedirects(),
+                HTTPSHandler(context=self.ssl_context),
+            )
+            with opener.open(request, timeout=self.timeout_seconds) as response:
                 if not 200 <= response.status < 300:
                     raise RuntimeError(f"Slack webhook returned HTTP {response.status}")
 
         self._circuit_breaker.call(post)
+
+
+class _RejectRedirects(HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        return None
 
 
 class SlackNotificationMiddleware(ObservingMiddleware):
