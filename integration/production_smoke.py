@@ -2,25 +2,35 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import shutil
 import subprocess
 import time
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from urllib.request import Request, urlopen
 
 from prometheus_client import CollectorRegistry, start_http_server
 from prometheus_client.parser import text_string_to_metric_families
 
 from agent_runtime_governance import (
+    ActionContract,
+    AuditMiddleware,
+    ExecutionMode,
     GovernanceDenied,
     InvocationOptions,
+    JSONLAuditSink,
     OPAClient,
     OPAMiddleware,
     OpenTelemetryMiddleware,
+    ProductionProfile,
     PrometheusMiddleware,
     RiskTier,
     Runtime,
+    SQLiteIdempotencyStore,
+    StaticIdentityProvider,
+    VerifiedPrincipal,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,6 +46,13 @@ KIND_NODE_IMAGE = (
     "kindest/node:v1.34.3@"
     "sha256:08497ee19eace7b4b5348db5c6a1591d7752b164530a36f855cb0f2bdcbadd48"
 )
+
+
+class SmokeIdentityDigestKeyProvider:
+    def get_key(self, *, tenant: str, version: str) -> bytes:
+        return hashlib.sha256(
+            f"production-smoke:{version}:{tenant}".encode("utf-8")
+        ).digest()
 
 
 def main() -> None:
@@ -86,24 +103,111 @@ def run_opa_smoke(keep_containers: bool) -> None:
     try:
         run(command)
         wait_http("http://127.0.0.1:8181/health", expected_status=200)
-        runtime = Runtime([
-            OPAMiddleware(
-                OPAClient("http://127.0.0.1:8181", "agents/tools/allow"),
-                fail_closed=True,
+        policy_digest = hashlib.sha256(
+            (policy_dir / "policy.rego").read_bytes()
+        ).hexdigest()
+        with TemporaryDirectory(prefix="arg-v06-opa-") as temporary:
+            state = Path(temporary)
+            allowed, sink = _strict_opa_runtime(
+                state / "allowed",
+                permissions=frozenset({"admin"}),
+                policy_digest=policy_digest,
             )
-        ])
-
-        @runtime.tool(risk=RiskTier.HIGH)
-        def delete_file() -> bool:
-            return True
-
-        assert delete_file(_governance=InvocationOptions(permissions=frozenset({"admin"})))
-        with contextlib.suppress(GovernanceDenied):
-            delete_file(_governance=InvocationOptions(permissions=frozenset()))
-            raise AssertionError("OPA did not deny a non-admin delete_file call")
+            denied, _ = _strict_opa_runtime(
+                state / "denied",
+                permissions=frozenset(),
+                policy_digest=policy_digest,
+            )
+            try:
+                result = allowed.invoke(
+                    "delete_file",
+                    _governance=InvocationOptions(
+                        idempotency_key="opa-smoke-allow-1"
+                    ),
+                )
+                assert result is True
+                event = sink.read_verified()[-1]
+                assert event["contract_id"] == "smoke.delete-file"
+                assert event["action_digest"]
+                with contextlib.suppress(GovernanceDenied):
+                    denied.invoke(
+                        "delete_file",
+                        _governance=InvocationOptions(
+                            idempotency_key="opa-smoke-deny-1"
+                        ),
+                    )
+                    raise AssertionError(
+                        "OPA did not deny a non-admin contracted call"
+                    )
+            finally:
+                allowed.close()
+                denied.close()
     finally:
         if not keep_containers:
             cleanup_container(name)
+
+
+def _strict_opa_runtime(
+    state: Path,
+    *,
+    permissions: frozenset[str],
+    policy_digest: str,
+) -> tuple[Runtime, JSONLAuditSink]:
+    state.mkdir(parents=True, exist_ok=True)
+    policy_version = "production-smoke-policy-v1"
+    sink = JSONLAuditSink(state / "audit.jsonl", sign_key=b"a" * 32)
+    runtime = Runtime(
+        [
+            OPAMiddleware(
+                OPAClient("http://127.0.0.1:8181", "agents/tools/allow"),
+                fail_closed=True,
+                policy_version=policy_version,
+                policy_digest=policy_digest,
+            ),
+            AuditMiddleware(sink, fail_closed=True),
+        ],
+        idempotency_store=SQLiteIdempotencyStore(state / "idempotency.db"),
+        identity_provider=StaticIdentityProvider(
+            VerifiedPrincipal(
+                issuer="production-smoke",
+                subject="smoke-runner",
+                tenant="smoke-tenant",
+                permissions=permissions,
+                source="static",
+            )
+        ),
+        require_verified_identity=True,
+        production_profile=ProductionProfile(
+            identity_digest_key_provider=SmokeIdentityDigestKeyProvider(),
+            identity_digest_key_version="smoke-key-v1",
+            policy_version=policy_version,
+            policy_digest=policy_digest,
+        ),
+    )
+    contract = ActionContract(
+        contract_id="smoke.delete-file",
+        contract_version=1,
+        tool_name="delete_file",
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        parameters_schema={
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+        effect_class="filesystem.delete",
+    )
+
+    @runtime.tool(
+        name="delete_file",
+        risk=RiskTier.HIGH,
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        action_contract=contract,
+    )
+    def delete_file() -> bool:
+        return True
+
+    runtime.seal_production()
+    return runtime, sink
 
 
 def run_otel_smoke(keep_containers: bool) -> None:

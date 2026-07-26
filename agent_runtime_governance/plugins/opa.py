@@ -195,13 +195,27 @@ class OPAPlugin:
     name = "opa"
     version = "1"
 
-    def __init__(self, client: OPAClient, *, fail_closed: bool = True) -> None:
+    def __init__(
+        self,
+        client: OPAClient,
+        *,
+        fail_closed: bool = True,
+        policy_version: str | None = None,
+        policy_digest: str | None = None,
+    ) -> None:
         self.client = client
         self.fail_closed = fail_closed
+        self.policy_version = policy_version
+        self.policy_digest = policy_digest
 
     def register(self, builder: RuntimeBuilder) -> None:
         builder.add_middleware(
-            OPAMiddleware(self.client, fail_closed=self.fail_closed)
+            OPAMiddleware(
+                self.client,
+                fail_closed=self.fail_closed,
+                policy_version=self.policy_version,
+                policy_digest=self.policy_digest,
+            )
         )
         builder.add_service("opa", self.client)
 
