@@ -45,13 +45,20 @@ integrations are JSON based. It is not part of v0.6.
 
 ### Domain and version separation
 
-Every digest is SHA-256 over a complete canonical JSON envelope. Raw strings or
-partially concatenated values are never hashed.
+Contract, parameter, and action digests are SHA-256 over complete canonical JSON
+envelopes. Principal and tenant digests use HMAC-SHA-256 over complete canonical
+JSON envelopes with deployment- or tenant-scoped secret material. Raw strings
+or partially concatenated values are never hashed.
 
 - `arg.action-contract` version 1 binds the public contract fields.
 - `arg.action-parameters` version 1 binds the normalized parameter snapshot.
 - `arg.bound-action` version 1 binds the contract and parameter digests to the
-  verified principal, tenant, policy, and optional precondition.
+  verified principal, tenant, identity-digest key version, policy, and optional
+  precondition.
+- `arg.principal.hmac-sha256.<key-version>` and
+  `arg.tenant.hmac-sha256.<key-version>` bind identity values without exposing a
+  dictionary-attackable unkeyed digest. The caller must provide at least 32
+  bytes of secret material and an explicit rotation version for every bind.
 
 The envelope carries both `domain` and `version`. Digest values are exposed as
 lowercase hexadecimal SHA-256 strings. Any future encoding or field-semantics
@@ -63,18 +70,27 @@ existing digest.
 `ActionContract` and `BoundAction` are frozen value objects. Their nested JSON
 members are detached from caller-owned inputs and recursively frozen. Public
 serialization is an explicitly versioned envelope; deserialization recomputes
-and verifies every digest. Representations omit raw principal and tenant values
-and retain only domain-separated digests. The principal digest jointly binds
-the trusted identity issuer and opaque subject, preventing equal subject values
-from different identity providers from sharing an action identity. Identity
-values are valid Unicode strings so OIDC subjects, email-style identifiers, and
-URI forms are not constrained by tool-name syntax. `repr` also excludes raw
-parameters, and a separate evidence representation excludes parameters
-entirely. The full `to_dict()` form includes the isolated parameters only for
-controlled persistence, migration, and replay readers; audit logs and external
-evidence must use the parameter-free evidence representation. Parameter schema
-failures report only the failed path and constraint; they never include the
-rejected instance value.
+and verifies every non-secret-derived digest. Representations omit raw principal
+and tenant values and retain only keyed, domain-separated HMAC digests. The
+principal digest jointly binds the trusted identity issuer and opaque subject,
+preventing equal subject values from different identity providers from sharing
+an action identity. The HMAC key is an ephemeral binding input: it is never
+retained by `BoundAction`, emitted by `repr`, serialized, or written to evidence.
+Only the non-secret key version is retained and bound into the action digest so
+operators can trace rotations. Cross-process identity is deterministic only
+when both processes possess the same scoped key and key version; rotating either
+intentionally changes the principal, tenant, and action digests. If the scoped
+key is compromised, the digests must be treated as correlation identifiers
+rather than identity confidentiality guarantees.
+
+Identity values are valid Unicode strings so OIDC subjects, email-style
+identifiers, and URI forms are not constrained by tool-name syntax. `repr` also
+excludes raw parameters, and a separate evidence representation excludes
+parameters entirely. The full `to_dict()` form includes the isolated parameters
+only for controlled persistence, migration, and replay readers; audit logs and
+external evidence must use the parameter-free evidence representation.
+Parameter schema failures report only the failed path and constraint; they
+never include the rejected instance value.
 
 An `ActionContract` includes its stable identifier and version, tool name,
 execution mode, parameter schema, effect class, precondition requirements,
@@ -92,8 +108,10 @@ without silently changing v0.5 execution identity.
 
 ## Consequences
 
-- Action identities are deterministic across supported Python processes and
-  interoperable RFC 8785 implementations for accepted inputs.
+- Contract and parameter identities are deterministic across supported Python
+  processes and interoperable RFC 8785 implementations for accepted inputs.
+  Bound action identities additionally require the same scoped HMAC key and key
+  version.
 - Some values accepted by the older internal JSON helper, such as integers
   outside the IEEE-754 safe range and negative zero, are intentionally rejected
   at the new action boundary.
