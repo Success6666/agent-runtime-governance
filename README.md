@@ -7,10 +7,13 @@
 [![PyPI](https://img.shields.io/pypi/v/agent-runtime-governance.svg)](https://pypi.org/project/agent-runtime-governance/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 
-A lightweight, framework-agnostic runtime governance framework for AI agents.
-It governs an immutable `ExecutionContext` through a deterministic middleware
-pipeline, then produces an explicit decision, an auditable execution, and a
-replayable trace.
+Agent Runtime Governance is a lightweight, framework-agnostic Python runtime
+built around an immutable `ExecutionContext` and deterministic middleware.
+v0.5.1 binds approval to the normalized tool call and trusted governance state,
+and marks uncertain in-flight mutations as `UNKNOWN` instead of blindly
+retrying them. The v0.6-v1.0 direction develops that verified baseline into
+Action Commit Safety without presenting planned recovery or evidence features
+as already shipped.
 
 ## Quick start
 
@@ -250,23 +253,28 @@ Production deployments must configure a trusted identity provider with
 stores coordinate processes on one host and require a distributed adapter for
 multi-host deployments.
 
-### v0.5 release verification record
+### v0.5.1 release verification record
 
-The release was validated on 2026-07-26 (UTC) on Windows 11 with Python 3.12,
-Docker Engine 29.4.2, and Kind 0.31.0, and on GitHub-hosted Linux runners:
+The release was validated on 2026-07-26 (UTC) on Windows and GitHub-hosted Linux
+runners:
 
-- 359 tests passed locally with 88.52% branch coverage on Python 3.12;
-- the same 359-test suite passed on Python 3.10, 3.11, 3.12, and 3.13 in GitHub
-  Actions, with 88.63%-88.66% branch coverage; the enforced floor is 80%;
+- 396 tests passed in the release workflow with 88.89% branch coverage; the
+  enforced floor is 80%;
+- the same 396-test suite passed on Python 3.10, 3.11, 3.12, and 3.13 in the
+  pull-request matrix;
 - 15 repository-policy tests passed;
 - real OPA HTTP allow/deny, OTLP HTTP export to an OpenTelemetry Collector,
-  Prometheus scraping, and a Kind 1.34.3 control-plane readiness check passed;
+  and Prometheus HTTP scraping passed in Docker;
 - the wheel and source distribution installed and imported from separate clean
-  virtual environments; and
+  virtual environments;
 - an isolated environment with the OTel, YAML, and Prometheus extras had no
-  known dependency vulnerabilities reported by `pip-audit` 2.10.1 at the time
-  of the run; before publication, the root distribution was reported as
-  unavailable on PyPI and was not treated as an audited third-party dependency.
+  known dependency vulnerabilities reported by `pip-audit` 2.10.1 at release
+  time; and
+- the wheel, source distribution, SPDX SBOM, SHA256 checksums, and GitHub
+  provenance were verified before PyPI Trusted Publishing.
+
+The immutable release, assets, and verification entry point are available at
+[`v0.5.1`](https://github.com/Success6666/agent-runtime-governance/releases/tag/v0.5.1).
 
 These are point-in-time verification results, not a latency SLA or a guarantee
 against future advisories. CI repeats the test matrix, policy checks, dependency
@@ -316,7 +324,9 @@ integration boundaries are documented in [SECURITY.md](SECURITY.md).
 Contributor workflow and plugin contribution rules are documented in
 [CONTRIBUTING.md](CONTRIBUTING.md). Production configuration and recovery are
 covered in [docs/production.md](docs/production.md), and the release procedure
-is defined in [RELEASING.md](RELEASING.md).
+is defined in [RELEASING.md](RELEASING.md). The evidence-backed v0.6-v1.0
+strategy is specified in
+[`docs/production-roadmap.md`](docs/production-roadmap.md).
 
 ## Development
 

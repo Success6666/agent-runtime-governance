@@ -38,5 +38,15 @@ PyPI Trusted Publishing.
 7. Install the published version in a fresh environment and verify
    `agent_runtime_governance.__version__`.
 
+Dispatch from the immutable tag, not from a moving branch:
+
+```bash
+gh workflow run publish-pypi.yml --ref "vX.Y.Z" -f tag="vX.Y.Z"
+```
+
+The workflow rejects a missing, draft, prerelease, or mismatched tag and
+publishes only the package distributions already verified by the release
+workflow.
+
 Do not replace release assets in place. A failed or compromised release is
 yanked and followed by a new patch version.
