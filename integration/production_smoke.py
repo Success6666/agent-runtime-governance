@@ -56,6 +56,7 @@ def main() -> None:
 def run_opa_smoke(keep_containers: bool) -> None:
     name = "arg-v05-opa"
     cleanup_container(name)
+    pull_image(OPA_IMAGE)
     policy_dir = ROOT / "integration" / "opa"
     command = [
         "docker",
@@ -117,6 +118,7 @@ def run_otel_smoke(keep_containers: bool) -> None:
 
     name = "arg-v05-otel"
     cleanup_container(name)
+    pull_image(OTEL_IMAGE)
     config = ROOT / "integration" / "otel" / "collector-config.yaml"
     command = [
         "docker",
@@ -217,6 +219,7 @@ def run_kind_smoke() -> None:
     cluster = "arg-v05-smoke"
     run(["kind", "delete", "cluster", "--name", cluster], check=False)
     try:
+        pull_image(KIND_NODE_IMAGE)
         run([
             "kind",
             "create",
@@ -274,6 +277,31 @@ def cleanup_container(name: str) -> None:
         check=False,
         capture=True,
         timeout=60,
+    )
+
+
+def pull_image(image: str, *, attempts: int = 3) -> None:
+    delay = 2.0
+    last_output = ""
+    for attempt in range(1, attempts + 1):
+        result = run(
+            ["docker", "pull", image],
+            check=False,
+            capture=True,
+            timeout=240,
+        )
+        if result.returncode == 0:
+            return
+        last_output = result.stdout or ""
+        if attempt < attempts:
+            print(
+                f"docker pull failed for {image} "
+                f"(attempt {attempt}/{attempts}); retrying in {delay:.0f}s"
+            )
+            time.sleep(delay)
+            delay *= 2
+    raise RuntimeError(
+        f"docker pull failed after {attempts} attempts for {image}\n{last_output}"
     )
 
 
