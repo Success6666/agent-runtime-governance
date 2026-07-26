@@ -612,6 +612,8 @@ def _validate_request(stored: ApprovalRequest, request: ApprovalRequest) -> Deci
         return denial_for_request(request, "approval request arguments mismatch")
     if stored.policy_version != request.policy_version:
         return denial_for_request(request, "approval request policy mismatch")
+    if stored.policy_digest != request.policy_digest:
+        return denial_for_request(request, "approval request policy digest mismatch")
     if stored.subject != request.subject:
         return denial_for_request(request, "approval request subject mismatch")
     if stored.tenant != request.tenant:

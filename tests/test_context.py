@@ -100,6 +100,12 @@ def test_evolve_returns_new_context() -> None:
     assert updated is not original
 
 
+def test_approval_requirement_is_monotonic() -> None:
+    context = make_context(requires_approval=True)
+    with pytest.raises(ContextMutationError, match="cannot be removed"):
+        context.evolve(requires_approval=False)
+
+
 @pytest.mark.parametrize("value", [-0.1, 1.1])
 def test_risk_score_range_is_validated(value: float) -> None:
     with pytest.raises(ValueError):

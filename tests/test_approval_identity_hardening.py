@@ -11,9 +11,13 @@ import pytest
 
 from agent_runtime_governance import (
     GovernanceDenied,
+    InMemoryMetrics,
     InvocationOptions,
+    MetricsMiddleware,
+    PolicyMiddleware,
     RiskTier,
     Runtime,
+    SimplePolicy,
 )
 from agent_runtime_governance.approval_store import (
     ApprovalStatus,
@@ -49,6 +53,7 @@ def make_request(**changes: object) -> ApprovalRequest:
         "risk_tier": "HIGH",
         "reason": "needs approval",
         "policy_version": "policy-v1",
+        "policy_digest": "digest-v1",
     }
     values.update(changes)
     return ApprovalRequest(**values)  # type: ignore[arg-type]
@@ -96,6 +101,9 @@ def test_decision_binding_rejects_wrong_request_or_arguments() -> None:
     decision = DecisionRecord(DecisionOutcome.ALLOW, "ok", "human").bind_to(request)
     assert decision.request_id == request.request_id
     assert decision.arguments_digest == request.arguments_digest
+    assert decision.risk_tier == request.risk_tier
+    assert decision.policy_version == request.policy_version
+    assert decision.policy_digest == request.policy_digest
 
     with pytest.raises(ValueError, match="request_id mismatch"):
         DecisionRecord(
@@ -267,6 +275,7 @@ def test_decision_middleware_can_consume_preapproved_sqlite_decision(tmp_path) -
         arguments={"args": ["x"], "kwargs": {}},
         risk_tier=context.risk_tier.name,
         policy_version=None,
+        policy_digest=None,
     )
     store.pending(request)
     store.decide(
@@ -340,6 +349,157 @@ def test_caller_metadata_cannot_forge_policy_binding() -> None:
         == "executed"
     )
     assert requests[0].policy_version is None
+    assert requests[0].policy_digest is None
+
+
+def test_before_execute_hook_cannot_invalidate_approval_after_final_check() -> None:
+    calls: list[str] = []
+    runtime = Runtime(
+        [DecisionMiddleware(HumanDecisionProvider(lambda context, request: True))]
+    )
+
+    @runtime.before_tool(critical=True)
+    def revoke_approval(context: ExecutionContext) -> ExecutionContext:
+        return context.evolve(
+            approval_granted=False,
+            approval_request_id=None,
+            approval_decision_id=None,
+        )
+
+    @runtime.tool(risk=RiskTier.HIGH, requires_approval=True)
+    def operate() -> str:
+        calls.append("executed")
+        return "executed"
+
+    with pytest.raises(GovernanceDenied):
+        operate()
+    assert calls == []
+
+
+def test_policy_or_risk_change_after_approval_invalidates_grant() -> None:
+    requests: list[ApprovalRequest] = []
+    calls: list[str] = []
+
+    def approve(context, request):
+        requests.append(request)
+        return True
+
+    runtime = Runtime(
+        [
+            DecisionMiddleware(HumanDecisionProvider(approve)),
+            PolicyMiddleware(
+                SimplePolicy(risk_overrides={"operate": RiskTier.CRITICAL}),
+                version="policy-v2",
+                digest="digest-v2",
+            ),
+        ]
+    )
+
+    @runtime.tool(risk=RiskTier.LOW, requires_approval=True)
+    def operate() -> str:
+        calls.append("executed")
+        return "executed"
+
+    with pytest.raises(GovernanceDenied):
+        operate()
+
+    assert calls == []
+    assert requests[0].risk_tier == RiskTier.LOW.name
+    assert requests[0].policy_version is None
+    assert requests[0].policy_digest is None
+
+
+def test_policy_and_risk_are_bound_when_evaluated_before_approval() -> None:
+    runtime = Runtime(
+        [
+            PolicyMiddleware(
+                SimplePolicy(risk_overrides={"operate": RiskTier.CRITICAL}),
+                version="policy-v2",
+                digest="digest-v2",
+            ),
+            DecisionMiddleware(HumanDecisionProvider(lambda context, request: True)),
+        ]
+    )
+
+    @runtime.tool(risk=RiskTier.LOW, requires_approval=True)
+    def operate() -> str:
+        return "executed"
+
+    result = asyncio.run(runtime.arun("operate"))
+
+    assert result.value == "executed"
+    assert result.context.decision.risk_tier == RiskTier.CRITICAL.name
+    assert result.context.decision.policy_version == "policy-v2"
+    assert result.context.decision.policy_digest == "digest-v2"
+
+
+def test_caller_metadata_cannot_forge_runtime_duration_metrics() -> None:
+    collector = InMemoryMetrics()
+    runtime = Runtime([MetricsMiddleware(collector)])
+
+    @runtime.tool()
+    def operate() -> str:
+        return "executed"
+
+    result = asyncio.run(
+        runtime.arun(
+            "operate",
+            _governance=InvocationOptions(
+                metadata={
+                    "duration_ms": 1_000_000_000,
+                    "DURATION_MS": 1_000_000_000,
+                    "application_label": "billing",
+                }
+            ),
+        )
+    )
+
+    assert result.context.metadata["duration_ms"] < 1_000_000
+    assert "DURATION_MS" not in result.context.metadata
+    assert result.context.metadata["application_label"] == "billing"
+    assert collector.snapshot().total_duration_ms < 1_000_000
+
+
+def test_v050_decision_and_request_positional_signatures_remain_compatible() -> None:
+    issued_at = datetime.now(timezone.utc).isoformat()
+    decision = DecisionRecord(
+        DecisionOutcome.ALLOW,
+        "approved",
+        "human",
+        "decision-v050",
+        "request-v050",
+        "operator",
+        issued_at,
+        None,
+        "operate",
+        "a" * 64,
+        "policy-v1",
+        "alice",
+        "tenant-a",
+        "gateway",
+    )
+    request = ApprovalRequest(
+        "trace-v050",
+        "operate",
+        {},
+        "HIGH",
+        "approval required",
+        "request-v050",
+        issued_at,
+        None,
+        "",
+        "policy-v1",
+        "alice",
+        "tenant-a",
+        "gateway",
+        False,
+    )
+
+    assert decision.identity_issuer == "gateway"
+    assert decision.risk_tier is None
+    assert decision.policy_digest is None
+    assert request.arguments_redacted is False
+    assert request.policy_digest is None
 
 
 def test_runtime_rejects_approval_bound_to_wrong_identity_issuer() -> None:

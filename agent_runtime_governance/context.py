@@ -205,6 +205,8 @@ class ExecutionContext:
         if forbidden:
             names = ", ".join(sorted(forbidden))
             raise ContextMutationError(f"immutable context fields cannot change: {names}")
+        if self.requires_approval and changes.get("requires_approval") is False:
+            raise ContextMutationError("an approval requirement cannot be removed")
         if self.denied:
             next_status = changes.get("status", self.status)
             next_decision = changes.get("decision", self.decision)

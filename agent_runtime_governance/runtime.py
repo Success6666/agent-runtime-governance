@@ -68,6 +68,7 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 _GOVERNANCE_METADATA_PREFIXES = ("approval_", "identity_", "policy_")
+_RUNTIME_METADATA_KEYS = frozenset({"duration_ms"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -342,6 +343,7 @@ class Runtime:
             context = await self._emit_hook(
                 HookPoint.BEFORE_EXECUTE, context, allow_critical=True
             )
+            context = self._enforce_required_approval(context)
             if context.denied:
                 context = await self._release_approvals(context)
                 context = await self._run_observers(context, post=True)
@@ -393,6 +395,7 @@ class Runtime:
                     value = self._normalize_result(spec, value)
                     self._enforce_size_limit("result", value, spec.max_result_bytes)
                     context = await self._commit_approvals(context)
+                    context = self._enforce_required_approval(context)
                     if context.denied:
                         context = await self._run_observers(context, post=True)
                         raise GovernanceDenied(context)
@@ -413,6 +416,7 @@ class Runtime:
                     context = await self._run_observers(context, post=True)
                     return RunResult(value=value, context=context)
                 context = await self._commit_approvals(context)
+                context = self._enforce_required_approval(context)
                 if context.denied:
                     denial = GovernanceDenied(context)
                     await self._finish_idempotency(claim, context, denial)
@@ -422,6 +426,7 @@ class Runtime:
                 heartbeat_task = self._start_idempotency_heartbeat(claim)
             else:
                 context = await self._commit_approvals(context)
+                context = self._enforce_required_approval(context)
                 if context.denied:
                     context = await self._run_observers(context, post=True)
                     raise GovernanceDenied(context)
@@ -1407,6 +1412,13 @@ class Runtime:
             or context.approval_decision_id != decision.decision_id
             or decision.request_id != context.request_id
             or decision.tool_name != context.tool_call.name
+            or decision.risk_tier != context.risk_tier.name
+            or decision.policy_version != _metadata_text(
+                context.metadata, "policy_version"
+            )
+            or decision.policy_digest != _metadata_text(
+                context.metadata, "policy_digest"
+            )
             or decision.subject != context.user
             or decision.tenant != context.tenant
             or decision.identity_issuer != expected_identity_issuer
@@ -1677,8 +1689,16 @@ def _caller_metadata(value: Mapping[str, Any] | None) -> dict[str, Any]:
         key: item
         for key, item in (value or {}).items()
         if not isinstance(key, str)
-        or not key.lower().startswith(_GOVERNANCE_METADATA_PREFIXES)
+        or (
+            key.lower() not in _RUNTIME_METADATA_KEYS
+            and not key.lower().startswith(_GOVERNANCE_METADATA_PREFIXES)
+        )
     }
+
+
+def _metadata_text(metadata: Mapping[str, Any], key: str) -> str | None:
+    value = metadata.get(key)
+    return None if value is None else str(value)
 
 
 Harness = Runtime
