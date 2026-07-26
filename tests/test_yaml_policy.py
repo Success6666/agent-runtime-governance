@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 
 from agent_runtime_governance import (
@@ -48,7 +50,27 @@ policies:
     risk: high
     approval: required
 """
-    assert YAMLPolicyLoader.loads(reversed_entries).digest == first.digest
+    reversed_document = YAMLPolicyLoader.loads(reversed_entries)
+    assert reversed_document.digest == first.digest
+    assert reversed_document.artifact_digest != first.artifact_digest
+
+
+def test_policy_artifact_digest_covers_exact_loaded_bytes(tmp_path) -> None:
+    artifact = tmp_path / "policy.yaml"
+    payload = VALID_POLICY.replace("\n", "\r\n").encode("utf-8")
+    artifact.write_bytes(payload)
+
+    document = YAMLPolicyLoader.load(artifact)
+
+    assert document.artifact_digest == hashlib.sha256(payload).hexdigest()
+    assert document.artifact_middleware().action_policy_identity() == (
+        "1",
+        document.artifact_digest,
+    )
+    assert document.middleware().action_policy_identity() == (
+        "1",
+        document.digest,
+    )
 
 
 def test_duplicate_tool_policy_is_rejected() -> None:

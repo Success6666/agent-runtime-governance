@@ -19,10 +19,20 @@ class PolicyDocument:
     version: str
     digest: str
     policy: SimplePolicy
+    artifact_digest: str | None = None
 
     def middleware(self) -> PolicyMiddleware:
+        """Build a compatibility middleware using the normalized semantic digest."""
         return PolicyMiddleware(
             self.policy, version=self.version, digest=self.digest
+        )
+
+    def artifact_middleware(self) -> PolicyMiddleware:
+        """Build strict middleware bound to the exact loaded artifact bytes."""
+        if self.artifact_digest is None:
+            raise ValueError("policy artifact digest is unavailable")
+        return PolicyMiddleware(
+            self.policy, version=self.version, digest=self.artifact_digest
         )
 
 
@@ -42,10 +52,24 @@ class YAMLPolicyLoader:
     @classmethod
     def load(cls, source: str | Path) -> PolicyDocument:
         path = Path(source)
-        return cls.loads(path.read_text(encoding="utf-8"))
+        artifact = path.read_bytes()
+        try:
+            text = artifact.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise PolicyValidationError("policy artifact must be UTF-8") from exc
+        return cls._loads(text, artifact_digest=hashlib.sha256(artifact).hexdigest())
 
     @classmethod
     def loads(cls, text: str) -> PolicyDocument:
+        if not isinstance(text, str):
+            raise TypeError("policy text must be a string")
+        return cls._loads(
+            text,
+            artifact_digest=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        )
+
+    @classmethod
+    def _loads(cls, text: str, *, artifact_digest: str) -> PolicyDocument:
         try:
             import yaml
         except ImportError as exc:
@@ -56,10 +80,10 @@ class YAMLPolicyLoader:
             data = yaml.safe_load(text)
         except yaml.YAMLError as exc:
             raise PolicyValidationError(f"invalid YAML: {exc}") from exc
-        return cls._parse(data)
+        return cls._parse(data, artifact_digest=artifact_digest)
 
     @classmethod
-    def _parse(cls, data: Any) -> PolicyDocument:
+    def _parse(cls, data: Any, *, artifact_digest: str) -> PolicyDocument:
         root = cls._mapping(data, "policy document")
         cls._reject_unknown(root, cls.ROOT_KEYS, "policy document")
         version = root.get("version")
@@ -146,6 +170,7 @@ class YAMLPolicyLoader:
                 required_permissions=required,
                 risk_overrides=risks,
             ),
+            artifact_digest=artifact_digest,
         )
 
     @staticmethod
