@@ -40,6 +40,8 @@ class DecisionRecord:
     subject: str | None = None
     tenant: str | None = None
     identity_issuer: str | None = None
+    risk_tier: str | None = None
+    policy_digest: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.outcome, DecisionOutcome):
@@ -50,7 +52,9 @@ class DecisionRecord:
         _validate_identifier("source", self.source)
         _validate_optional_identifier("approver", self.approver)
         _validate_optional_identifier("tool_name", self.tool_name)
+        _validate_optional_risk_tier(self.risk_tier)
         _validate_optional_identifier("policy_version", self.policy_version)
+        _validate_optional_identifier("policy_digest", self.policy_digest)
         _validate_optional_identifier("subject", self.subject)
         _validate_optional_identifier("tenant", self.tenant)
         _validate_optional_identifier("identity_issuer", self.identity_issuer)
@@ -75,7 +79,9 @@ class DecisionRecord:
         _reject_mismatch(
             "arguments_digest", self.arguments_digest, request.arguments_digest
         )
+        _reject_mismatch("risk_tier", self.risk_tier, request.risk_tier)
         _reject_mismatch("policy_version", self.policy_version, request.policy_version)
+        _reject_mismatch("policy_digest", self.policy_digest, request.policy_digest)
         _reject_mismatch("subject", self.subject, request.subject)
         _reject_mismatch("tenant", self.tenant, request.tenant)
         _reject_mismatch(
@@ -102,7 +108,9 @@ class DecisionRecord:
             ),
             tool_name=request.tool_name,
             arguments_digest=request.arguments_digest,
+            risk_tier=request.risk_tier,
             policy_version=request.policy_version,
+            policy_digest=request.policy_digest,
             subject=request.subject,
             tenant=request.tenant,
             identity_issuer=request.identity_issuer,
@@ -132,7 +140,9 @@ class DecisionRecord:
             "expires_at": self.expires_at,
             "tool_name": self.tool_name,
             "arguments_digest": self.arguments_digest,
+            "risk_tier": self.risk_tier,
             "policy_version": self.policy_version,
+            "policy_digest": self.policy_digest,
             "subject": self.subject,
             "tenant": self.tenant,
             "identity_issuer": self.identity_issuer,
@@ -151,7 +161,9 @@ class DecisionRecord:
             expires_at=_optional_str(data.get("expires_at")),
             tool_name=_optional_str(data.get("tool_name")),
             arguments_digest=_optional_str(data.get("arguments_digest")),
+            risk_tier=_optional_str(data.get("risk_tier")),
             policy_version=_optional_str(data.get("policy_version")),
+            policy_digest=_optional_str(data.get("policy_digest")),
             subject=_optional_str(data.get("subject")),
             tenant=_optional_str(data.get("tenant")),
             identity_issuer=_optional_str(data.get("identity_issuer")),
@@ -174,6 +186,7 @@ class ApprovalRequest:
     tenant: str | None = None
     identity_issuer: str | None = None
     arguments_redacted: bool = False
+    policy_digest: str | None = None
 
     def __post_init__(self) -> None:
         _validate_identifier("trace_id", self.trace_id)
@@ -183,6 +196,7 @@ class ApprovalRequest:
         if self.risk_tier not in {"LOW", "MEDIUM", "HIGH", "CRITICAL"}:
             raise ValueError("risk_tier must be LOW, MEDIUM, HIGH, or CRITICAL")
         _validate_optional_identifier("policy_version", self.policy_version)
+        _validate_optional_identifier("policy_digest", self.policy_digest)
         _validate_optional_identifier("subject", self.subject)
         _validate_optional_identifier("tenant", self.tenant)
         _validate_optional_identifier("identity_issuer", self.identity_issuer)
@@ -216,6 +230,7 @@ class ApprovalRequest:
             "expires_at": self.expires_at,
             "arguments_digest": self.arguments_digest,
             "policy_version": self.policy_version,
+            "policy_digest": self.policy_digest,
             "subject": self.subject,
             "tenant": self.tenant,
             "identity_issuer": self.identity_issuer,
@@ -235,6 +250,7 @@ class ApprovalRequest:
             expires_at=_optional_str(data.get("expires_at")),
             arguments_digest=str(data.get("arguments_digest") or ""),
             policy_version=_optional_str(data.get("policy_version")),
+            policy_digest=_optional_str(data.get("policy_digest")),
             subject=_optional_str(data.get("subject")),
             tenant=_optional_str(data.get("tenant")),
             identity_issuer=_optional_str(data.get("identity_issuer")),
@@ -338,6 +354,11 @@ def _validate_identifier(name: str, value: str) -> None:
 def _validate_optional_identifier(name: str, value: str | None) -> None:
     if value is not None:
         _validate_identifier(name, value)
+
+
+def _validate_optional_risk_tier(value: str | None) -> None:
+    if value is not None and value not in {"LOW", "MEDIUM", "HIGH", "CRITICAL"}:
+        raise ValueError("risk_tier must be LOW, MEDIUM, HIGH, or CRITICAL")
 
 
 def _validate_text(name: str, value: str, *, maximum: int) -> None:

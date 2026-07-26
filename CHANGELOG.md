@@ -10,8 +10,11 @@ All notable changes are documented here.
   or `policy_` governance state. Reserved prefixes are filtered
   case-insensitively at the runtime trust boundary.
 - Required approvals now execute only when a first-class grant is bound to the
-  current request, allow decision, tool, arguments, subject, tenant, identity
-  issuer, and unexpired decision.
+  current request, allow decision, tool, arguments, risk tier, policy version
+  and digest, subject, tenant, identity issuer, and unexpired decision. The
+  binding is revalidated after pre-execution hooks and approval commit.
+- Runtime-owned duration metadata is isolated from caller metadata so metrics
+  cannot be polluted by forged execution timing values.
 
 ### Changed
 
@@ -19,6 +22,8 @@ All notable changes are documented here.
   decision identifiers. Contexts created by earlier releases remain readable
   and restore as unapproved unless they contain the new bound state.
 - A later deny decision clears any previously granted approval state.
+- Durable approvals issued by `0.5.0` do not contain the new risk and policy
+  digest bindings. They fail closed after upgrade and must be reissued.
 
 ## [0.5.0] - 2026-07-26
 

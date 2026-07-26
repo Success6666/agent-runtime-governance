@@ -74,8 +74,10 @@ class HookRegistry:
                 if value is not None:
                     if not isinstance(value, ExecutionContext):
                         raise TypeError("hook must return ExecutionContext or None")
-                    if value.status is not current.status or value.decision != current.decision:
-                        raise TypeError("hooks cannot change execution status or decisions")
+                    if _protected_state(value) != _protected_state(current):
+                        raise TypeError("hooks cannot change protected execution state")
+                    if _governance_metadata(value) != _governance_metadata(current):
+                        raise TypeError("hooks cannot change governance metadata")
                     current = value
             except Exception as exc:
                 if registration.critical and allow_critical:
@@ -84,3 +86,42 @@ class HookRegistry:
                     HistoryEntry(f"hook:{point.value}", "error", str(exc))
                 )
         return current
+
+
+def _protected_state(context: ExecutionContext) -> tuple[object, ...]:
+    return (
+        context.trace_id,
+        context.span_id,
+        context.parent_span_id,
+        context.request_id,
+        context.task_id,
+        context.conversation_id,
+        context.user,
+        context.tenant,
+        context.permissions,
+        context.tool_call,
+        context.input_text,
+        context.execution_mode,
+        context.idempotency_key,
+        context.deadline,
+        context.risk_tier,
+        context.risk_score,
+        context.requires_approval,
+        context.approval_granted,
+        context.approval_request_id,
+        context.approval_decision_id,
+        context.status,
+        context.decision,
+        context.history,
+        context.result,
+        context.error,
+    )
+
+
+def _governance_metadata(context: ExecutionContext) -> dict[str, object]:
+    return {
+        key: value
+        for key, value in context.metadata.items()
+        if key.lower() == "duration_ms"
+        or key.lower().startswith(("approval_", "identity_", "policy_"))
+    }

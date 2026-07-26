@@ -75,10 +75,8 @@ class DecisionMiddleware(GatingMiddleware):
             risk_tier=context.risk_tier.name,
             reason="tool requires human decision",
             expires_at=self._expires_at(),
-            policy_version=_metadata_text(
-                context, "policy_version"
-            )
-            or _metadata_text(context, "policy_digest"),
+            policy_version=_metadata_text(context, "policy_version"),
+            policy_digest=_metadata_text(context, "policy_digest"),
             subject=context.user,
             tenant=context.tenant,
             identity_issuer=_metadata_text(context, "identity_issuer"),
@@ -146,6 +144,7 @@ class DecisionMiddleware(GatingMiddleware):
                     "decision_id": decision.decision_id,
                     "arguments_digest": request.arguments_digest,
                     "policy_version": request.policy_version,
+                    "policy_digest": request.policy_digest,
                     "approver": decision.approver,
                 },
             )

@@ -5,6 +5,7 @@ import pytest
 from agent_runtime_governance import (
     DecisionOutcome,
     DecisionRecord,
+    ExecutionContext,
     GovernanceDenied,
     HookPoint,
     LLMMiddleware,
@@ -142,6 +143,26 @@ def test_hook_cannot_rewrite_decision() -> None:
         return True
 
     assert work() is True
+
+
+def test_after_pipeline_hook_cannot_remove_required_approval() -> None:
+    runtime = Runtime()
+    calls: list[str] = []
+
+    @runtime.hook(HookPoint.AFTER_PIPELINE)
+    def invalid(context):
+        payload = context.to_dict()
+        payload["requires_approval"] = False
+        return ExecutionContext.from_dict(payload)
+
+    @runtime.tool(requires_approval=True)
+    def work() -> bool:
+        calls.append("executed")
+        return True
+
+    with pytest.raises(GovernanceDenied):
+        work()
+    assert calls == []
 
 
 def test_llm_hooks_wrap_semantic_middleware() -> None:
