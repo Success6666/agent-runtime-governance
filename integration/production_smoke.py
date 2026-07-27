@@ -4,7 +4,8 @@ import argparse
 import asyncio
 import contextlib
 import hashlib
-import json
+import os
+import secrets
 import shutil
 import subprocess
 import time
@@ -20,6 +21,7 @@ from agent_runtime_governance import (
     AuditMiddleware,
     ExecutionMode,
     GovernanceDenied,
+    IdempotencyAlreadyAppliedError,
     InvocationOptions,
     OPAClient,
     OPAMiddleware,
@@ -28,6 +30,7 @@ from agent_runtime_governance import (
     PrometheusMiddleware,
     ProviderDescriptor,
     ReconciliationAttemptContext,
+    ReconciliationDisposition,
     ReconciliationFinding,
     ReconciliationState,
     RiskTier,
@@ -53,6 +56,8 @@ KIND_NODE_IMAGE = (
     "kindest/node:v1.34.3@"
     "sha256:08497ee19eace7b4b5348db5c6a1591d7752b164530a36f855cb0f2bdcbadd48"
 )
+KIND_SMOKE_IMAGE = "agent-runtime-governance-k8s-smoke:local"
+_KIND_IMAGE_PLACEHOLDER = "__ARG_KIND_SMOKE_IMAGE__"
 
 
 class SmokeIdentityDigestKeyProvider:
@@ -118,13 +123,13 @@ def run_opa_smoke(keep_containers: bool) -> None:
         with TemporaryDirectory(prefix="arg-v07-opa-") as temporary:
             state = Path(temporary)
             with contextlib.ExitStack() as stack:
-                allowed, sink = _strict_opa_runtime(
+                allowed, sink, allowed_dispatches = _strict_opa_runtime(
                     state / "allowed",
                     permissions=frozenset({"admin", "reconciliation:probe"}),
                     policy_digest=policy_digest,
                 )
                 stack.callback(allowed.close)
-                denied, _ = _strict_opa_runtime(
+                denied, _, _ = _strict_opa_runtime(
                     state / "denied",
                     permissions=frozenset(),
                     policy_digest=policy_digest,
@@ -157,6 +162,22 @@ def run_opa_smoke(keep_containers: bool) -> None:
                     raise AssertionError("UNKNOWN smoke action unexpectedly completed")
                 head = asyncio.run(allowed.areconcile(execution_record_id))
                 assert head.state is ReconciliationState.CONFIRMED_SUCCEEDED
+                assert head.disposition is ReconciliationDisposition.APPLIED_NO_RESULT
+                try:
+                    allowed.invoke(
+                        "reconcile_unknown",
+                        _governance=InvocationOptions(
+                            idempotency_key="opa-smoke-unknown-1"
+                        ),
+                    )
+                except ToolExecutionError as error:
+                    if not isinstance(error.cause, IdempotencyAlreadyAppliedError):
+                        raise
+                else:
+                    raise AssertionError(
+                        "reconciled no-result action unexpectedly dispatched again"
+                    )
+                assert allowed_dispatches["reconcile_unknown"] == 1
                 try:
                     denied.invoke(
                         "delete_file",
@@ -180,7 +201,7 @@ def _strict_opa_runtime(
     *,
     permissions: frozenset[str],
     policy_digest: str,
-) -> tuple[Runtime, SQLiteAuditSink]:
+) -> tuple[Runtime, SQLiteAuditSink, dict[str, int]]:
     state.mkdir(parents=True, exist_ok=True)
     policy_version = "production-smoke-policy-v1"
     state_path = state / "runtime.db"
@@ -267,6 +288,8 @@ def _strict_opa_runtime(
     def delete_file() -> bool:
         return True
 
+    dispatches = {"reconcile_unknown": 0}
+
     @runtime.tool(
         name="reconcile_unknown",
         risk=RiskTier.HIGH,
@@ -275,10 +298,11 @@ def _strict_opa_runtime(
         reconciliation_provider=provider,
     )
     def reconcile_unknown() -> None:
+        dispatches["reconcile_unknown"] += 1
         raise TimeoutError("production smoke simulates an uncertain side effect")
 
     runtime.seal_production()
-    return runtime, sink
+    return runtime, sink, dispatches
 
 
 def run_otel_smoke(keep_containers: bool) -> None:
@@ -295,6 +319,8 @@ def run_otel_smoke(keep_containers: bool) -> None:
     cleanup_container(name)
     pull_image(OTEL_IMAGE)
     config = ROOT / "integration" / "otel" / "collector-config.yaml"
+    provider = None
+    runtime = None
     command = [
         "docker",
         "run",
@@ -331,16 +357,21 @@ def run_otel_smoke(keep_containers: bool) -> None:
         tracer = provider.get_tracer("arg-production-smoke")
         runtime = Runtime([OpenTelemetryMiddleware(tracer)])
 
-        @runtime.tool()
+        @runtime.tool(name="runtime_otel_probe")
         def observed() -> str:
-            with tracer.start_as_current_span("inside-smoke-tool"):
-                return "ok"
+            return "ok"
 
         assert observed() == "ok"
-        provider.force_flush(5000)
-        provider.shutdown()
-        wait_docker_logs(name, "inside-smoke-tool")
+        if not provider.force_flush(5000):
+            raise AssertionError("OpenTelemetry exporter did not flush the runtime span")
+        wait_docker_logs(name, "tool.runtime_otel_probe")
+        wait_docker_logs(name, "arg.tool.name")
+        wait_docker_logs(name, "runtime_otel_probe")
     finally:
+        if runtime is not None:
+            runtime.close()
+        if provider is not None:
+            provider.shutdown()
         if not keep_containers:
             cleanup_container(name)
 
@@ -391,8 +422,8 @@ def run_prometheus_smoke() -> None:
 def run_kind_smoke() -> None:
     if shutil.which("kind") is None or shutil.which("kubectl") is None:
         raise SystemExit("kind and kubectl are required for the Kubernetes smoke check")
-    cluster = "arg-v07-smoke"
-    run(["kind", "delete", "cluster", "--name", cluster], check=False)
+    cluster, image = kind_smoke_resources()
+    cleanup_kind_cluster(cluster)
     try:
         pull_image(KIND_NODE_IMAGE)
         run([
@@ -406,24 +437,38 @@ def run_kind_smoke() -> None:
             "--wait",
             "120s",
         ], timeout=420)
-        manifest = ROOT / "integration" / "k8s" / "smoke.yaml"
-        run(["kubectl", "apply", "-f", str(manifest)], timeout=60)
-        run(["kubectl", "wait", "--for=condition=Ready", "node", "--all", "--timeout=120s"], timeout=180)
-        out = run([
-            "kubectl",
-            "get",
-            "configmap",
-            "arg-smoke-config",
-            "-n",
-            "arg-smoke",
-            "-o",
-            "json",
-        ], capture=True, timeout=60)
-        data = json.loads(out.stdout)["data"]
-        if data.get("runtime.txt") != "ExecutionContext pipeline smoke":
-            raise AssertionError("Kubernetes smoke ConfigMap content mismatch")
+        build_kind_smoke_image(image=image)
+        run(
+            ["kind", "load", "docker-image", "--name", cluster, image],
+            timeout=180,
+        )
+        with TemporaryDirectory(prefix="arg-v07-kind-manifest-") as temporary:
+            manifest = render_kind_smoke_manifest(Path(temporary), image)
+            run(["kubectl", "apply", "-f", str(manifest)], timeout=60)
+            run(
+                [
+                    "kubectl",
+                    "wait",
+                    "--for=condition=complete",
+                    "job/arg-runtime-smoke",
+                    "-n",
+                    "arg-smoke",
+                    "--timeout=120s",
+                ],
+                timeout=180,
+            )
+            out = run([
+                "kubectl",
+                "logs",
+                "job/arg-runtime-smoke",
+                "-n",
+                "arg-smoke",
+            ], capture=True, timeout=60)
+            if "kubernetes runtime smoke passed" not in (out.stdout or ""):
+                raise AssertionError("Kubernetes Job did not run the SDK smoke program")
     finally:
-        run(["kind", "delete", "cluster", "--name", cluster], check=False, timeout=180)
+        cleanup_kind_cluster(cluster)
+        run(["docker", "image", "rm", "--force", image], check=False, timeout=60)
 
 
 def require(binary: str) -> None:
@@ -487,6 +532,138 @@ def pull_image(image: str, *, attempts: int = 3) -> None:
     raise RuntimeError(
         f"docker pull failed after {attempts} attempts for {image}\n{last_output}"
     )
+
+
+def kind_smoke_resources() -> tuple[str, str]:
+    """Allocate exact, process-scoped Docker resources for one Kind smoke run."""
+
+    suffix = f"{os.getpid()}-{secrets.token_hex(8)}"
+    return (
+        f"arg-v07-smoke-{suffix}",
+        f"agent-runtime-governance-k8s-smoke-{suffix}:local",
+    )
+
+
+def render_kind_smoke_manifest(directory: Path, image: str) -> Path:
+    """Render the run-scoped image tag into the checked-in hardened Job template."""
+
+    template = ROOT / "integration" / "k8s" / "smoke.yaml"
+    content = template.read_text(encoding="utf-8")
+    if content.count(_KIND_IMAGE_PLACEHOLDER) != 1:
+        raise RuntimeError("Kind smoke manifest must contain exactly one image placeholder")
+    rendered = directory / "smoke.yaml"
+    rendered.write_text(
+        content.replace(_KIND_IMAGE_PLACEHOLDER, image),
+        encoding="utf-8",
+    )
+    return rendered
+
+
+def build_kind_smoke_image(
+    *,
+    image: str = KIND_SMOKE_IMAGE,
+    attempts: int = 3,
+) -> None:
+    """Build the local Kind image with bounded, cache-busting retries.
+
+    A failed Docker build is never treated as success. A retry bypasses
+    BuildKit layer cache so transient dependency-download or build-isolation
+    failures are re-evaluated from a clean image build. Artifact hash pinning
+    is deliberately not claimed here: that requires a separately maintained
+    hash-locked constraints file.
+    """
+
+    base_command = [
+        "docker",
+        "build",
+        "--tag",
+        image,
+        "--file",
+        str(ROOT / "integration" / "k8s" / "Dockerfile"),
+        str(ROOT),
+    ]
+    delay = 2.0
+    last_output = ""
+    for attempt in range(1, attempts + 1):
+        command = [
+            *base_command[:2],
+            *(["--no-cache"] if attempt > 1 else []),
+            *base_command[2:],
+        ]
+        try:
+            result = run(command, check=False, capture=True, timeout=420)
+        except subprocess.TimeoutExpired as exc:
+            output = exc.output if exc.output is not None else ""
+            if isinstance(output, bytes):
+                output = output.decode("utf-8", errors="replace")
+            last_output = output
+            failure = f"timed out after {exc.timeout:.0f}s"
+        else:
+            if result.returncode == 0:
+                return
+            last_output = result.stdout or ""
+            failure = f"exit code {result.returncode}"
+        run(
+            ["docker", "image", "rm", "--force", image],
+            check=False,
+            capture=True,
+            timeout=60,
+        )
+        if attempt < attempts:
+            print(
+                f"docker build failed for {image} ({failure}; "
+                f"attempt {attempt}/{attempts}); retrying in {delay:.0f}s"
+            )
+            time.sleep(delay)
+            delay *= 2
+    raise RuntimeError(
+        f"docker build failed after {attempts} attempts for {image}\n"
+        f"{last_output}"
+    )
+
+
+def cleanup_kind_cluster(cluster: str) -> None:
+    """Delete the exact smoke cluster and verify its control-plane is gone."""
+
+    run(
+        ["kind", "delete", "cluster", "--name", cluster],
+        check=False,
+        capture=True,
+        timeout=180,
+    )
+    container = f"{cluster}-control-plane"
+    deadline = time.monotonic() + 60.0
+    while time.monotonic() < deadline:
+        clusters = run(["kind", "get", "clusters"], check=False, capture=True, timeout=30)
+        node = run(
+            ["docker", "container", "inspect", container],
+            check=False,
+            capture=True,
+            timeout=30,
+        )
+        remaining_clusters = set((clusters.stdout or "").splitlines())
+        if cluster not in remaining_clusters and node.returncode != 0:
+            return
+        time.sleep(0.5)
+
+    # `kind delete` occasionally returns before Docker Desktop has finished
+    # removing a control-plane that died during kubeadm. This exact name is
+    # owned by this smoke test, so force-removal is bounded and safe.
+    run(
+        ["docker", "rm", "--force", container],
+        check=False,
+        capture=True,
+        timeout=60,
+    )
+    clusters = run(["kind", "get", "clusters"], check=False, capture=True, timeout=30)
+    node = run(
+        ["docker", "container", "inspect", container],
+        check=False,
+        capture=True,
+        timeout=30,
+    )
+    if cluster in set((clusters.stdout or "").splitlines()) or node.returncode == 0:
+        raise RuntimeError(f"failed to clean up Kind smoke cluster {cluster!r}")
 
 
 def wait_http(url: str, *, expected_status: int, timeout: float = 30.0) -> None:

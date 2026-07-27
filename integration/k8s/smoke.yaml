@@ -6,12 +6,43 @@ metadata:
     app.kubernetes.io/name: agent-runtime-governance
     app.kubernetes.io/part-of: production-smoke
 ---
-apiVersion: v1
-kind: ConfigMap
+apiVersion: batch/v1
+kind: Job
 metadata:
-  name: arg-smoke-config
+  name: arg-runtime-smoke
   namespace: arg-smoke
   labels:
     app.kubernetes.io/name: agent-runtime-governance
-data:
-  runtime.txt: "ExecutionContext pipeline smoke"
+    app.kubernetes.io/part-of: production-smoke
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agent-runtime-governance
+    spec:
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 10
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: runtime
+          image: __ARG_KIND_SMOKE_IMAGE__
+          imagePullPolicy: Never
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsGroup: 65532
+            runAsUser: 65532

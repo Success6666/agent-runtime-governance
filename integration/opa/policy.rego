@@ -9,11 +9,11 @@ allow if {
 allow if {
   input.tool == "delete_file"
   input.risk_tier == "HIGH"
-  input.permissions[_] == "admin"
+  "admin" in input.permissions
 }
 
 allow if {
   input.tool == "reconcile_unknown"
   input.risk_tier == "HIGH"
-  input.permissions[_] == "admin"
+  "admin" in input.permissions
 }
