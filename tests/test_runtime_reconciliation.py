@@ -143,6 +143,80 @@ async def test_missing_provider_is_recorded_and_never_auto_dispatches(
 
 
 @pytest.mark.asyncio
+async def test_reconciliation_rejects_provider_drift_after_restart(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "provider-drift.db"
+    drifted_provider_calls = 0
+    original_runtime = _runtime(path)
+
+    async def original_provider(
+        _context: ReconciliationAttemptContext,
+    ) -> ReconciliationFinding:
+        raise AssertionError("provider calls must remain explicit")
+
+    @original_runtime.tool(
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        reconciliation_provider=ProviderDescriptor(
+            provider_id="payment-receipt-v1",
+            protocol_version="1",
+            supported_evidence_kinds=("receipt",),
+            provider=original_provider,
+        ),
+    )
+    async def charge() -> None:
+        raise TimeoutError("outcome is uncertain")
+
+    options = InvocationOptions(idempotency_key="request-1")
+    try:
+        with pytest.raises(ToolExecutionError) as failed:
+            await original_runtime.arun("charge", _governance=options)
+        execution_record_id = failed.value.execution_record_id
+        assert execution_record_id is not None
+        unknown = original_runtime.reconciliation_ledger.current(execution_record_id)  # type: ignore[union-attr]
+        assert unknown.action.reconciliation_provider_id == "payment-receipt-v1"
+        assert unknown.action.reconciliation_protocol_version == "1"
+    finally:
+        await original_runtime.aclose()
+
+    async def drifted_provider(
+        _context: ReconciliationAttemptContext,
+    ) -> ReconciliationFinding:
+        nonlocal drifted_provider_calls
+        drifted_provider_calls += 1
+        return ReconciliationFinding(
+            proposed_state=ReconciliationState.CONFIRMED_SUCCEEDED,
+            evidence_kind="receipt",
+            evidence={"receipt_id": "replacement-provider"},
+            observed_at=datetime.now(timezone.utc),
+        )
+
+    restarted_runtime = _runtime(path)
+
+    @restarted_runtime.tool(
+        name="charge",
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        reconciliation_provider=ProviderDescriptor(
+            provider_id="payment-receipt-v2",
+            protocol_version="2",
+            supported_evidence_kinds=("receipt",),
+            provider=drifted_provider,
+        ),
+    )
+    async def restarted_charge() -> None:
+        raise AssertionError("the retained idempotency key must not redispatch")
+
+    try:
+        head = await restarted_runtime.areconcile(execution_record_id)
+        assert head.state is ReconciliationState.UNKNOWN
+        assert drifted_provider_calls == 0
+        attempts = restarted_runtime.reconciliation_ledger.attempts(execution_record_id)  # type: ignore[union-attr]
+        assert attempts[-1].payload["outcome"] == ReconciliationAttemptOutcome.UNAVAILABLE.value
+    finally:
+        await restarted_runtime.aclose()
+
+
+@pytest.mark.asyncio
 async def test_late_provider_result_is_discarded_and_provider_is_poisoned(
     tmp_path: Path,
 ) -> None:

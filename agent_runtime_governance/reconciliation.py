@@ -138,6 +138,9 @@ class UnknownAction:
     receipt_schema: Mapping[str, Any] | None = field(default=None, repr=False)
     probe_schema: Mapping[str, Any] | None = field(default=None, repr=False)
     result_schema: Mapping[str, Any] | None = field(default=None, repr=False)
+    reconciliation_provider_id: str | None = None
+    reconciliation_protocol_version: str | int | None = None
+    reconciliation_supported_evidence_kinds: tuple[str, ...] | frozenset[str] = ()
     max_evidence_bytes: int = _MAX_EVIDENCE_BYTES
     max_result_bytes: int = _MAX_RESULT_BYTES
     metadata: Mapping[str, Any] = field(default_factory=dict, repr=False)
@@ -168,6 +171,40 @@ class UnknownAction:
             schema = getattr(self, name)
             if schema is not None:
                 object.__setattr__(self, name, _bounded_schema(schema, label=name))
+        provider_id = self.reconciliation_provider_id
+        provider_version = self.reconciliation_protocol_version
+        evidence_kinds = self.reconciliation_supported_evidence_kinds
+        if not isinstance(evidence_kinds, tuple | frozenset):
+            raise TypeError(
+                "reconciliation_supported_evidence_kinds must be a tuple or frozenset"
+            )
+        if provider_id is None:
+            if provider_version is not None or evidence_kinds:
+                raise ReconciliationValidationError(
+                    "reconciliation provider metadata requires a provider ID"
+                )
+        else:
+            _require_identifier("reconciliation_provider_id", provider_id)
+            if provider_version is None:
+                raise ReconciliationValidationError(
+                    "reconciliation provider metadata requires a protocol version"
+                )
+            _require_protocol_version(provider_version)
+            for kind in evidence_kinds:
+                _require_identifier("supported reconciliation evidence kind", kind)
+            if not evidence_kinds:
+                raise ReconciliationValidationError(
+                    "reconciliation provider metadata requires supported evidence kinds"
+                )
+            if len(set(evidence_kinds)) != len(evidence_kinds):
+                raise ReconciliationValidationError(
+                    "reconciliation provider metadata cannot contain duplicate evidence kinds"
+                )
+            object.__setattr__(
+                self,
+                "reconciliation_supported_evidence_kinds",
+                tuple(sorted(evidence_kinds)),
+            )
         object.__setattr__(
             self,
             "metadata",
@@ -186,7 +223,7 @@ class UnknownAction:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "execution_record_id": self.execution_record_id,
             "action_digest": self.action_digest,
             "tool_name": self.tool_name,
@@ -208,11 +245,29 @@ class UnknownAction:
             "max_result_bytes": self.max_result_bytes,
             "metadata": thaw(self.metadata),
         }
+        if self.reconciliation_provider_id is not None:
+            value.update(
+                {
+                    "reconciliation_provider_id": self.reconciliation_provider_id,
+                    "reconciliation_protocol_version": self.reconciliation_protocol_version,
+                    "reconciliation_supported_evidence_kinds": list(
+                        self.reconciliation_supported_evidence_kinds
+                    ),
+                }
+            )
+        return value
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> UnknownAction:
         data = dict(value)
         data["attempted_at"] = _parse_timestamp(data["attempted_at"])
+        if "reconciliation_supported_evidence_kinds" in data:
+            kinds = data["reconciliation_supported_evidence_kinds"]
+            if not isinstance(kinds, list):
+                raise ReconciliationValidationError(
+                    "serialized reconciliation provider evidence kinds must be an array"
+                )
+            data["reconciliation_supported_evidence_kinds"] = tuple(kinds)
         return cls(**data)
 
 

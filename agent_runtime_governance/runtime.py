@@ -42,6 +42,7 @@ from .errors import (
     ExecutionControlError,
     GovernanceCancelledError,
     GovernanceDenied,
+    RegistryError,
     ToolExecutionError,
 )
 from .hooks import CriticalHookError, HookCallback, HookPoint, HookRegistry
@@ -1011,8 +1012,9 @@ class Runtime:
         )
         if head.state is not ReconciliationState.UNKNOWN:
             return head
-        spec = self.registry.get(head.action.tool_name)
-        provider = spec.reconciliation_provider
+        provider, unavailable_reason = self._provider_for_reconciliation_action(
+            head.action
+        )
         attempt_timeout = self._bounded_timeout(
             deadline,
             self.limits.reconciliation_provider_timeout_seconds,
@@ -1040,7 +1042,10 @@ class Runtime:
                 descriptor,
                 ReconciliationAttemptOutcome.UNAVAILABLE,
                 started.revision,
-                error="no trusted reconciliation provider is registered for this tool",
+                error=(
+                    unavailable_reason
+                    or "no trusted reconciliation provider is registered for this tool"
+                ),
                 deadline=deadline,
             )
             return await read_head_with_audit(
@@ -1270,6 +1275,55 @@ class Runtime:
             supported_evidence_kinds=("runtime",),
             provider=unavailable,
         )
+
+    def _provider_for_reconciliation_action(
+        self, action: UnknownAction
+    ) -> tuple[ProviderDescriptor | None, str | None]:
+        """Return only the provider durably bound to an UNKNOWN action.
+
+        A restarted runtime may register a tool with the same name but a
+        different reconciliation implementation.  That configuration drift
+        must never authorize a new external probe for a persisted action.
+        """
+
+        try:
+            spec = self.registry.get(action.tool_name)
+        except RegistryError:
+            return None, "the tool registered for this unresolved action is unavailable"
+
+        contract = spec.action_contract
+        contract_id = (
+            contract.contract_id if contract is not None else f"runtime.{spec.name}"
+        )
+        contract_version = contract.contract_version if contract is not None else 1
+        if (
+            spec.execution_mode is not ExecutionMode.IDEMPOTENT
+            or contract_id != action.contract_id
+            or contract_version != action.contract_version
+        ):
+            return None, "the registered tool identity no longer matches this unresolved action"
+
+        provider = spec.reconciliation_provider
+        if action.reconciliation_provider_id is None:
+            if provider is None:
+                return None, None
+            return (
+                None,
+                "the unresolved action has no persisted reconciliation provider binding",
+            )
+        if provider is None:
+            return None, "the persisted reconciliation provider is not registered"
+        if (
+            provider.provider_id != action.reconciliation_provider_id
+            or provider.protocol_version != action.reconciliation_protocol_version
+            or provider.supported_evidence_kinds
+            != action.reconciliation_supported_evidence_kinds
+        ):
+            return (
+                None,
+                "the registered reconciliation provider does not match the unresolved action",
+            )
+        return provider, None
 
     async def _write_reconciliation_audit(
         self,
@@ -2315,6 +2369,7 @@ class Runtime:
             )
         bound_action = context.bound_action
         contract = None if bound_action is None else bound_action.contract
+        provider = spec.reconciliation_provider
         return UnknownAction(
             execution_record_id=claim.execution_record_id,
             action_digest=claim.fingerprint,
@@ -2336,6 +2391,15 @@ class Runtime:
                 spec.result_schema
                 if spec.result_schema is not None
                 else (None if contract is None else contract.receipt_schema)
+            ),
+            reconciliation_provider_id=(
+                None if provider is None else provider.provider_id
+            ),
+            reconciliation_protocol_version=(
+                None if provider is None else provider.protocol_version
+            ),
+            reconciliation_supported_evidence_kinds=(
+                () if provider is None else provider.supported_evidence_kinds
             ),
             max_result_bytes=spec.max_result_bytes or 1_048_576,
             metadata={"trace_id": context.trace_id, "request_id": context.request_id},
