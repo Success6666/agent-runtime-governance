@@ -280,6 +280,24 @@ async def test_observer_can_append_history_and_add_ordinary_metadata() -> None:
     )
 
 
+@pytest.mark.parametrize("value", ["1.25", "inf", "-inf", "nan"])
+def test_context_transition_preserves_equivalent_float_metadata(value: str) -> None:
+    previous = _boundary_context().evolve(
+        metadata={"application": "billing", "measurement": float(value)}
+    )
+    candidate = previous.evolve(
+        metadata={"application": "billing", "measurement": float(value)}
+    )
+
+    assert candidate.metadata["measurement"] is not previous.metadata["measurement"]
+    assert (
+        validate_middleware_transition(
+            previous, candidate, MiddlewareKind.OBSERVING
+        )
+        is candidate
+    )
+
+
 def test_gate_cannot_lower_registered_risk() -> None:
     calls: list[str] = []
 
