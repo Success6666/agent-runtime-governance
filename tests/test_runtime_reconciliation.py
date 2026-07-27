@@ -453,12 +453,10 @@ async def test_strict_global_audit_recovery_requires_its_own_permission(
             await runtime.adrain_reconciliation_audit_outbox(
                 identity_claims={"actor": "probe"}
             )
-        assert (
-            await runtime.adrain_reconciliation_audit_outbox(
-                identity_claims={"actor": "audit-worker"}
-            )
-            >= 0
+        delivered = await runtime.adrain_reconciliation_audit_outbox(
+            identity_claims={"actor": "audit-worker"}
         )
+        assert delivered == 0
     finally:
         await runtime.aclose()
 
@@ -563,12 +561,10 @@ async def test_verified_identity_without_profile_secures_reconciliation_control_
             await runtime.adrain_reconciliation_audit_outbox(
                 identity_claims={"actor": "tenant-a"}
             )
-        assert (
-            await runtime.adrain_reconciliation_audit_outbox(
-                identity_claims={"actor": "audit-worker"}
-            )
-            >= 0
+        delivered = await runtime.adrain_reconciliation_audit_outbox(
+            identity_claims={"actor": "audit-worker"}
         )
+        assert delivered == 0
 
         head = await runtime.areconcile(
             execution_record_id,
@@ -577,6 +573,35 @@ async def test_verified_identity_without_profile_secures_reconciliation_control_
         assert head.state is ReconciliationState.MANUAL_REVIEW
         assert provider_calls == [execution_record_id]
     finally:
+        await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_control_plane_helpers_reject_closing_runtime() -> None:
+    runtime = Runtime()
+    try:
+        with runtime._lifecycle_lock:
+            runtime._closing = True
+
+        with pytest.raises(RuntimeError, match="runtime is closed"):
+            await runtime._adrain_reconciliation_audit_outbox(
+                limit=1,
+                identity_claims=None,
+                deadline=None,
+            )
+        with pytest.raises(RuntimeError, match="runtime is closed"):
+            await runtime._aresolve_reconciliation(
+                "execution-1",
+                expected_state=ReconciliationState.MANUAL_REVIEW,
+                expected_revision=1,
+                new_state=ReconciliationState.CONFIRMED_SUCCEEDED,
+                reason="operator verification",
+                evidence_kind="receipt",
+                evidence={},
+            )
+    finally:
+        with runtime._lifecycle_lock:
+            runtime._closing = False
         await runtime.aclose()
 
 
@@ -2463,3 +2488,96 @@ async def test_concurrent_recovery_workers_deduplicate_outbox_delivery(
     finally:
         await first.aclose()
         await second.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_timeout_registers_one_deferred_release_per_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CallbackTarget:
+        def __init__(self) -> None:
+            self._callbacks: list[Callable[[object], object]] = []
+            self._done = False
+
+        def add_done_callback(self, callback: Callable[[object], object]) -> None:
+            self._callbacks.append(callback)
+
+        def done(self) -> bool:
+            return self._done
+
+        def result(self) -> None:
+            return None
+
+        def complete(self) -> None:
+            self._done = True
+            for callback in tuple(self._callbacks):
+                callback(self)
+
+    class RecordingExecutor:
+        def __init__(self) -> None:
+            self.submitted: list[CallbackTarget] = []
+
+        def submit(self, _function: object) -> CallbackTarget:
+            future = CallbackTarget()
+            self.submitted.append(future)
+            return future
+
+    class CountingLease:
+        def __init__(self) -> None:
+            self.release_count = 0
+
+        def release(self) -> None:
+            self.release_count += 1
+
+    class StaticBulkhead:
+        def __init__(self, lease: CountingLease) -> None:
+            self._lease = lease
+
+        async def acquire(self, _timeout: float) -> CountingLease:
+            return self._lease
+
+    executor = RecordingExecutor()
+    wrapped_tasks: list[CallbackTarget] = []
+
+    def wrap_future(_future: object, *, loop: object) -> CallbackTarget:
+        del loop
+        task = CallbackTarget()
+        wrapped_tasks.append(task)
+        return task
+
+    async def wait_for_timeout(
+        _tasks: object,
+        *,
+        timeout: float | None = None,
+    ) -> tuple[set[object], set[object]]:
+        del timeout
+        return set(), set()
+
+    monkeypatch.setattr(runtime_module.asyncio, "wrap_future", wrap_future)
+    monkeypatch.setattr(runtime_module.asyncio, "wait", wait_for_timeout)
+
+    runtime = Runtime(
+        reconciliation_executor=executor,  # type: ignore[arg-type]
+        reconciliation_audit_executor=executor,  # type: ignore[arg-type]
+    )
+    audit_lease = CountingLease()
+    ledger_lease = CountingLease()
+    runtime._reconciliation_audit_bulkhead = StaticBulkhead(audit_lease)  # type: ignore[assignment]
+    runtime._reconciliation_bulkhead = StaticBulkhead(ledger_lease)  # type: ignore[assignment]
+    try:
+        with pytest.raises(StageTimeoutError, match="reconciliation audit delivery"):
+            await runtime._run_reconciliation_audit_delivery(lambda: None)
+        with pytest.raises(StageTimeoutError, match="reconciliation ledger operation"):
+            await runtime._run_reconciliation_operation(lambda: None)
+
+        assert len(executor.submitted) == 2
+        assert len(wrapped_tasks) == 2
+        for future, task in zip(executor.submitted, wrapped_tasks, strict=True):
+            future.complete()
+            task.complete()
+
+        assert audit_lease.release_count == 1
+        assert ledger_lease.release_count == 1
+        assert runtime._reconciliation_draining == 0
+    finally:
+        runtime.close()
