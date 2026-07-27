@@ -11,3 +11,7 @@ build/
 dist/
 audit.log
 *.log
+*.db*
+*.sqlite*
+.env
+.env.*
