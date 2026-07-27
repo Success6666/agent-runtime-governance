@@ -28,7 +28,11 @@ from .action_contracts import ActionContract
 from .context import ExecutionMode, RiskTier
 from .contracts import canonical_json_bytes, validate_schema
 from .errors import ContractValidationError, RegistryError
-from .reconciliation import ProviderDescriptor
+from .reconciliation import (
+    ProviderDescriptor,
+    UnknownAction,
+    idempotency_namespace_digest,
+)
 
 if TYPE_CHECKING:
     from .runtime import Runtime
@@ -346,6 +350,40 @@ class SQLiteIdempotencyStore:
         self._initialize()
 
     def acquire(self, namespace: str, key: str, fingerprint: str) -> IdempotencyClaim:
+        return self._acquire(namespace, key, fingerprint)
+
+    def acquire_prepared(
+        self,
+        namespace: str,
+        key: str,
+        fingerprint: str,
+        action: UnknownAction,
+    ) -> IdempotencyClaim:
+        """Atomically create an idempotency owner and its recovery descriptor.
+
+        The prepared descriptor is committed before the caller can dispatch an
+        irreversible tool body.  Lease-expiry recovery can then always
+        materialize an explicit UNKNOWN reconciliation head.
+        """
+
+        if not isinstance(action, UnknownAction):
+            raise TypeError("action must be an UnknownAction")
+        if action.action_digest != fingerprint:
+            raise ValueError("prepared action digest does not match fingerprint")
+        if action.idempotency_namespace_digest != idempotency_namespace_digest(
+            namespace
+        ):
+            raise ValueError("prepared action namespace does not match claim")
+        return self._acquire(namespace, key, fingerprint, prepared_action=action)
+
+    def _acquire(
+        self,
+        namespace: str,
+        key: str,
+        fingerprint: str,
+        *,
+        prepared_action: UnknownAction | None = None,
+    ) -> IdempotencyClaim:
         self._validate_identifier("namespace", namespace)
         self._validate_identifier("key", key)
         if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
@@ -367,7 +405,11 @@ class SQLiteIdempotencyStore:
                 (namespace, key),
             ).fetchone()
             if row is None:
-                execution_record_id = _new_execution_record_id()
+                execution_record_id = (
+                    _new_execution_record_id()
+                    if prepared_action is None
+                    else prepared_action.execution_record_id
+                )
                 connection.execute(
                     """
                     INSERT INTO idempotency_records(
@@ -386,6 +428,8 @@ class SQLiteIdempotencyStore:
                         now.isoformat(),
                     ),
                 )
+                if prepared_action is not None:
+                    self._insert_prepared_action(connection, prepared_action)
                 connection.commit()
                 return IdempotencyClaim(
                     namespace,
@@ -429,7 +473,11 @@ class SQLiteIdempotencyStore:
                     )
                 )
             elif state == "not_applied":
-                next_execution_record_id = _new_execution_record_id()
+                next_execution_record_id = (
+                    _new_execution_record_id()
+                    if prepared_action is None
+                    else prepared_action.execution_record_id
+                )
                 next_generation = generation + 1
                 connection.execute(
                     """
@@ -449,6 +497,8 @@ class SQLiteIdempotencyStore:
                         now.isoformat(),
                     ),
                 )
+                if prepared_action is not None:
+                    self._insert_prepared_action(connection, prepared_action)
                 connection.commit()
                 return IdempotencyClaim(
                     namespace,
@@ -516,6 +566,35 @@ class SQLiteIdempotencyStore:
                 generation=generation,
             )
 
+    @staticmethod
+    def _insert_prepared_action(
+        connection: sqlite3.Connection, action: UnknownAction
+    ) -> None:
+        table = connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'reconciliation_prepared_actions'
+            """
+        ).fetchone()
+        if table is None:
+            raise RuntimeError(
+                "atomic reconciliation preparation requires a colocated ledger"
+            )
+        connection.execute(
+            """
+            INSERT INTO reconciliation_prepared_actions(
+                execution_record_id, action_json, prepared_at
+            ) VALUES (?, ?, ?)
+            """,
+            (
+                action.execution_record_id,
+                canonical_json_bytes(
+                    action.to_dict(), label="prepared reconciliation action"
+                ).decode("utf-8"),
+                action.attempted_at.isoformat(),
+            ),
+        )
+
     def complete(self, claim: IdempotencyClaim, result: Any) -> None:
         if not claim.owner:
             return
@@ -548,6 +627,18 @@ class SQLiteIdempotencyStore:
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("idempotency ownership was lost before failure")
+            connection.execute(
+                """
+                DELETE FROM reconciliation_prepared_actions
+                WHERE execution_record_id = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM reconciliation_heads
+                      WHERE reconciliation_heads.execution_record_id =
+                            reconciliation_prepared_actions.execution_record_id
+                  )
+                """,
+                (claim.execution_record_id,),
+            )
             connection.commit()
         if not claim.future.done():
             claim.future.set_exception(error)

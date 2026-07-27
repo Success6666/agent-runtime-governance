@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -106,6 +107,42 @@ async def test_explicit_reconciliation_restores_only_a_validated_cached_result(
         cached = await runtime.ainvoke("charge", 100, _governance=options)
         assert cached == {"status": "paid"}
         assert dispatches == 1
+    finally:
+        await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runtime_atomically_prepares_recovery_descriptor_before_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "runtime-atomic-prepare.db"
+    runtime = _runtime(path)
+    ledger = runtime.reconciliation_ledger
+    assert isinstance(ledger, SQLiteReconciliationLedger)
+    legacy_prepare_called = False
+
+    def fail_legacy_prepare(*_args: object, **_kwargs: object) -> None:
+        nonlocal legacy_prepare_called
+        legacy_prepare_called = True
+        raise AssertionError("runtime must not use the split prepare path")
+
+    monkeypatch.setattr(ledger, "prepare_action", fail_legacy_prepare)
+
+    @runtime.tool(execution_mode=ExecutionMode.IDEMPOTENT)
+    async def charge() -> dict[str, bool]:
+        with sqlite3.connect(path) as connection:
+            prepared = connection.execute(
+                "SELECT COUNT(*) FROM reconciliation_prepared_actions"
+            ).fetchone()[0]
+        assert prepared == 1
+        return {"ok": True}
+
+    try:
+        result = await runtime.ainvoke(
+            "charge", _governance=InvocationOptions(idempotency_key="request-1")
+        )
+        assert result == {"ok": True}
+        assert not legacy_prepare_called
     finally:
         await runtime.aclose()
 

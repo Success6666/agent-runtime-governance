@@ -599,6 +599,81 @@ def test_expired_prepared_lease_materializes_reconciliation_head(
     assert raw_key not in prepared
 
 
+def test_atomic_prepared_acquire_rolls_back_claim_when_descriptor_insert_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "atomic-prepared-rollback.db"
+    store = SQLiteIdempotencyStore(path)
+    SQLiteReconciliationLedger(path)
+    action = _unknown("f" * 64)
+
+    def fail_insert(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("simulated descriptor persistence failure")
+
+    monkeypatch.setattr(store, "_insert_prepared_action", fail_insert)
+
+    with pytest.raises(RuntimeError, match="descriptor persistence"):
+        store.acquire_prepared("tenant/charge", "request-1", _ACTION_DIGEST, action)
+
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM idempotency_records"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM reconciliation_prepared_actions"
+        ).fetchone()[0] == 0
+
+
+def test_expired_atomically_prepared_lease_materializes_reconciliation_head(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "expired-atomic-prepared.db"
+    raw_key = "caller-visible-idempotency-key"
+    store = SQLiteIdempotencyStore(path, lease_seconds=60)
+    ledger = SQLiteReconciliationLedger(path)
+    action = _unknown("f" * 64)
+
+    claim = store.acquire_prepared("tenant/charge", raw_key, _ACTION_DIGEST, action)
+    assert claim.execution_record_id == action.execution_record_id
+
+    expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute(
+                """
+                UPDATE idempotency_records SET lease_expires_at = ?
+                WHERE execution_record_id = ?
+                """,
+                (expired, action.execution_record_id),
+            )
+
+    duplicate = SQLiteIdempotencyStore(path).acquire(
+        "tenant/charge", raw_key, _ACTION_DIGEST
+    )
+    with pytest.raises(IdempotencyOutcomeUnknownError) as blocked:
+        duplicate.future.result()
+    assert blocked.value.execution_record_id == action.execution_record_id
+    assert ledger.current(action.execution_record_id).action.to_dict() == action.to_dict()
+
+
+def test_known_failure_removes_atomically_prepared_descriptor(tmp_path: Path) -> None:
+    path = tmp_path / "prepared-failure-cleanup.db"
+    store = SQLiteIdempotencyStore(path)
+    SQLiteReconciliationLedger(path)
+    action = _unknown("f" * 64)
+    claim = store.acquire_prepared("tenant/charge", "request-1", _ACTION_DIGEST, action)
+
+    store.fail(claim, ValueError("validation failed before dispatch"))
+
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM idempotency_records"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM reconciliation_prepared_actions"
+        ).fetchone()[0] == 0
+
+
 def test_sqlite_prepared_actions_are_database_enforced_immutable(
     tmp_path: Path,
 ) -> None:
