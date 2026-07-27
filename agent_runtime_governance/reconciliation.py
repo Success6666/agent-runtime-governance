@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import math
 import re
 import secrets
 import sqlite3
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -41,6 +43,198 @@ _MAX_SCHEMA_BYTES = 1_048_576
 _MAX_VALUE_DEPTH = 32
 _MAX_VALUE_NODES = 10_000
 _MAX_SAFE_INTEGER = (1 << 53) - 1
+_AUDIT_DELIVERY_ALERT_ATTEMPTS = 3
+_AUDIT_DELIVERY_ALERT_AGE_SECONDS = 300.0
+_RECONCILIATION_SCHEMA_VERSION = 5
+_RECONCILIATION_CORE_TABLES = frozenset(
+    {
+        "reconciliation_heads",
+        "reconciliation_events",
+        "reconciliation_prepared_actions",
+        "reconciliation_audit_outbox",
+    }
+)
+_RECONCILIATION_AUTHORITY_TABLES = _RECONCILIATION_CORE_TABLES | frozenset(
+    {"reconciliation_schema"}
+)
+_RECONCILIATION_LEGACY_CORE_TABLES = {
+    1: frozenset({"reconciliation_heads", "reconciliation_events"}),
+    2: frozenset(
+        {
+            "reconciliation_heads",
+            "reconciliation_events",
+            "reconciliation_prepared_actions",
+        }
+    ),
+    3: frozenset(
+        {
+            "reconciliation_heads",
+            "reconciliation_events",
+            "reconciliation_prepared_actions",
+        }
+    ),
+}
+_RECONCILIATION_TABLE_DDL = {
+    "reconciliation_schema": """
+        CREATE TABLE reconciliation_schema (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            version INTEGER NOT NULL
+        )
+    """,
+    "reconciliation_heads": """
+        CREATE TABLE reconciliation_heads (
+            execution_record_id TEXT PRIMARY KEY NOT NULL,
+            action_json TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN (
+                'UNKNOWN', 'CONFIRMED_SUCCEEDED',
+                'CONFIRMED_NOT_APPLIED', 'MANUAL_REVIEW'
+            )),
+            revision INTEGER NOT NULL CHECK(revision >= 0),
+            disposition TEXT NOT NULL CHECK(disposition IN (
+                'blocked_unknown', 'blocked_manual_review', 'completed',
+                'applied_no_result', 'retry_allowed'
+            )),
+            resolved_result_available INTEGER NOT NULL
+                CHECK(resolved_result_available IN (0, 1)),
+            resolved_result_json TEXT,
+            updated_at TEXT NOT NULL,
+            CHECK(
+                (resolved_result_available = 1 AND resolved_result_json IS NOT NULL)
+                OR (resolved_result_available = 0 AND resolved_result_json IS NULL)
+            )
+        )
+    """,
+    "reconciliation_events": """
+        CREATE TABLE reconciliation_events (
+            event_id TEXT PRIMARY KEY NOT NULL,
+            execution_record_id TEXT NOT NULL,
+            revision INTEGER NOT NULL CHECK(revision >= 1),
+            kind TEXT NOT NULL CHECK(kind IN (
+                'ATTEMPT_STARTED', 'ATTEMPT_FINISHED', 'STATE_TRANSITION'
+            )),
+            state_before TEXT NOT NULL,
+            state_after TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            UNIQUE(execution_record_id, revision),
+            FOREIGN KEY(execution_record_id)
+                REFERENCES reconciliation_heads(execution_record_id)
+        )
+    """,
+    "reconciliation_prepared_actions": """
+        CREATE TABLE reconciliation_prepared_actions (
+            execution_record_id TEXT PRIMARY KEY NOT NULL,
+            action_json TEXT NOT NULL,
+            prepared_at TEXT NOT NULL
+        )
+    """,
+    "reconciliation_audit_outbox": """
+        CREATE TABLE reconciliation_audit_outbox (
+            outbox_id TEXT PRIMARY KEY NOT NULL,
+            execution_record_id TEXT NOT NULL,
+            revision INTEGER NOT NULL CHECK(revision >= 0),
+            event_type TEXT NOT NULL,
+            event_json TEXT NOT NULL,
+            event_digest TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            delivery_attempts INTEGER NOT NULL DEFAULT 0
+                CHECK(delivery_attempts >= 0),
+            delivered_at TEXT,
+            last_error_class TEXT,
+            alerted_at TEXT,
+            UNIQUE(execution_record_id, revision, event_type),
+            FOREIGN KEY(execution_record_id)
+                REFERENCES reconciliation_heads(execution_record_id)
+        )
+    """,
+}
+_RECONCILIATION_V4_AUDIT_OUTBOX_DDL = """
+    CREATE TABLE reconciliation_audit_outbox (
+        outbox_id TEXT PRIMARY KEY NOT NULL,
+        execution_record_id TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK(revision >= 0),
+        event_type TEXT NOT NULL,
+        event_json TEXT NOT NULL,
+        event_digest TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        delivery_attempts INTEGER NOT NULL DEFAULT 0
+            CHECK(delivery_attempts >= 0),
+        delivered_at TEXT,
+        last_error_class TEXT,
+        UNIQUE(execution_record_id, revision, event_type),
+        FOREIGN KEY(execution_record_id)
+            REFERENCES reconciliation_heads(execution_record_id)
+    )
+"""
+_RECONCILIATION_PENDING_INDEX_DDL = """
+    CREATE INDEX idx_reconciliation_audit_outbox_pending
+    ON reconciliation_audit_outbox(delivered_at, execution_record_id, revision)
+"""
+_RECONCILIATION_TRIGGER_DDL = {
+    "reconciliation_events_no_update": """
+        CREATE TRIGGER reconciliation_events_no_update
+        BEFORE UPDATE ON reconciliation_events
+        BEGIN
+            SELECT RAISE(ABORT, 'reconciliation events are append-only');
+        END
+    """,
+    "reconciliation_events_no_delete": """
+        CREATE TRIGGER reconciliation_events_no_delete
+        BEFORE DELETE ON reconciliation_events
+        BEGIN
+            SELECT RAISE(ABORT, 'reconciliation events are append-only');
+        END
+    """,
+    "reconciliation_prepared_actions_no_update": """
+        CREATE TRIGGER reconciliation_prepared_actions_no_update
+        BEFORE UPDATE ON reconciliation_prepared_actions
+        BEGIN
+            SELECT RAISE(ABORT, 'prepared reconciliation actions are immutable');
+        END
+    """,
+    "reconciliation_prepared_actions_delete_guard": """
+        CREATE TRIGGER reconciliation_prepared_actions_delete_guard
+        BEFORE DELETE ON reconciliation_prepared_actions
+        WHEN EXISTS (
+            SELECT 1 FROM reconciliation_heads
+            WHERE reconciliation_heads.execution_record_id =
+                  OLD.execution_record_id
+        ) OR EXISTS (
+            SELECT 1 FROM idempotency_records
+            WHERE idempotency_records.execution_record_id =
+                  OLD.execution_record_id
+              AND idempotency_records.state != 'completed'
+        )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'prepared reconciliation action cannot be deleted before retention is safe'
+            );
+        END
+    """,
+    "reconciliation_audit_outbox_immutable": """
+        CREATE TRIGGER reconciliation_audit_outbox_immutable
+        BEFORE UPDATE OF outbox_id, execution_record_id, revision, event_type,
+                         event_json, event_digest, created_at
+        ON reconciliation_audit_outbox
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'reconciliation audit outbox payload is immutable'
+            );
+        END
+    """,
+    "reconciliation_audit_outbox_no_delete": """
+        CREATE TRIGGER reconciliation_audit_outbox_no_delete
+        BEFORE DELETE ON reconciliation_audit_outbox
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'reconciliation audit outbox retention requires an explicit migration'
+            );
+        END
+    """,
+}
 _FORBIDDEN_EVIDENCE_KEYS = {
     "api_key",
     "access_token",
@@ -62,6 +256,99 @@ _FORBIDDEN_EVIDENCE_KEYS = {
     "subject",
     "tenant",
 }
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _create_reconciliation_table(
+    connection: sqlite3.Connection,
+    table_name: str,
+) -> None:
+    """Install one exact reconciliation table when it is absent."""
+
+    try:
+        definition = _RECONCILIATION_TABLE_DDL[table_name]
+    except KeyError as exc:  # pragma: no cover - internal misuse guard
+        raise ValueError(f"unknown reconciliation table {table_name!r}") from exc
+    connection.execute(
+        definition.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1)
+    )
+
+
+def _create_reconciliation_trigger(
+    connection: sqlite3.Connection,
+    trigger_name: str,
+) -> None:
+    """Install one exact reconciliation guard when it is absent."""
+
+    try:
+        definition = _RECONCILIATION_TRIGGER_DDL[trigger_name]
+    except KeyError as exc:  # pragma: no cover - internal misuse guard
+        raise ValueError(f"unknown reconciliation trigger {trigger_name!r}") from exc
+    connection.execute(
+        definition.replace("CREATE TRIGGER ", "CREATE TRIGGER IF NOT EXISTS ", 1)
+    )
+
+
+def _create_reconciliation_pending_index(connection: sqlite3.Connection) -> None:
+    """Install the canonical pending-delivery index when it is absent."""
+
+    connection.execute(
+        _RECONCILIATION_PENDING_INDEX_DDL.replace(
+            "CREATE INDEX ",
+            "CREATE INDEX IF NOT EXISTS ",
+            1,
+        )
+    )
+
+
+def _normalize_schema_sql(value: str) -> str:
+    """Remove layout-only whitespace without changing quoted SQL semantics."""
+
+    normalized: list[str] = []
+    quote_terminator: str | None = None
+    line_comment = False
+    block_comment = False
+    index = 0
+    while index < len(value):
+        character = value[index]
+        following = value[index + 1] if index + 1 < len(value) else ""
+        if line_comment:
+            normalized.append(character)
+            if character in "\r\n":
+                line_comment = False
+        elif block_comment:
+            normalized.append(character)
+            if character == "*" and following == "/":
+                normalized.append(following)
+                index += 1
+                block_comment = False
+        elif quote_terminator is not None:
+            normalized.append(character)
+            if character == quote_terminator:
+                if following == quote_terminator and quote_terminator != "]":
+                    normalized.append(following)
+                    index += 1
+                else:
+                    quote_terminator = None
+        elif character == "-" and following == "-":
+            normalized.extend((character, following))
+            index += 1
+            line_comment = True
+        elif character == "/" and following == "*":
+            normalized.extend((character, following))
+            index += 1
+            block_comment = True
+        elif character in {"'", '"', "`"}:
+            normalized.append(character)
+            quote_terminator = character
+        elif character == "[":
+            normalized.append(character)
+            quote_terminator = "]"
+        elif not character.isspace():
+            normalized.append(character)
+        index += 1
+    return "".join(normalized).rstrip(";")
 
 
 class ReconciliationState(str, Enum):
@@ -916,6 +1203,17 @@ class InMemoryReconciliationLedger:
             raise ReconciliationValidationError(
                 "prepared action execution record does not match the idempotency claim"
             )
+        if claim.fingerprint != action.action_digest:
+            raise ReconciliationValidationError(
+                "prepared action digest does not match the idempotency claim"
+            )
+        if (
+            idempotency_namespace_digest(claim.namespace)
+            != action.idempotency_namespace_digest
+        ):
+            raise ReconciliationValidationError(
+                "prepared action namespace does not match the idempotency claim"
+            )
         with self._lock:
             existing = self._prepared_actions.get(action.execution_record_id)
             if existing is not None and existing != action:
@@ -1159,16 +1457,106 @@ class SQLiteReconciliationLedger:
         *,
         timeout_seconds: float = 30.0,
         journal_mode: str = "auto",
+        audit_delivery_alert_attempts: int = _AUDIT_DELIVERY_ALERT_ATTEMPTS,
+        audit_delivery_alert_age_seconds: float = _AUDIT_DELIVERY_ALERT_AGE_SECONDS,
+        _allow_legacy_schema_migration: bool = False,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
+        if (
+            type(audit_delivery_alert_attempts) is not int
+            or audit_delivery_alert_attempts < 1
+        ):
+            raise ValueError("audit_delivery_alert_attempts must be a positive integer")
+        if (
+            isinstance(audit_delivery_alert_age_seconds, bool)
+            or not isinstance(audit_delivery_alert_age_seconds, int | float)
+            or not math.isfinite(audit_delivery_alert_age_seconds)
+            or audit_delivery_alert_age_seconds <= 0
+        ):
+            raise ValueError(
+                "audit_delivery_alert_age_seconds must be a positive finite number"
+            )
+        if type(_allow_legacy_schema_migration) is not bool:
+            raise TypeError("_allow_legacy_schema_migration must be a bool")
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.timeout_seconds = timeout_seconds
         self.journal_capabilities = sqlite_journal_capabilities(journal_mode)
         self._journal_mode = journal_mode
-        self._initialize()
-        self._migrate_legacy_idempotency_if_needed()
+        self._audit_delivery_alert_attempts = audit_delivery_alert_attempts
+        self._audit_delivery_alert_age_seconds = float(
+            audit_delivery_alert_age_seconds
+        )
+        self._allow_legacy_schema_migration = _allow_legacy_schema_migration
+        if self._allow_legacy_schema_migration:
+            self._initialize_controlled_migration()
+        else:
+            self._preflight_reconciliation_schema()
+            self._preflight_idempotency_schema()
+            self._initialize()
+
+    @classmethod
+    def migrate_legacy(
+        cls,
+        path: str | Path,
+        *,
+        timeout_seconds: float = 30.0,
+        journal_mode: str = "auto",
+        audit_delivery_alert_attempts: int = _AUDIT_DELIVERY_ALERT_ATTEMPTS,
+        audit_delivery_alert_age_seconds: float = _AUDIT_DELIVERY_ALERT_AGE_SECONDS,
+    ) -> "SQLiteReconciliationLedger":
+        """Upgrade a verified pre-outbox database in a dedicated migration process.
+
+        Normal runtime construction never creates an outbox for a database that
+        declares versions 1 through 3.  Calling this method is an explicit
+        operator action and must be limited to an offline migration after a
+        verified backup and restore drill.
+        """
+
+        return cls(
+            path,
+            timeout_seconds=timeout_seconds,
+            journal_mode=journal_mode,
+            audit_delivery_alert_attempts=audit_delivery_alert_attempts,
+            audit_delivery_alert_age_seconds=audit_delivery_alert_age_seconds,
+            _allow_legacy_schema_migration=True,
+        )
+
+    def _initialize_controlled_migration(self) -> None:
+        """Upgrade colocated authorities atomically after validating both sides."""
+
+        with initialize_sqlite(
+            self.path,
+            self.timeout_seconds,
+            journal_mode=self._journal_mode,
+        ) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._validate_reconciliation_schema(connection)
+            from .registry import SQLiteIdempotencyStore
+
+            try:
+                idempotency_state = SQLiteIdempotencyStore._preflight_schema(
+                    connection,
+                    allow_legacy_schema_migration=True,
+                )
+            except RuntimeError as exc:
+                raise ReconciliationError(str(exc)) from exc
+
+            self._initialize(connection)
+            if idempotency_state != "absent":
+                try:
+                    SQLiteIdempotencyStore._initialize_schema(
+                        connection,
+                        allow_legacy_schema_migration=True,
+                    )
+                except RuntimeError as exc:
+                    raise ReconciliationError(str(exc)) from exc
+            self._assert_audit_outbox_integrity(
+                connection,
+                require_alert_marker=True,
+            )
+            connection.commit()
 
     @property
     def journal_mode(self) -> str:
@@ -1438,7 +1826,7 @@ class SQLiteReconciliationLedger:
         table_exists = connection.execute(
             """
             SELECT 1 FROM sqlite_master
-            WHERE type = 'table' AND name = 'idempotency_records'
+            WHERE type = 'table' AND name = 'idempotency_records' COLLATE NOCASE
             """
         ).fetchone()
         if table_exists is None:
@@ -1768,6 +2156,15 @@ class SQLiteReconciliationLedger:
                 """,
                 parameters,
             ).fetchall()
+            for row in rows:
+                if self._audit_delivery_alert_candidate(
+                    created_at=str(row[6]),
+                    delivery_attempts=int(row[7]),
+                ):
+                    self._warn_if_audit_delivery_is_stalled(
+                        connection,
+                        str(row[1]),
+                    )
         return tuple(_audit_envelope_from_row(row) for row in rows)
 
     def mark_audit_event_delivered(self, outbox_id: str) -> None:
@@ -1792,6 +2189,81 @@ class SQLiteReconciliationLedger:
                         "reconciliation audit outbox event is not present"
                     )
             connection.commit()
+
+    def _audit_delivery_alert_candidate(
+        self,
+        *,
+        created_at: str,
+        delivery_attempts: int,
+    ) -> bool:
+        if delivery_attempts >= self._audit_delivery_alert_attempts:
+            return True
+        oldest_pending_at = _parse_timestamp(created_at)
+        oldest_age_seconds = max(
+            0.0,
+            (datetime.now(timezone.utc) - oldest_pending_at).total_seconds(),
+        )
+        return oldest_age_seconds >= self._audit_delivery_alert_age_seconds
+
+    def _warn_if_audit_delivery_is_stalled(
+        self, connection: sqlite3.Connection, execution_record_id: str
+    ) -> None:
+        """Warn once per execution while a durable delivery outage is pending.
+
+        The ledger never discards an outbox obligation because a sink is down.
+        Operations still need an observable signal before retention pressure turns
+        a recoverable delivery outage into an incident, so only lineage-safe
+        counters and timestamps are emitted here.
+        """
+
+        row = connection.execute(
+            """
+            SELECT COUNT(*), MAX(delivery_attempts), MIN(created_at),
+                   MAX(CASE WHEN alerted_at IS NOT NULL THEN 1 ELSE 0 END)
+            FROM reconciliation_audit_outbox
+            WHERE execution_record_id = ? AND delivered_at IS NULL
+            """,
+            (execution_record_id,),
+        ).fetchone()
+        assert row is not None
+        pending_count = int(row[0])
+        if pending_count == 0:
+            return
+        max_attempts = int(row[1])
+        oldest_pending_at = _parse_timestamp(str(row[2]))
+        oldest_age_seconds = max(
+            0.0,
+            (datetime.now(timezone.utc) - oldest_pending_at).total_seconds(),
+        )
+        if not self._audit_delivery_alert_candidate(
+            created_at=str(row[2]),
+            delivery_attempts=max_attempts,
+        ):
+            return
+        if bool(row[3]):
+            return
+        alerted_at = _timestamp_text(datetime.now(timezone.utc))
+        claimed = connection.execute(
+            """
+            UPDATE reconciliation_audit_outbox
+            SET alerted_at = ?
+            WHERE execution_record_id = ?
+              AND delivered_at IS NULL
+              AND alerted_at IS NULL
+            """,
+            (alerted_at, execution_record_id),
+        )
+        if claimed.rowcount == 0:
+            return
+        _LOGGER.warning(
+            "reconciliation audit delivery is stalled: "
+            "execution_record_id=%s pending_events=%s max_delivery_attempts=%s "
+            "oldest_pending_age_seconds=%.3f",
+            execution_record_id,
+            pending_count,
+            max_attempts,
+            oldest_age_seconds,
+        )
 
     def record_audit_delivery_failure(
         self, outbox_id: str, error: BaseException
@@ -1819,6 +2291,20 @@ class SQLiteReconciliationLedger:
                     raise ReconciliationNotFoundError(
                         "reconciliation audit outbox event is not present"
                     )
+            record = connection.execute(
+                """
+                SELECT execution_record_id, delivery_attempts, created_at
+                FROM reconciliation_audit_outbox
+                WHERE outbox_id = ?
+                """,
+                (outbox_id,),
+            ).fetchone()
+            assert record is not None
+            if self._audit_delivery_alert_candidate(
+                created_at=str(record[2]),
+                delivery_attempts=int(record[1]),
+            ):
+                self._warn_if_audit_delivery_is_stalled(connection, str(record[0]))
             connection.commit()
 
     def _append_attempt(
@@ -2061,7 +2547,7 @@ class SQLiteReconciliationLedger:
         table_exists = connection.execute(
             """
             SELECT 1 FROM sqlite_master
-            WHERE type = 'table' AND name = 'idempotency_records'
+            WHERE type = 'table' AND name = 'idempotency_records' COLLATE NOCASE
             """
         ).fetchone()
         if table_exists is None:
@@ -2087,197 +2573,886 @@ class SQLiteReconciliationLedger:
                 "idempotency authority did not match the reconciliation execution"
             )
 
-    def _initialize(self) -> None:
-        with initialize_sqlite(
-            self.path,
-            self.timeout_seconds,
-            journal_mode=self._journal_mode,
-        ) as connection:
-            connection.execute("BEGIN IMMEDIATE")
+    def _preflight_reconciliation_schema(self) -> None:
+        """Validate an existing reconciliation authority before any schema write."""
+
+        with self._connect() as connection:
+            self._validate_reconciliation_schema(connection)
+
+    def _validate_reconciliation_schema(self, connection: sqlite3.Connection) -> None:
+        """Validate the pre-existing reconciliation authority without writing."""
+
+        schema_exists = (
             connection.execute(
                 """
-                CREATE TABLE IF NOT EXISTS reconciliation_schema (
-                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-                    version INTEGER NOT NULL
-                )
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table'
+                  AND name = 'reconciliation_schema' COLLATE NOCASE
                 """
+            ).fetchone()
+            is not None
+        )
+        existing_core_tables = self._existing_core_tables(connection)
+        if not schema_exists:
+            if existing_core_tables:
+                raise ReconciliationError(
+                    "reconciliation schema integrity failure: version table is missing "
+                    f"while core tables exist {sorted(existing_core_tables)!r}"
+                )
+            return
+
+        self._assert_version_table_integrity(connection)
+        version_row = connection.execute(
+            "SELECT version FROM reconciliation_schema WHERE singleton = 1"
+        ).fetchone()
+        if version_row is None:
+            raise ReconciliationError(
+                "reconciliation schema integrity failure: version row is missing"
             )
+        version = version_row[0]
+        if version not in {0, 1, 2, 3, 4, _RECONCILIATION_SCHEMA_VERSION}:
+            raise ReconciliationError(f"unsupported reconciliation schema version {version}")
+        if version == 0 and existing_core_tables:
+            raise ReconciliationError(
+                "reconciliation schema integrity failure: version 0 is inconsistent "
+                f"with existing core tables {sorted(existing_core_tables)!r}"
+            )
+        if version < 4 and "reconciliation_audit_outbox" in existing_core_tables:
+            raise ReconciliationError(
+                "reconciliation schema integrity failure: pre-outbox schema version "
+                "cannot declare a transactional audit outbox"
+            )
+        if version in _RECONCILIATION_LEGACY_CORE_TABLES:
+            if not self._allow_legacy_schema_migration:
+                raise ReconciliationError(
+                    "pre-outbox reconciliation schema requires an explicit "
+                    "controlled migration via SQLiteReconciliationLedger.migrate_legacy"
+                )
+            self._assert_legacy_schema_integrity(
+                connection,
+                version=version,
+                existing_core_tables=existing_core_tables,
+            )
+        if version >= 4:
+            self._assert_audit_outbox_integrity(
+                connection,
+                require_alert_marker=version >= 5,
+            )
+
+    def _preflight_idempotency_schema(self) -> bool:
+        """Return whether a validated legacy idempotency upgrade is required."""
+
+        with self._connect() as connection:
+            state = self._validate_idempotency_schema(connection)
+        return state == "legacy"
+
+    def _validate_idempotency_schema(self, connection: sqlite3.Connection) -> str:
+        """Validate the colocated idempotency authority without writing to it."""
+
+        from .registry import SQLiteIdempotencyStore
+
+        try:
+            return SQLiteIdempotencyStore._preflight_schema(
+                connection,
+                allow_legacy_schema_migration=self._allow_legacy_schema_migration,
+            )
+        except RuntimeError as exc:
+            raise ReconciliationError(str(exc)) from exc
+
+    def _initialize(self, connection: sqlite3.Connection | None = None) -> None:
+        owns_transaction = connection is None
+        initialization = (
+            initialize_sqlite(
+                self.path,
+                self.timeout_seconds,
+                journal_mode=self._journal_mode,
+            )
+            if owns_transaction
+            else nullcontext(connection)
+        )
+        with initialization as connection:
+            if owns_transaction:
+                connection.execute("BEGIN IMMEDIATE")
+            # The initial read-only preflight is intentionally repeated after
+            # acquiring the initializer lock and transaction.  This closes the
+            # gap in which another process could introduce a legacy or corrupt
+            # idempotency authority between normal construction's preflight and
+            # the first reconciliation schema write.
+            self._validate_idempotency_schema(connection)
+            schema_exists = (
+                connection.execute(
+                    """
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table'
+                      AND name = 'reconciliation_schema' COLLATE NOCASE
+                    """
+                ).fetchone()
+                is not None
+            )
+            existing_core_tables = self._existing_core_tables(connection)
+            if not schema_exists and existing_core_tables:
+                raise ReconciliationError(
+                    "reconciliation schema integrity failure: version table is missing "
+                    f"while core tables exist {sorted(existing_core_tables)!r}"
+                )
+            if schema_exists:
+                self._assert_version_table_integrity(connection)
+            _create_reconciliation_table(connection, "reconciliation_schema")
+            self._assert_version_table_integrity(connection)
             version_row = connection.execute(
                 "SELECT version FROM reconciliation_schema WHERE singleton = 1"
             ).fetchone()
+            if version_row is None and schema_exists:
+                raise ReconciliationError(
+                    "reconciliation schema integrity failure: version row is missing"
+                )
             version = 0 if version_row is None else version_row[0]
-            if version not in {0, 1, 2, 3, 4}:
+            if version not in {0, 1, 2, 3, 4, _RECONCILIATION_SCHEMA_VERSION}:
                 raise ReconciliationError(
                     f"unsupported reconciliation schema version {version}"
                 )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS reconciliation_heads (
-                    execution_record_id TEXT PRIMARY KEY NOT NULL,
-                    action_json TEXT NOT NULL,
-                    state TEXT NOT NULL CHECK(state IN (
-                        'UNKNOWN', 'CONFIRMED_SUCCEEDED',
-                        'CONFIRMED_NOT_APPLIED', 'MANUAL_REVIEW'
-                    )),
-                    revision INTEGER NOT NULL CHECK(revision >= 0),
-                    disposition TEXT NOT NULL CHECK(disposition IN (
-                        'blocked_unknown', 'blocked_manual_review', 'completed',
-                        'applied_no_result', 'retry_allowed'
-                    )),
-                    resolved_result_available INTEGER NOT NULL
-                        CHECK(resolved_result_available IN (0, 1)),
-                    resolved_result_json TEXT,
-                    updated_at TEXT NOT NULL,
-                    CHECK(
-                        (resolved_result_available = 1 AND resolved_result_json IS NOT NULL)
-                        OR (resolved_result_available = 0 AND resolved_result_json IS NULL)
+            if version == 0 and existing_core_tables:
+                raise ReconciliationError(
+                    "reconciliation schema integrity failure: version 0 is inconsistent "
+                    f"with existing core tables {sorted(existing_core_tables)!r}"
+                )
+            if version < 4 and "reconciliation_audit_outbox" in existing_core_tables:
+                raise ReconciliationError(
+                    "reconciliation schema integrity failure: pre-outbox schema version "
+                    "cannot declare a transactional audit outbox"
+                )
+            if version in _RECONCILIATION_LEGACY_CORE_TABLES:
+                if not self._allow_legacy_schema_migration:
+                    raise ReconciliationError(
+                        "pre-outbox reconciliation schema requires an explicit "
+                        "controlled migration via SQLiteReconciliationLedger.migrate_legacy"
                     )
+                self._assert_legacy_schema_integrity(
+                    connection,
+                    version=version,
+                    existing_core_tables=existing_core_tables,
                 )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS reconciliation_events (
-                    event_id TEXT PRIMARY KEY NOT NULL,
-                    execution_record_id TEXT NOT NULL,
-                    revision INTEGER NOT NULL CHECK(revision >= 1),
-                    kind TEXT NOT NULL CHECK(kind IN (
-                        'ATTEMPT_STARTED', 'ATTEMPT_FINISHED', 'STATE_TRANSITION'
-                    )),
-                    state_before TEXT NOT NULL,
-                    state_after TEXT NOT NULL,
-                    occurred_at TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    UNIQUE(execution_record_id, revision),
-                    FOREIGN KEY(execution_record_id)
-                        REFERENCES reconciliation_heads(execution_record_id)
+            if version >= 4:
+                self._assert_audit_outbox_integrity(
+                    connection,
+                    require_alert_marker=version >= 5,
                 )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS reconciliation_prepared_actions (
-                    execution_record_id TEXT PRIMARY KEY NOT NULL,
-                    action_json TEXT NOT NULL,
-                    prepared_at TEXT NOT NULL
+            for table_name in (
+                "reconciliation_heads",
+                "reconciliation_events",
+                "reconciliation_prepared_actions",
+                "reconciliation_audit_outbox",
+            ):
+                _create_reconciliation_table(connection, table_name)
+            outbox_columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(reconciliation_audit_outbox)"
                 )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS reconciliation_audit_outbox (
-                    outbox_id TEXT PRIMARY KEY NOT NULL,
-                    execution_record_id TEXT NOT NULL,
-                    revision INTEGER NOT NULL CHECK(revision >= 0),
-                    event_type TEXT NOT NULL,
-                    event_json TEXT NOT NULL,
-                    event_digest TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    delivery_attempts INTEGER NOT NULL DEFAULT 0
-                        CHECK(delivery_attempts >= 0),
-                    delivered_at TEXT,
-                    last_error_class TEXT,
-                    UNIQUE(execution_record_id, revision, event_type),
-                    FOREIGN KEY(execution_record_id)
-                        REFERENCES reconciliation_heads(execution_record_id)
+            }
+            if "alerted_at" not in outbox_columns:
+                self._suspend_unbound_prepared_action_guard_for_schema_ddl(connection)
+                connection.execute(
+                    "ALTER TABLE reconciliation_audit_outbox ADD COLUMN alerted_at TEXT"
                 )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TRIGGER IF NOT EXISTS reconciliation_events_no_update
-                BEFORE UPDATE ON reconciliation_events
-                BEGIN
-                    SELECT RAISE(ABORT, 'reconciliation events are append-only');
-                END
-                """
-            )
-            connection.execute(
-                """
-                CREATE TRIGGER IF NOT EXISTS reconciliation_events_no_delete
-                BEFORE DELETE ON reconciliation_events
-                BEGIN
-                    SELECT RAISE(ABORT, 'reconciliation events are append-only');
-                END
-                """
-            )
-            connection.execute(
-                """
-                CREATE TRIGGER IF NOT EXISTS reconciliation_prepared_actions_no_update
-                BEFORE UPDATE ON reconciliation_prepared_actions
-                BEGIN
-                    SELECT RAISE(ABORT, 'prepared reconciliation actions are immutable');
-                END
-                """
-            )
-            connection.execute(
-                """
-                CREATE TRIGGER IF NOT EXISTS reconciliation_audit_outbox_immutable
-                BEFORE UPDATE OF outbox_id, execution_record_id, revision, event_type,
-                                 event_json, event_digest, created_at
-                ON reconciliation_audit_outbox
-                BEGIN
-                    SELECT RAISE(
-                        ABORT,
-                        'reconciliation audit outbox payload is immutable'
-                    );
-                END
-                """
-            )
-            connection.execute(
-                """
-                CREATE TRIGGER IF NOT EXISTS reconciliation_audit_outbox_no_delete
-                BEFORE DELETE ON reconciliation_audit_outbox
-                BEGIN
-                    SELECT RAISE(
-                        ABORT,
-                        'reconciliation audit outbox retention requires an explicit migration'
-                    );
-                END
-                """
-            )
+            if version == 4:
+                self._normalize_legacy_snapshot_enqueue_times(connection)
+            for trigger_name in (
+                "reconciliation_events_no_update",
+                "reconciliation_events_no_delete",
+                "reconciliation_prepared_actions_no_update",
+                "reconciliation_audit_outbox_immutable",
+                "reconciliation_audit_outbox_no_delete",
+            ):
+                _create_reconciliation_trigger(connection, trigger_name)
             connection.execute(
                 """
                 DROP TRIGGER IF EXISTS reconciliation_prepared_actions_no_delete
                 """
             )
-            connection.execute(
-                """
-                CREATE TRIGGER IF NOT EXISTS reconciliation_prepared_actions_delete_guard
-                BEFORE DELETE ON reconciliation_prepared_actions
-                WHEN EXISTS (
-                    SELECT 1 FROM reconciliation_heads
-                    WHERE reconciliation_heads.execution_record_id =
-                          OLD.execution_record_id
-                ) OR EXISTS (
-                    SELECT 1 FROM idempotency_records
-                    WHERE idempotency_records.execution_record_id =
-                          OLD.execution_record_id
-                      AND idempotency_records.state != 'completed'
-                )
-                BEGIN
-                    SELECT RAISE(
-                        ABORT,
-                        'prepared reconciliation action cannot be deleted before retention is safe'
-                    );
-                END
-                """
+            _create_reconciliation_trigger(
+                connection,
+                "reconciliation_prepared_actions_delete_guard",
             )
-            connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_reconciliation_audit_outbox_pending
-                ON reconciliation_audit_outbox(delivered_at, execution_record_id, revision)
-                """
-            )
+            _create_reconciliation_pending_index(connection)
             if version < 4:
                 self._backfill_legacy_audit_outbox(connection)
             connection.execute(
                 """
-                INSERT INTO reconciliation_schema(singleton, version) VALUES (1, 4)
+                INSERT INTO reconciliation_schema(singleton, version)
+                VALUES (1, ?)
                 ON CONFLICT(singleton) DO UPDATE SET version = excluded.version
+                """,
+                (_RECONCILIATION_SCHEMA_VERSION,),
+            )
+            stored_version = connection.execute(
+                "SELECT version FROM reconciliation_schema WHERE singleton = 1"
+            ).fetchone()
+            if (
+                stored_version is None
+                or stored_version[0] != _RECONCILIATION_SCHEMA_VERSION
+            ):
+                raise ReconciliationError(
+                    "reconciliation schema integrity failure: version update did not "
+                    "persist the released schema version"
+                )
+            self._assert_audit_outbox_integrity(
+                connection,
+                require_alert_marker=True,
+            )
+            if owns_transaction:
+                connection.commit()
+
+    @staticmethod
+    def _existing_core_tables(connection: sqlite3.Connection) -> set[str]:
+        return {
+            str(row[0]).lower()
+            for row in connection.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'table' AND lower(name) IN (
+                    'reconciliation_heads',
+                    'reconciliation_events',
+                    'reconciliation_prepared_actions',
+                    'reconciliation_audit_outbox'
+                )
                 """
             )
-            connection.commit()
+        }
+
+    @staticmethod
+    def _assert_version_table_integrity(connection: sqlite3.Connection) -> None:
+        table = connection.execute(
+            """
+            SELECT sql FROM sqlite_master
+            WHERE type = 'table'
+              AND name = 'reconciliation_schema' COLLATE NOCASE
+            """
+        ).fetchone()
+        if table is None or table[0] is None:
+            raise ReconciliationError(
+                "reconciliation schema integrity failure: version table definition is missing"
+            )
+        columns = {
+            str(row[1]): row
+            for row in connection.execute("PRAGMA table_info(reconciliation_schema)")
+        }
+        if {"singleton", "version"} - set(columns):
+            raise ReconciliationError(
+                "reconciliation schema integrity failure: version table columns are invalid"
+            )
+        if int(columns["singleton"][5]) != 1 or int(columns["version"][3]) != 1:
+            raise ReconciliationError(
+                "reconciliation schema integrity failure: version table constraints are invalid"
+            )
+        if _normalize_schema_sql(str(table[0])) != _normalize_schema_sql(
+            _RECONCILIATION_TABLE_DDL["reconciliation_schema"]
+        ):
+            raise ReconciliationError(
+                "reconciliation schema integrity failure: version table definition is invalid"
+            )
+
+    @staticmethod
+    def _persistent_triggers_for_tables(
+        connection: sqlite3.Connection,
+        table_names: frozenset[str] | set[str],
+    ) -> dict[str, tuple[str, str]]:
+        normalized_tables = tuple(sorted(name.lower() for name in table_names))
+        placeholders = ", ".join("?" for _ in normalized_tables)
+        return {
+            str(row[0]).lower(): (str(row[1]), str(row[2]))
+            for row in connection.execute(
+                """
+                SELECT name, type, sql FROM sqlite_master
+                WHERE type = 'trigger' AND lower(tbl_name) IN (%s)
+                """
+                % placeholders,
+                normalized_tables,
+            )
+        }
+
+    @staticmethod
+    def _explicit_indexes_for_tables(
+        connection: sqlite3.Connection,
+        table_names: frozenset[str] | set[str],
+    ) -> dict[str, str]:
+        normalized_tables = tuple(sorted(name.lower() for name in table_names))
+        placeholders = ", ".join("?" for _ in normalized_tables)
+        return {
+            str(row[0]).lower(): str(row[1])
+            for row in connection.execute(
+                """
+                SELECT name, sql FROM sqlite_master
+                WHERE type = 'index'
+                  AND sql IS NOT NULL
+                  AND lower(tbl_name) IN (%s)
+                """
+                % placeholders,
+                normalized_tables,
+            )
+        }
+
+    @staticmethod
+    def _assert_legacy_schema_integrity(
+        connection: sqlite3.Connection,
+        *,
+        version: int,
+        existing_core_tables: set[str],
+    ) -> None:
+        """Verify the complete pre-outbox authority set before an opt-in upgrade."""
+
+        expected_tables = _RECONCILIATION_LEGACY_CORE_TABLES[version]
+        if existing_core_tables != expected_tables:
+            raise ReconciliationError(
+                "reconciliation schema integrity failure: pre-outbox authority "
+                f"tables are invalid for version {version}: "
+                f"expected {sorted(expected_tables)!r}, found "
+                f"{sorted(existing_core_tables)!r}"
+            )
+        for table_name in expected_tables:
+            table = connection.execute(
+                """
+                SELECT sql FROM sqlite_master
+                WHERE type = 'table' AND name = ? COLLATE NOCASE
+                """,
+                (table_name,),
+            ).fetchone()
+            if table is None or table[0] is None or _normalize_schema_sql(
+                str(table[0])
+            ) != _normalize_schema_sql(_RECONCILIATION_TABLE_DDL[table_name]):
+                raise ReconciliationError(
+                    "reconciliation schema integrity failure: pre-outbox table "
+                    f"definition differs for {table_name!r}"
+                )
+
+        expected_triggers = {
+            "reconciliation_events_no_update",
+            "reconciliation_events_no_delete",
+        }
+        if version >= 2:
+            expected_triggers.update(
+                {
+                    "reconciliation_prepared_actions_no_update",
+                    "reconciliation_prepared_actions_delete_guard",
+                }
+            )
+        objects = SQLiteReconciliationLedger._persistent_triggers_for_tables(
+            connection,
+            expected_tables | {"reconciliation_schema"},
+        )
+        if set(objects) != expected_triggers or any(
+            kind != "trigger" for kind, _ in objects.values()
+        ):
+            raise ReconciliationError(
+                "reconciliation schema integrity failure: pre-outbox guards are invalid"
+            )
+        for trigger_name in expected_triggers:
+            SQLiteReconciliationLedger._assert_trigger_contract(
+                objects,
+                trigger_name,
+                expected_definition=_RECONCILIATION_TRIGGER_DDL[trigger_name],
+            )
+        if connection.execute("PRAGMA foreign_key_check(reconciliation_events)").fetchone():
+            raise ReconciliationError(
+                "reconciliation schema integrity failure: foreign-key check failed "
+                "for 'reconciliation_events'"
+            )
+
+    @staticmethod
+    def _normalize_legacy_snapshot_enqueue_times(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Correct v4 snapshot enqueue metadata during the controlled v5 upgrade.
+
+        v4 used the lineage timestamp for ``created_at``.  A migration snapshot
+        did not exist at that historical time, so an unattempted snapshot could
+        immediately satisfy the delivery-age alert threshold on upgrade.  Its
+        payload retains the historical lineage timestamp; only the mutable
+        delivery-queue enqueue timestamp is corrected here.
+        """
+
+        pending_snapshots = connection.execute(
+            """
+            SELECT 1 FROM reconciliation_audit_outbox
+            WHERE event_type = 'migration_snapshot_recorded'
+              AND delivered_at IS NULL
+              AND delivery_attempts = 0
+              AND last_error_class IS NULL
+            LIMIT 1
+            """
+        ).fetchone()
+        if pending_snapshots is None:
+            return
+        # The immutable trigger is restored in this same BEGIN IMMEDIATE
+        # transaction. SQLite rolls back both DDL and the metadata rewrite if
+        # initialization fails before commit.
+        connection.execute(
+            "DROP TRIGGER IF EXISTS reconciliation_audit_outbox_immutable"
+        )
+        connection.execute(
+            """
+            UPDATE reconciliation_audit_outbox
+            SET created_at = ?
+            WHERE event_type = 'migration_snapshot_recorded'
+              AND delivered_at IS NULL
+              AND delivery_attempts = 0
+              AND last_error_class IS NULL
+            """,
+            (_timestamp_text(datetime.now(timezone.utc)),),
+        )
+
+    @staticmethod
+    def _suspend_unbound_prepared_action_guard_for_schema_ddl(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Avoid SQLite reparsing an optional authority table during an upgrade.
+
+        A standalone ledger is valid before it is paired with an idempotency
+        store. SQLite allows the retention trigger to be created in that state,
+        but reparses its optional ``idempotency_records`` reference while an
+        unrelated ``ALTER TABLE`` runs. The initializer recreates this exact
+        guard later in the same exclusive transaction.
+        """
+
+        idempotency_table = connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'idempotency_records' COLLATE NOCASE
+            """
+        ).fetchone()
+        if idempotency_table is None:
+            connection.execute(
+                "DROP TRIGGER IF EXISTS reconciliation_prepared_actions_delete_guard"
+            )
+
+    @staticmethod
+    def _assert_audit_outbox_integrity(
+        connection: sqlite3.Connection,
+        *,
+        require_alert_marker: bool,
+    ) -> None:
+        """Refuse a partially restored versioned reconciliation schema.
+
+        Version 4 made the outbox part of the authoritative recovery record.
+        Its surrounding heads, append-only events, and prepared actions are
+        equally authoritative.  A declared version 4 or 5 database must not be
+        "healed" by ``CREATE IF NOT EXISTS`` because that can conceal a lost
+        recovery or delivery obligation.
+        """
+
+        tables = SQLiteReconciliationLedger._existing_core_tables(connection)
+        if "reconciliation_audit_outbox" not in tables:
+            raise ReconciliationError(
+                "reconciliation schema integrity failure: audit outbox table is missing"
+            )
+        if missing_tables := _RECONCILIATION_CORE_TABLES - tables:
+            raise ReconciliationError(
+                "reconciliation schema integrity failure: core tables are missing "
+                f"{sorted(missing_tables)!r}"
+            )
+
+        outbox_columns = (
+            "outbox_id",
+            "execution_record_id",
+            "revision",
+            "event_type",
+            "event_json",
+            "event_digest",
+            "created_at",
+            "delivery_attempts",
+            "delivered_at",
+            "last_error_class",
+        )
+        if require_alert_marker:
+            outbox_columns += ("alerted_at",)
+        outbox_definition = (
+            _RECONCILIATION_TABLE_DDL["reconciliation_audit_outbox"]
+            if require_alert_marker
+            else _RECONCILIATION_V4_AUDIT_OUTBOX_DDL
+        )
+        table_contracts = {
+            "reconciliation_heads": (
+                _RECONCILIATION_TABLE_DDL["reconciliation_heads"],
+                (
+                    "execution_record_id",
+                    "action_json",
+                    "state",
+                    "revision",
+                    "disposition",
+                    "resolved_result_available",
+                    "resolved_result_json",
+                    "updated_at",
+                ),
+                ("execution_record_id",),
+                (
+                    "execution_record_id",
+                    "action_json",
+                    "state",
+                    "revision",
+                    "disposition",
+                    "resolved_result_available",
+                    "updated_at",
+                ),
+            ),
+            "reconciliation_events": (
+                _RECONCILIATION_TABLE_DDL["reconciliation_events"],
+                (
+                    "event_id",
+                    "execution_record_id",
+                    "revision",
+                    "kind",
+                    "state_before",
+                    "state_after",
+                    "occurred_at",
+                    "payload_json",
+                ),
+                ("event_id",),
+                (
+                    "event_id",
+                    "execution_record_id",
+                    "revision",
+                    "kind",
+                    "state_before",
+                    "state_after",
+                    "occurred_at",
+                    "payload_json",
+                ),
+            ),
+            "reconciliation_prepared_actions": (
+                _RECONCILIATION_TABLE_DDL["reconciliation_prepared_actions"],
+                ("execution_record_id", "action_json", "prepared_at"),
+                ("execution_record_id",),
+                ("execution_record_id", "action_json", "prepared_at"),
+            ),
+            "reconciliation_audit_outbox": (
+                outbox_definition,
+                outbox_columns,
+                ("outbox_id",),
+                (
+                    "outbox_id",
+                    "execution_record_id",
+                    "revision",
+                    "event_type",
+                    "event_json",
+                    "event_digest",
+                    "created_at",
+                    "delivery_attempts",
+                ),
+            ),
+        }
+        for (
+            table_name,
+            (
+                expected_definition,
+                columns,
+                primary_key,
+                required_not_null_columns,
+            ),
+        ) in table_contracts.items():
+            SQLiteReconciliationLedger._assert_table_contract(
+                connection,
+                table_name,
+                expected_definition=expected_definition,
+                required_columns=columns,
+                primary_key=primary_key,
+                required_not_null_columns=required_not_null_columns,
+            )
+        SQLiteReconciliationLedger._assert_unique_constraint(
+            connection,
+            "reconciliation_events",
+            ("execution_record_id", "revision"),
+        )
+        SQLiteReconciliationLedger._assert_unique_constraint(
+            connection,
+            "reconciliation_audit_outbox",
+            ("execution_record_id", "revision", "event_type"),
+        )
+        SQLiteReconciliationLedger._assert_foreign_key(
+            connection,
+            "reconciliation_events",
+            from_column="execution_record_id",
+            target_table="reconciliation_heads",
+            target_column="execution_record_id",
+        )
+        SQLiteReconciliationLedger._assert_foreign_key(
+            connection,
+            "reconciliation_audit_outbox",
+            from_column="execution_record_id",
+            target_table="reconciliation_heads",
+            target_column="execution_record_id",
+        )
+        SQLiteReconciliationLedger._assert_reconciliation_foreign_keys(connection)
+
+        trigger_objects = SQLiteReconciliationLedger._persistent_triggers_for_tables(
+            connection,
+            _RECONCILIATION_AUTHORITY_TABLES,
+        )
+        if set(trigger_objects) != set(_RECONCILIATION_TRIGGER_DDL) or any(
+            kind != "trigger" for kind, _ in trigger_objects.values()
+        ):
+            raise ReconciliationError(
+                "reconciliation schema integrity failure: reconciliation guards are "
+                "incomplete or unexpected"
+            )
+        for trigger_name, expected_definition in _RECONCILIATION_TRIGGER_DDL.items():
+            SQLiteReconciliationLedger._assert_trigger_contract(
+                trigger_objects,
+                trigger_name,
+                expected_definition=expected_definition,
+            )
+        pending_indexes = tuple(
+            index
+            for index in connection.execute(
+                "PRAGMA index_list(reconciliation_audit_outbox)"
+            )
+            if str(index[1]).lower() == "idx_reconciliation_audit_outbox_pending"
+        )
+        if (
+            len(pending_indexes) != 1
+            or int(pending_indexes[0][2]) != 0
+            or int(pending_indexes[0][4]) != 0
+        ):
+            raise ReconciliationError(
+                "reconciliation schema integrity failure: audit outbox pending "
+                "index is invalid"
+            )
+        index_columns = tuple(
+            str(row[2])
+            for row in connection.execute(
+                "PRAGMA index_info(idx_reconciliation_audit_outbox_pending)"
+            )
+        )
+        if index_columns != ("delivered_at", "execution_record_id", "revision"):
+            raise ReconciliationError(
+                "reconciliation schema integrity failure: audit outbox pending "
+                "index is invalid"
+            )
+        explicit_indexes = SQLiteReconciliationLedger._explicit_indexes_for_tables(
+            connection,
+            _RECONCILIATION_AUTHORITY_TABLES,
+        )
+        if set(explicit_indexes) != {"idx_reconciliation_audit_outbox_pending"}:
+            raise ReconciliationError(
+                "reconciliation schema integrity failure: reconciliation indexes are "
+                "invalid or unexpected"
+            )
+        if _normalize_schema_sql(
+            explicit_indexes["idx_reconciliation_audit_outbox_pending"]
+        ) != _normalize_schema_sql(_RECONCILIATION_PENDING_INDEX_DDL):
+            raise ReconciliationError(
+                "reconciliation schema integrity failure: audit outbox pending "
+                "index definition is invalid"
+            )
+        SQLiteReconciliationLedger._assert_audit_outbox_guards_enforced(
+            connection,
+            include_alert_marker=require_alert_marker,
+        )
+
+    @staticmethod
+    def _assert_table_contract(
+        connection: sqlite3.Connection,
+        table_name: str,
+        *,
+        expected_definition: str,
+        required_columns: tuple[str, ...],
+        primary_key: tuple[str, ...],
+        required_not_null_columns: tuple[str, ...],
+    ) -> None:
+        table = connection.execute(
+            """
+            SELECT sql FROM sqlite_master
+            WHERE type = 'table' AND name = ? COLLATE NOCASE
+            """,
+            (table_name,),
+        ).fetchone()
+        if table is None or table[0] is None:
+            raise ReconciliationError(
+                "reconciliation schema integrity failure: core table definition is "
+                f"missing for {table_name!r}"
+            )
+        if _normalize_schema_sql(str(table[0])) != _normalize_schema_sql(
+            expected_definition
+        ):
+            raise ReconciliationError(
+                "reconciliation schema integrity failure: core table definition differs "
+                f"for {table_name!r}"
+            )
+        columns = {
+            str(row[1]): row
+            for row in connection.execute(f"PRAGMA table_info({table_name})")
+        }
+        if missing_columns := set(required_columns) - set(columns):
+            raise ReconciliationError(
+                "reconciliation schema integrity failure: core table columns are "
+                f"missing from {table_name!r}: {sorted(missing_columns)!r}"
+            )
+        primary_key_columns = tuple(
+            str(row[1])
+            for row in sorted(
+                columns.values(),
+                key=lambda row: int(row[5]),
+            )
+            if int(row[5]) > 0
+        )
+        if primary_key_columns != primary_key:
+            raise ReconciliationError(
+                "reconciliation schema integrity failure: core table primary key is "
+                f"invalid for {table_name!r}"
+            )
+        nullable_columns = [
+            column
+            for column in required_not_null_columns
+            if int(columns[column][3]) != 1
+        ]
+        if nullable_columns:
+            raise ReconciliationError(
+                "reconciliation schema integrity failure: core table non-null "
+                f"constraints are invalid for {table_name!r}: {nullable_columns!r}"
+            )
+
+    @staticmethod
+    def _assert_unique_constraint(
+        connection: sqlite3.Connection,
+        table_name: str,
+        expected_columns: tuple[str, ...],
+    ) -> None:
+        for index in connection.execute(f"PRAGMA index_list({table_name})"):
+            if int(index[2]) != 1 or int(index[4]) != 0:
+                continue
+            index_name = str(index[1])
+            columns = tuple(
+                str(row[2])
+                for row in connection.execute(f"PRAGMA index_info({index_name})")
+            )
+            if columns == expected_columns:
+                return
+        raise ReconciliationError(
+            "reconciliation schema integrity failure: required unique constraint is "
+            f"missing from {table_name!r}"
+        )
+
+    @staticmethod
+    def _assert_foreign_key(
+        connection: sqlite3.Connection,
+        table_name: str,
+        *,
+        from_column: str,
+        target_table: str,
+        target_column: str,
+    ) -> None:
+        for foreign_key in connection.execute(f"PRAGMA foreign_key_list({table_name})"):
+            if (
+                str(foreign_key[2]) == target_table
+                and str(foreign_key[3]) == from_column
+                and str(foreign_key[4]) == target_column
+            ):
+                return
+        raise ReconciliationError(
+            "reconciliation schema integrity failure: required foreign key is "
+            f"missing from {table_name!r}"
+        )
+
+    @staticmethod
+    def _assert_reconciliation_foreign_keys(connection: sqlite3.Connection) -> None:
+        for table_name in (
+            "reconciliation_events",
+            "reconciliation_audit_outbox",
+        ):
+            if connection.execute(
+                f"PRAGMA foreign_key_check({table_name})"
+            ).fetchone() is not None:
+                raise ReconciliationError(
+                    "reconciliation schema integrity failure: foreign-key check failed "
+                    f"for {table_name!r}"
+                )
+
+    @staticmethod
+    def _assert_trigger_contract(
+        objects: Mapping[str, tuple[str, str]],
+        trigger_name: str,
+        *,
+        expected_definition: str,
+    ) -> None:
+        if _normalize_schema_sql(objects[trigger_name][1]) != _normalize_schema_sql(
+            expected_definition
+        ):
+            raise ReconciliationError(
+                "reconciliation schema integrity failure: guard definition differs "
+                f"for {trigger_name!r}"
+            )
+
+    @staticmethod
+    def _assert_audit_outbox_guards_enforced(
+        connection: sqlite3.Connection,
+        *,
+        include_alert_marker: bool,
+    ) -> None:
+        """Probe immutable and retention guards without retaining a test row."""
+
+        execution_record_id = f"schema-probe-{secrets.token_hex(16)}"
+        outbox_id = f"schema-probe-{secrets.token_hex(16)}"
+        now = _timestamp_text(datetime.now(timezone.utc))
+        connection.execute("SAVEPOINT reconciliation_schema_guard_probe")
+        try:
+            connection.execute(
+                """
+                INSERT INTO reconciliation_heads(
+                    execution_record_id, action_json, state, revision, disposition,
+                    resolved_result_available, resolved_result_json, updated_at
+                ) VALUES (?, '{}', 'UNKNOWN', 0, 'blocked_unknown', 0, NULL, ?)
+                """,
+                (execution_record_id, now),
+            )
+            alert_columns = ", alerted_at" if include_alert_marker else ""
+            alert_values = ", NULL" if include_alert_marker else ""
+            connection.execute(
+                """
+                INSERT INTO reconciliation_audit_outbox(
+                    outbox_id, execution_record_id, revision, event_type, event_json,
+                    event_digest, created_at, delivery_attempts, delivered_at,
+                    last_error_class%s
+                ) VALUES (?, ?, 0, 'schema_probe', '{}', ?, ?, 0, NULL, NULL%s)
+                """
+                % (alert_columns, alert_values),
+                (
+                    outbox_id,
+                    execution_record_id,
+                    hashlib.sha256(b"{}").hexdigest(),
+                    now,
+                ),
+            )
+            try:
+                connection.execute(
+                    "UPDATE reconciliation_audit_outbox SET event_json = '{\"x\":1}' "
+                    "WHERE outbox_id = ?",
+                    (outbox_id,),
+                )
+            except sqlite3.DatabaseError:
+                pass
+            else:
+                raise ReconciliationError(
+                    "reconciliation schema integrity failure: audit outbox immutable "
+                    "guard does not reject payload mutation"
+                )
+            try:
+                connection.execute(
+                    "DELETE FROM reconciliation_audit_outbox WHERE outbox_id = ?",
+                    (outbox_id,),
+                )
+            except sqlite3.DatabaseError:
+                pass
+            else:
+                raise ReconciliationError(
+                    "reconciliation schema integrity failure: audit outbox retention "
+                    "guard does not reject deletion"
+                )
+        except sqlite3.DatabaseError as exc:
+            raise ReconciliationError(
+                "reconciliation schema integrity failure: audit outbox guard probe failed"
+            ) from exc
+        finally:
+            connection.execute("ROLLBACK TO reconciliation_schema_guard_probe")
+            connection.execute("RELEASE reconciliation_schema_guard_probe")
 
     def _backfill_legacy_audit_outbox(self, connection: sqlite3.Connection) -> None:
         """Establish an auditable migration boundary for pre-outbox records.
@@ -2310,30 +3485,6 @@ class SQLiteReconciliationLedger:
                 head,
                 event_type="migration_snapshot_recorded",
             )
-
-    def _migrate_legacy_idempotency_if_needed(self) -> None:
-        with self._connect() as connection:
-            table_exists = connection.execute(
-                """
-                SELECT 1 FROM sqlite_master
-                WHERE type = 'table' AND name = 'idempotency_records'
-                """
-            ).fetchone()
-            if table_exists is None:
-                return
-            columns = {
-                row[1]
-                for row in connection.execute("PRAGMA table_info(idempotency_records)")
-            }
-        if {"execution_record_id", "generation"}.issubset(columns):
-            return
-        from .registry import SQLiteIdempotencyStore
-
-        SQLiteIdempotencyStore(
-            self.path,
-            timeout_seconds=self.timeout_seconds,
-            journal_mode=self._journal_mode,
-        )
 
     def _connect(self) -> sqlite3.Connection:
         return connect_sqlite(self.path, self.timeout_seconds)
@@ -2455,7 +3606,7 @@ def enqueue_reconciliation_audit_outbox(
             event_type,
             encoded,
             payload_digest,
-            _timestamp_text(head.updated_at),
+            _timestamp_text(datetime.now(timezone.utc)),
         ),
     )
     return outbox_id

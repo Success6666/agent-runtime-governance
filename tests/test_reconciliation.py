@@ -4,7 +4,7 @@ import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
@@ -45,10 +45,31 @@ from agent_runtime_governance._sqlite import (
     sqlite_journal_capabilities,
     sqlite_wal_is_safe,
 )
-from agent_runtime_governance.reconciliation import _require_legal_transition
+from agent_runtime_governance.reconciliation import (
+    _require_legal_transition,
+    enqueue_reconciliation_audit_outbox,
+)
 
 _ACTION_DIGEST = "a" * 64
 _OPERATOR_DIGEST = "b" * 64
+_LEGACY_IDEMPOTENCY_V05_SCHEMA = """
+CREATE TABLE idempotency_records (
+    namespace TEXT NOT NULL,
+    key TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('pending', 'completed', 'unknown')),
+    result_json TEXT,
+    error TEXT,
+    owner_token TEXT,
+    lease_expires_at TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(namespace, key),
+    CHECK(
+        (state = 'pending' AND owner_token IS NOT NULL AND lease_expires_at IS NOT NULL)
+        OR (state != 'pending' AND owner_token IS NULL AND lease_expires_at IS NULL)
+    )
+)
+"""
 
 
 async def _provider(context: ReconciliationAttemptContext) -> ReconciliationFinding:
@@ -226,6 +247,29 @@ def test_stale_attempt_and_transition_cas_fail_closed() -> None:
             ReconciliationAttemptOutcome.TIMEOUT,
             0,
         )
+
+
+def test_in_memory_prepare_action_matches_durable_claim_bindings() -> None:
+    store = InMemoryIdempotencyStore()
+    claim = store.acquire("tenant/charge", "request-1", _ACTION_DIGEST)
+    assert claim.execution_record_id is not None
+    action = _unknown(claim.execution_record_id)
+    ledger = InMemoryReconciliationLedger()
+
+    with pytest.raises(ReconciliationValidationError, match="digest"):
+        ledger.prepare_action(claim, replace(action, action_digest="c" * 64))
+    with pytest.raises(ReconciliationValidationError, match="namespace"):
+        ledger.prepare_action(
+            claim,
+            replace(
+                action,
+                idempotency_namespace_digest=idempotency_namespace_digest(
+                    "other/charge"
+                ),
+            ),
+        )
+
+    ledger.prepare_action(claim, action)
 
 
 @pytest.mark.parametrize(
@@ -732,7 +776,7 @@ def test_expired_atomically_prepared_lease_materializes_reconciliation_head(
     assert ledger.current(action.execution_record_id).action.to_dict() == action.to_dict()
 
 
-def test_legacy_lease_recovery_backfills_audit_snapshot_during_v4_migration(
+def test_legacy_lease_recovery_backfills_audit_snapshot_during_v5_migration(
     tmp_path: Path,
 ) -> None:
     """A recovery performed before the outbox migration must remain auditable."""
@@ -791,7 +835,7 @@ def test_legacy_lease_recovery_backfills_audit_snapshot_during_v4_migration(
     with pytest.raises(IdempotencyOutcomeUnknownError):
         duplicate.future.result()
 
-    migrated = SQLiteReconciliationLedger(path)
+    migrated = SQLiteReconciliationLedger.migrate_legacy(path)
     head = migrated.current(claim.execution_record_id)
     assert head.state is ReconciliationState.UNKNOWN
     pending = migrated.pending_audit_events(
@@ -805,7 +849,7 @@ def test_legacy_lease_recovery_backfills_audit_snapshot_during_v4_migration(
         version = connection.execute(
             "SELECT version FROM reconciliation_schema WHERE singleton = 1"
         ).fetchone()[0]
-    assert version == 4
+    assert version == 5
 
 
 def test_reconciliation_audit_outbox_is_ordered_and_redacted(tmp_path: Path) -> None:
@@ -857,6 +901,843 @@ def test_reconciliation_audit_outbox_is_ordered_and_redacted(tmp_path: Path) -> 
         "attempt_finished",
         "transition_recorded",
     ]
+
+
+def test_reconciliation_audit_outbox_emits_stall_warning(tmp_path: Path, caplog) -> None:
+    path = tmp_path / "reconciliation-audit-alert.db"
+    store = SQLiteIdempotencyStore(path)
+    claim = store.acquire("tenant/charge", "request-1", _ACTION_DIGEST)
+    assert claim.execution_record_id is not None
+    ledger = SQLiteReconciliationLedger(
+        path,
+        audit_delivery_alert_attempts=1,
+        audit_delivery_alert_age_seconds=3_600,
+    )
+    ledger.record_unknown(
+        claim,
+        _unknown(claim.execution_record_id),
+        TimeoutError("outcome uncertain"),
+    )
+    envelope = ledger.pending_audit_events(
+        execution_record_id=claim.execution_record_id
+    )[0]
+
+    caplog.set_level("WARNING", logger="agent_runtime_governance.reconciliation")
+    ledger.record_audit_delivery_failure(envelope.outbox_id, RuntimeError("sink down"))
+
+    assert "reconciliation audit delivery is stalled" in caplog.text
+    assert claim.execution_record_id in caplog.text
+    assert "max_delivery_attempts=1" in caplog.text
+    assert "sink down" not in caplog.text
+
+    caplog.clear()
+    ledger.record_audit_delivery_failure(envelope.outbox_id, RuntimeError("sink down"))
+    restarted = SQLiteReconciliationLedger(
+        path,
+        audit_delivery_alert_attempts=1,
+        audit_delivery_alert_age_seconds=3_600,
+    )
+    restarted.pending_audit_events(execution_record_id=claim.execution_record_id)
+    assert "reconciliation audit delivery is stalled" not in caplog.text
+
+
+def test_v4_audit_outbox_alert_marker_migrates_without_losing_pending_event(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "v4-audit-outbox-alert-migration.db"
+    store = SQLiteIdempotencyStore(path)
+    claim = store.acquire("tenant/charge", "request-1", _ACTION_DIGEST)
+    assert claim.execution_record_id is not None
+    ledger = SQLiteReconciliationLedger(path)
+    ledger.record_unknown(
+        claim,
+        _unknown(claim.execution_record_id),
+        TimeoutError("outcome uncertain"),
+    )
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute(
+                "ALTER TABLE reconciliation_audit_outbox DROP COLUMN alerted_at"
+            )
+            connection.execute(
+                "UPDATE reconciliation_schema SET version = 4 WHERE singleton = 1"
+            )
+
+    migrated = SQLiteReconciliationLedger(path)
+    pending = migrated.pending_audit_events(execution_record_id=claim.execution_record_id)
+    assert len(pending) == 1
+    with closing(sqlite3.connect(path)) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(reconciliation_audit_outbox)")
+        }
+        version = connection.execute(
+            "SELECT version FROM reconciliation_schema WHERE singleton = 1"
+        ).fetchone()[0]
+    assert "alerted_at" in columns
+    assert version == 5
+
+
+def test_v4_snapshot_upgrade_uses_migration_time_for_delivery_age(
+    tmp_path: Path, caplog
+) -> None:
+    path = tmp_path / "v4-snapshot-enqueue-time.db"
+    ledger = SQLiteReconciliationLedger(path)
+    head = ledger.create_unknown(_unknown())
+    with connect_sqlite(path, 30.0) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        enqueue_reconciliation_audit_outbox(
+            connection,
+            head,
+            event_type="migration_snapshot_recorded",
+        )
+        connection.commit()
+
+    historical_time = datetime.now(timezone.utc) - timedelta(hours=2)
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute(
+                "DROP TRIGGER IF EXISTS reconciliation_audit_outbox_immutable"
+            )
+            connection.execute(
+                "DROP TRIGGER IF EXISTS reconciliation_prepared_actions_delete_guard"
+            )
+            connection.execute(
+                """
+                UPDATE reconciliation_audit_outbox
+                SET created_at = ?
+                WHERE event_type = 'migration_snapshot_recorded'
+                """,
+                (historical_time.isoformat(),),
+            )
+            connection.execute(
+                "ALTER TABLE reconciliation_audit_outbox DROP COLUMN alerted_at"
+            )
+            connection.execute(
+                "UPDATE reconciliation_schema SET version = 4 WHERE singleton = 1"
+            )
+            connection.execute(
+                """
+                CREATE TRIGGER reconciliation_prepared_actions_delete_guard
+                BEFORE DELETE ON reconciliation_prepared_actions
+                WHEN EXISTS (
+                    SELECT 1 FROM reconciliation_heads
+                    WHERE reconciliation_heads.execution_record_id =
+                          OLD.execution_record_id
+                ) OR EXISTS (
+                    SELECT 1 FROM idempotency_records
+                    WHERE idempotency_records.execution_record_id =
+                          OLD.execution_record_id
+                      AND idempotency_records.state != 'completed'
+                )
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'prepared reconciliation action cannot be deleted before retention is safe'
+                    );
+                END
+                """
+            )
+            connection.execute(
+                """
+                CREATE TRIGGER reconciliation_audit_outbox_immutable
+                BEFORE UPDATE OF outbox_id, execution_record_id, revision, event_type,
+                                 event_json, event_digest, created_at
+                ON reconciliation_audit_outbox
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'reconciliation audit outbox payload is immutable'
+                    );
+                END
+                """
+            )
+
+    migration_started = datetime.now(timezone.utc)
+    caplog.set_level("WARNING", logger="agent_runtime_governance.reconciliation")
+    upgraded = SQLiteReconciliationLedger(
+        path,
+        audit_delivery_alert_attempts=10,
+        audit_delivery_alert_age_seconds=3_600,
+    )
+    snapshots = [
+        envelope
+        for envelope in upgraded.pending_audit_events()
+        if envelope.event_type == "migration_snapshot_recorded"
+    ]
+
+    assert len(snapshots) == 1
+    assert snapshots[0].created_at >= migration_started - timedelta(seconds=1)
+    assert snapshots[0].event["timestamp"] == head.updated_at.isoformat()
+    assert "reconciliation audit delivery is stalled" not in caplog.text
+
+
+def test_missing_v4_audit_outbox_fails_closed_before_empty_recreation(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "missing-v4-audit-outbox.db"
+    store = SQLiteIdempotencyStore(path)
+    claim = store.acquire("tenant/charge", "request-1", _ACTION_DIGEST)
+    assert claim.execution_record_id is not None
+    ledger = SQLiteReconciliationLedger(path)
+    ledger.record_unknown(
+        claim,
+        _unknown(claim.execution_record_id),
+        TimeoutError("outcome uncertain"),
+    )
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute(
+                "DROP TRIGGER IF EXISTS reconciliation_audit_outbox_immutable"
+            )
+            connection.execute(
+                "DROP TRIGGER IF EXISTS reconciliation_audit_outbox_no_delete"
+            )
+            connection.execute("DROP TABLE reconciliation_audit_outbox")
+            connection.execute(
+                "UPDATE reconciliation_schema SET version = 4 WHERE singleton = 1"
+            )
+
+    with pytest.raises(ReconciliationError, match="audit outbox table is missing"):
+        SQLiteReconciliationLedger(path)
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'reconciliation_audit_outbox'
+            """
+        ).fetchone() is None
+
+
+def test_declared_outbox_schema_rejects_missing_core_event_table(tmp_path: Path) -> None:
+    path = tmp_path / "missing-v5-events.db"
+    SQLiteReconciliationLedger(path)
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute("DROP TABLE reconciliation_events")
+
+    with pytest.raises(
+        ReconciliationError,
+        match="core tables are missing .*reconciliation_events",
+    ):
+        SQLiteReconciliationLedger(path)
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'reconciliation_events'
+            """
+        ).fetchone() is None
+
+
+@pytest.mark.parametrize(
+    "table_name",
+    ["RECONCILIATION_HEADS", "Reconciliation_Audit_Outbox"],
+)
+def test_first_initialization_rejects_case_insensitive_weak_core_table(
+    tmp_path: Path,
+    table_name: str,
+) -> None:
+    path = tmp_path / f"weak-{table_name.lower()}.db"
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute(
+            f"CREATE TABLE {table_name} (execution_record_id TEXT PRIMARY KEY)"
+        )
+        connection.commit()
+
+    with pytest.raises(ReconciliationError, match="version table is missing"):
+        SQLiteReconciliationLedger(path)
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND lower(name) = 'reconciliation_schema'
+            """
+        ).fetchone() is None
+
+
+def test_first_initialization_rejects_case_changed_version_table(tmp_path: Path) -> None:
+    path = tmp_path / "case-changed-version-table.db"
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute(
+            """
+            CREATE TABLE RECONCILIATION_SCHEMA (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                version INTEGER NOT NULL
+            )
+            """
+        )
+        connection.commit()
+
+    with pytest.raises(ReconciliationError, match="version table definition is invalid"):
+        SQLiteReconciliationLedger(path)
+
+
+def test_declared_outbox_schema_rejects_missing_version_table(tmp_path: Path) -> None:
+    path = tmp_path / "missing-v5-version-table.db"
+    SQLiteReconciliationLedger(path)
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute("DROP TABLE reconciliation_schema")
+
+    with pytest.raises(ReconciliationError, match="version table is missing"):
+        SQLiteReconciliationLedger(path)
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'reconciliation_schema'
+            """
+        ).fetchone() is None
+
+
+def test_declared_outbox_schema_rejects_invalid_version_table(tmp_path: Path) -> None:
+    path = tmp_path / "invalid-v5-version-table.db"
+    SQLiteReconciliationLedger(path)
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute("DROP TABLE reconciliation_schema")
+            connection.execute(
+                "CREATE TABLE reconciliation_schema (singleton INTEGER PRIMARY KEY)"
+            )
+
+    with pytest.raises(ReconciliationError, match="version table columns are invalid"):
+        SQLiteReconciliationLedger(path)
+
+
+def test_declared_outbox_schema_rejects_unique_pending_index(tmp_path: Path) -> None:
+    path = tmp_path / "invalid-v5-pending-index.db"
+    SQLiteReconciliationLedger(path)
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute("DROP INDEX idx_reconciliation_audit_outbox_pending")
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX idx_reconciliation_audit_outbox_pending
+                ON reconciliation_audit_outbox(
+                    delivered_at, execution_record_id, revision
+                )
+                """
+            )
+
+    with pytest.raises(ReconciliationError, match="audit outbox pending index is invalid"):
+        SQLiteReconciliationLedger(path)
+
+
+def test_declared_outbox_schema_rejects_conditional_immutable_guard(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "conditional-v5-immutable-guard.db"
+    SQLiteReconciliationLedger(path)
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute("DROP TRIGGER reconciliation_audit_outbox_immutable")
+            connection.execute(
+                """
+                CREATE TRIGGER reconciliation_audit_outbox_immutable
+                BEFORE UPDATE OF outbox_id, execution_record_id, revision, event_type,
+                                 event_json, event_digest, created_at
+                ON reconciliation_audit_outbox
+                WHEN OLD.outbox_id LIKE 'schema-probe-%'
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'reconciliation audit outbox payload is immutable'
+                    );
+                END
+                """
+            )
+
+    with pytest.raises(ReconciliationError, match="guard definition differs"):
+        SQLiteReconciliationLedger(path)
+
+
+def test_declared_outbox_schema_rejects_commented_event_guard(tmp_path: Path) -> None:
+    path = tmp_path / "commented-v5-event-guard.db"
+    SQLiteReconciliationLedger(path)
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute("DROP TRIGGER reconciliation_events_no_delete")
+            connection.execute(
+                """
+                CREATE TRIGGER reconciliation_events_no_delete
+                BEFORE DELETE ON reconciliation_events
+                BEGIN
+                    SELECT 1;
+                    /* RAISE(ABORT, 'reconciliation events are append-only'); */
+                END
+                """
+            )
+
+    with pytest.raises(ReconciliationError, match="guard definition differs"):
+        SQLiteReconciliationLedger(path)
+
+
+def test_declared_outbox_schema_rejects_commented_head_constraint(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "commented-v5-head-constraint.db"
+    SQLiteReconciliationLedger(path)
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute("DROP TABLE reconciliation_heads")
+            connection.execute(
+                """
+                CREATE TABLE reconciliation_heads (
+                    execution_record_id TEXT PRIMARY KEY NOT NULL,
+                    action_json TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    revision INTEGER NOT NULL CHECK(revision >= 0),
+                    disposition TEXT NOT NULL CHECK(disposition IN (
+                        'blocked_unknown', 'blocked_manual_review', 'completed',
+                        'applied_no_result', 'retry_allowed'
+                    )),
+                    resolved_result_available INTEGER NOT NULL
+                        CHECK(resolved_result_available IN (0, 1)),
+                    resolved_result_json TEXT,
+                    updated_at TEXT NOT NULL,
+                    CHECK(
+                        (resolved_result_available = 1 AND resolved_result_json IS NOT NULL)
+                        OR (resolved_result_available = 0 AND resolved_result_json IS NULL)
+                    )
+                    /* CHECK(state IN (
+                        'UNKNOWN', 'CONFIRMED_SUCCEEDED',
+                        'CONFIRMED_NOT_APPLIED', 'MANUAL_REVIEW'
+                    )) */
+                )
+                """
+            )
+
+    with pytest.raises(
+        ReconciliationError,
+        match="core table definition differs.*reconciliation_heads",
+    ):
+        SQLiteReconciliationLedger(path)
+
+
+def test_declared_outbox_schema_rejects_downgraded_version_before_recreation(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "downgraded-v5-schema-version.db"
+    SQLiteReconciliationLedger(path)
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute("DROP TRIGGER reconciliation_audit_outbox_immutable")
+            connection.execute("DROP TRIGGER reconciliation_audit_outbox_no_delete")
+            connection.execute("DROP TABLE reconciliation_audit_outbox")
+            connection.execute(
+                "UPDATE reconciliation_schema SET version = 0 WHERE singleton = 1"
+            )
+
+    with pytest.raises(ReconciliationError, match="version 0 is inconsistent"):
+        SQLiteReconciliationLedger(path)
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'reconciliation_audit_outbox'
+            """
+        ).fetchone() is None
+
+
+@pytest.mark.parametrize("legacy_version", [1, 2, 3])
+def test_declared_outbox_schema_rejects_pre_outbox_version_forgery(
+    tmp_path: Path,
+    legacy_version: int,
+) -> None:
+    path = tmp_path / f"forged-v{legacy_version}-schema-version.db"
+    SQLiteReconciliationLedger(path)
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute("DROP TRIGGER reconciliation_audit_outbox_immutable")
+            connection.execute("DROP TRIGGER reconciliation_audit_outbox_no_delete")
+            connection.execute("DROP TABLE reconciliation_audit_outbox")
+            if legacy_version == 1:
+                connection.execute(
+                    "DROP TRIGGER reconciliation_prepared_actions_no_update"
+                )
+                connection.execute(
+                    "DROP TRIGGER reconciliation_prepared_actions_delete_guard"
+                )
+                connection.execute("DROP TABLE reconciliation_prepared_actions")
+            connection.execute(
+                "UPDATE reconciliation_schema SET version = ? WHERE singleton = 1",
+                (legacy_version,),
+            )
+
+    with pytest.raises(ReconciliationError, match="requires an explicit controlled"):
+        SQLiteReconciliationLedger(path)
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'reconciliation_audit_outbox'
+            """
+        ).fetchone() is None
+
+
+def test_controlled_legacy_migration_requires_complete_legacy_authority_set(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "incomplete-v3-migration.db"
+    SQLiteReconciliationLedger(path)
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute("DROP TRIGGER reconciliation_audit_outbox_immutable")
+            connection.execute("DROP TRIGGER reconciliation_audit_outbox_no_delete")
+            connection.execute("DROP TABLE reconciliation_audit_outbox")
+            connection.execute("DROP TABLE reconciliation_events")
+            connection.execute(
+                "UPDATE reconciliation_schema SET version = 3 WHERE singleton = 1"
+            )
+
+    with pytest.raises(ReconciliationError, match="pre-outbox authority tables are invalid"):
+        SQLiteReconciliationLedger.migrate_legacy(path)
+
+
+@pytest.mark.parametrize("legacy_version", [1, 2, 3])
+def test_controlled_legacy_migration_upgrades_complete_pre_outbox_schema(
+    tmp_path: Path,
+    legacy_version: int,
+) -> None:
+    path = tmp_path / f"complete-v{legacy_version}-migration.db"
+    SQLiteReconciliationLedger(path)
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute("DROP TRIGGER reconciliation_audit_outbox_immutable")
+            connection.execute("DROP TRIGGER reconciliation_audit_outbox_no_delete")
+            connection.execute("DROP TABLE reconciliation_audit_outbox")
+            if legacy_version == 1:
+                connection.execute(
+                    "DROP TRIGGER reconciliation_prepared_actions_no_update"
+                )
+                connection.execute(
+                    "DROP TRIGGER reconciliation_prepared_actions_delete_guard"
+                )
+                connection.execute("DROP TABLE reconciliation_prepared_actions")
+            connection.execute(
+                "UPDATE reconciliation_schema SET version = ? WHERE singleton = 1",
+                (legacy_version,),
+            )
+
+    migrated = SQLiteReconciliationLedger.migrate_legacy(path)
+    assert migrated.pending_audit_events() == ()
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute(
+            "SELECT version FROM reconciliation_schema WHERE singleton = 1"
+        ).fetchone()[0] == 5
+    SQLiteReconciliationLedger(path)
+
+
+def test_declared_outbox_schema_rejects_case_changed_constraint_literal(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "case-changed-v5-constraint.db"
+    SQLiteReconciliationLedger(path)
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute("DROP TABLE reconciliation_events")
+            connection.execute(
+                """
+                CREATE TABLE reconciliation_events (
+                    event_id TEXT PRIMARY KEY NOT NULL,
+                    execution_record_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL CHECK(revision >= 1),
+                    kind TEXT NOT NULL CHECK(kind IN (
+                        'attempt_started', 'ATTEMPT_FINISHED', 'STATE_TRANSITION'
+                    )),
+                    state_before TEXT NOT NULL,
+                    state_after TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    UNIQUE(execution_record_id, revision),
+                    FOREIGN KEY(execution_record_id)
+                        REFERENCES reconciliation_heads(execution_record_id)
+                )
+                """
+            )
+
+    with pytest.raises(
+        ReconciliationError,
+        match="core table definition differs.*reconciliation_events",
+    ):
+        SQLiteReconciliationLedger(path)
+
+
+def test_declared_outbox_schema_rejects_whitespace_changed_constraint_literal(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "whitespace-changed-v5-constraint.db"
+    SQLiteReconciliationLedger(path)
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute("DROP TABLE reconciliation_heads")
+            connection.execute(
+                """
+                CREATE TABLE reconciliation_heads (
+                    execution_record_id TEXT PRIMARY KEY NOT NULL,
+                    action_json TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN (
+                        'UNKNOWN', 'CONFIRMED_ SUCCEEDED',
+                        'CONFIRMED_NOT_APPLIED', 'MANUAL_REVIEW'
+                    )),
+                    revision INTEGER NOT NULL CHECK(revision >= 0),
+                    disposition TEXT NOT NULL CHECK(disposition IN (
+                        'blocked_unknown', 'blocked_manual_review', 'completed',
+                        'applied_no_result', 'retry_allowed'
+                    )),
+                    resolved_result_available INTEGER NOT NULL
+                        CHECK(resolved_result_available IN (0, 1)),
+                    resolved_result_json TEXT,
+                    updated_at TEXT NOT NULL,
+                    CHECK(
+                        (resolved_result_available = 1 AND resolved_result_json IS NOT NULL)
+                        OR (resolved_result_available = 0 AND resolved_result_json IS NULL)
+                    )
+                )
+                """
+            )
+
+    with pytest.raises(
+        ReconciliationError,
+        match="core table definition differs.*reconciliation_heads",
+    ):
+        SQLiteReconciliationLedger(path)
+
+
+def test_declared_outbox_schema_rejects_orphaned_audit_event(tmp_path: Path) -> None:
+    path = tmp_path / "orphaned-v5-outbox.db"
+    SQLiteReconciliationLedger(path)
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO reconciliation_audit_outbox(
+                    outbox_id, execution_record_id, revision, event_type, event_json,
+                    event_digest, created_at, delivery_attempts, delivered_at,
+                    last_error_class, alerted_at
+                ) VALUES (?, ?, 0, 'unknown_recorded', '{}', ?, ?, 0, NULL, NULL, NULL)
+                """,
+                (
+                    "a" * 64,
+                    "b" * 64,
+                    "c" * 64,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
+    with pytest.raises(
+        ReconciliationError,
+        match="foreign-key check failed.*reconciliation_audit_outbox",
+    ):
+        SQLiteReconciliationLedger(path)
+
+
+@pytest.mark.parametrize(
+    ("trigger_name", "replacement"),
+    [
+        (
+            "reconciliation_events_no_update",
+            """
+            CREATE TRIGGER reconciliation_events_no_update
+            BEFORE UPDATE ON reconciliation_events
+            BEGIN
+                SELECT 1;
+            END
+            """,
+        ),
+        (
+            "reconciliation_events_no_delete",
+            """
+            CREATE TRIGGER reconciliation_events_no_delete
+            BEFORE DELETE ON reconciliation_events
+            BEGIN
+                SELECT 1;
+            END
+            """,
+        ),
+        (
+            "reconciliation_prepared_actions_no_update",
+            """
+            CREATE TRIGGER reconciliation_prepared_actions_no_update
+            BEFORE UPDATE ON reconciliation_prepared_actions
+            BEGIN
+                SELECT 1;
+            END
+            """,
+        ),
+        (
+            "reconciliation_prepared_actions_delete_guard",
+            """
+            CREATE TRIGGER reconciliation_prepared_actions_delete_guard
+            BEFORE DELETE ON reconciliation_prepared_actions
+            BEGIN
+                SELECT 1;
+            END
+            """,
+        ),
+        (
+            "reconciliation_audit_outbox_immutable",
+            """
+            CREATE TRIGGER reconciliation_audit_outbox_immutable
+            BEFORE UPDATE ON reconciliation_audit_outbox
+            BEGIN
+                SELECT 1;
+            END
+            """,
+        ),
+        (
+            "reconciliation_audit_outbox_no_delete",
+            """
+            CREATE TRIGGER reconciliation_audit_outbox_no_delete
+            BEFORE DELETE ON reconciliation_audit_outbox
+            BEGIN
+                SELECT 1;
+            END
+            """,
+        ),
+    ],
+)
+def test_declared_outbox_schema_rejects_same_name_empty_guard(
+    tmp_path: Path,
+    trigger_name: str,
+    replacement: str,
+) -> None:
+    path = tmp_path / f"same-name-{trigger_name}.db"
+    SQLiteReconciliationLedger(path)
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute(f"DROP TRIGGER {trigger_name}")
+            connection.execute(replacement)
+
+    with pytest.raises(ReconciliationError, match="guard definition differs"):
+        SQLiteReconciliationLedger(path)
+
+
+def test_declared_outbox_schema_rejects_unexpected_persistent_trigger(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "unexpected-v5-outbox-trigger.db"
+    SQLiteReconciliationLedger(path)
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute(
+                """
+                CREATE TRIGGER reconciliation_outbox_auto_ack
+                AFTER INSERT ON reconciliation_audit_outbox
+                BEGIN
+                    UPDATE reconciliation_audit_outbox
+                    SET delivered_at = '2026-01-01T00:00:00+00:00'
+                    WHERE outbox_id = NEW.outbox_id;
+                END
+                """
+            )
+
+    with pytest.raises(
+        ReconciliationError,
+        match="reconciliation guards are incomplete or unexpected",
+    ):
+        SQLiteReconciliationLedger(path)
+
+
+def test_declared_outbox_schema_rejects_version_table_trigger(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "unexpected-v5-version-trigger.db"
+    SQLiteReconciliationLedger(path)
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute(
+                """
+                CREATE TRIGGER reconciliation_schema_version_rollback
+                AFTER UPDATE OF version ON reconciliation_schema
+                BEGIN
+                    UPDATE reconciliation_schema SET version = 0
+                    WHERE singleton = NEW.singleton;
+                END
+                """
+            )
+
+    with pytest.raises(
+        ReconciliationError,
+        match="reconciliation guards are incomplete or unexpected",
+    ):
+        SQLiteReconciliationLedger(path)
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute(
+            "SELECT version FROM reconciliation_schema WHERE singleton = 1"
+        ).fetchone()[0] == 5
+
+
+def test_declared_outbox_schema_rejects_unexpected_explicit_index(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "unexpected-v5-outbox-index.db"
+    SQLiteReconciliationLedger(path)
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX reconciliation_outbox_event_type_unique
+                ON reconciliation_audit_outbox(event_type)
+                """
+            )
+
+    with pytest.raises(
+        ReconciliationError,
+        match="reconciliation indexes are invalid or unexpected",
+    ):
+        SQLiteReconciliationLedger(path)
+
+
+def test_reconciliation_audit_alert_marker_prevents_repeat_poll_writes(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "reconciliation-audit-alert-no-repeat-write.db"
+    store = SQLiteIdempotencyStore(path)
+    claim = store.acquire("tenant/charge", "request-1", _ACTION_DIGEST)
+    assert claim.execution_record_id is not None
+    ledger = SQLiteReconciliationLedger(
+        path,
+        audit_delivery_alert_attempts=1,
+        audit_delivery_alert_age_seconds=3_600,
+    )
+    ledger.record_unknown(
+        claim,
+        _unknown(claim.execution_record_id),
+        TimeoutError("outcome uncertain"),
+    )
+    envelope = ledger.pending_audit_events(
+        execution_record_id=claim.execution_record_id
+    )[0]
+    ledger.record_audit_delivery_failure(envelope.outbox_id, RuntimeError("sink down"))
+
+    with closing(sqlite3.connect(path)) as observer:
+        before = observer.execute("PRAGMA data_version").fetchone()[0]
+        pending = ledger.pending_audit_events(
+            execution_record_id=claim.execution_record_id
+        )
+        after = observer.execute("PRAGMA data_version").fetchone()[0]
+
+    assert len(pending) == 1
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"audit_delivery_alert_attempts": 0}, "positive integer"),
+        ({"audit_delivery_alert_attempts": True}, "positive integer"),
+        ({"audit_delivery_alert_age_seconds": 0}, "positive finite"),
+        ({"audit_delivery_alert_age_seconds": float("nan")}, "positive finite"),
+    ],
+)
+def test_reconciliation_audit_alert_configuration_fails_closed(
+    tmp_path: Path, kwargs: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        SQLiteReconciliationLedger(tmp_path / "invalid-audit-alert.db", **kwargs)
 
 
 def test_reconciliation_audit_outbox_rejects_tampered_payload(tmp_path: Path) -> None:
@@ -1197,22 +2078,7 @@ def test_concurrent_transition_cas_has_exactly_one_winner(
 def test_v06_idempotency_schema_is_rebuilt_without_data_loss(tmp_path: Path) -> None:
     path = tmp_path / "legacy.db"
     with closing(sqlite3.connect(path)) as connection:
-        connection.execute(
-            """
-            CREATE TABLE idempotency_records (
-                namespace TEXT NOT NULL,
-                key TEXT NOT NULL,
-                fingerprint TEXT NOT NULL,
-                state TEXT NOT NULL,
-                result_json TEXT,
-                error TEXT,
-                owner_token TEXT,
-                lease_expires_at TEXT,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY(namespace, key)
-            )
-            """
-        )
+        connection.execute(_LEGACY_IDEMPOTENCY_V05_SCHEMA)
         now = datetime.now(timezone.utc).isoformat()
         connection.executemany(
             """
@@ -1236,7 +2102,19 @@ def test_v06_idempotency_schema_is_rebuilt_without_data_loss(tmp_path: Path) -> 
         )
         connection.commit()
 
-    ledger = SQLiteReconciliationLedger(path, journal_mode="delete")
+    with pytest.raises(ReconciliationError, match="controlled migration"):
+        SQLiteReconciliationLedger(path, journal_mode="delete")
+    with closing(sqlite3.connect(path)) as connection:
+        reconciliation_objects = connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE name LIKE 'reconciliation_%'
+            ORDER BY name
+            """
+        ).fetchall()
+    assert reconciliation_objects == []
+
+    ledger = SQLiteReconciliationLedger.migrate_legacy(path, journal_mode="delete")
     assert ledger.journal_mode == "delete"
     with closing(sqlite3.connect(path)) as connection:
         columns = {
@@ -1271,22 +2149,8 @@ def test_v06_migration_normalizes_malformed_rows_fail_closed(tmp_path: Path) -> 
     now = datetime.now(timezone.utc).isoformat()
     future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
     with closing(sqlite3.connect(path)) as connection:
-        connection.execute(
-            """
-            CREATE TABLE idempotency_records (
-                namespace TEXT NOT NULL,
-                key TEXT NOT NULL,
-                fingerprint TEXT NOT NULL,
-                state TEXT NOT NULL,
-                result_json TEXT,
-                error TEXT,
-                owner_token TEXT,
-                lease_expires_at TEXT,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY(namespace, key)
-            )
-            """
-        )
+        connection.execute(_LEGACY_IDEMPOTENCY_V05_SCHEMA)
+        connection.execute("PRAGMA ignore_check_constraints = ON")
         connection.executemany(
             "INSERT INTO idempotency_records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
@@ -1300,9 +2164,13 @@ def test_v06_migration_normalizes_malformed_rows_fail_closed(tmp_path: Path) -> 
                 ("ns", "valid", "8" * 64, "completed", "{ \"ok\" : true }", "stale", None, None, now),
             ],
         )
+        connection.execute("PRAGMA ignore_check_constraints = OFF")
         connection.commit()
 
-    SQLiteIdempotencyStore(path, journal_mode="delete")
+    with pytest.raises(RuntimeError, match="controlled migration"):
+        SQLiteIdempotencyStore(path, journal_mode="delete")
+
+    SQLiteIdempotencyStore.migrate_legacy(path, journal_mode="delete")
     with connect_sqlite(path, 1.0) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
         rows = {
@@ -1324,6 +2192,263 @@ def test_v06_migration_normalizes_malformed_rows_fail_closed(tmp_path: Path) -> 
     assert rows["unknown-residue"] == ("unknown", None, "lost", None, None)
     assert rows["valid"] == ("completed", '{"ok":true}', None, None, None)
     assert all(row[3] is None and row[4] is None for row in rows.values())
+
+
+def test_controlled_ledger_migration_validates_idempotency_before_schema_write(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "invalid-legacy-idempotency.db"
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute(
+            """
+            CREATE TABLE idempotency_records (
+                namespace TEXT NOT NULL,
+                key TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                state TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(namespace, key)
+            )
+            """
+        )
+        connection.commit()
+
+    with pytest.raises(
+        ReconciliationError,
+        match="legacy idempotency schema integrity failure",
+    ):
+        SQLiteReconciliationLedger.migrate_legacy(path)
+
+    with closing(sqlite3.connect(path)) as connection:
+        reconciliation_objects = connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE name LIKE 'reconciliation_%'
+            ORDER BY name
+            """
+        ).fetchall()
+    assert reconciliation_objects == []
+
+
+def test_normal_ledger_open_rejects_legacy_idempotency_without_schema_write(
+    tmp_path: Path,
+) -> None:
+    """A fail-closed normal open must not bootstrap reconciliation objects."""
+
+    path = tmp_path / "legacy-idempotency-normal-open.db"
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute(_LEGACY_IDEMPOTENCY_V05_SCHEMA)
+        connection.commit()
+
+    def catalog() -> tuple[tuple[str, str, str, str | None], ...]:
+        with closing(sqlite3.connect(path)) as connection:
+            return tuple(
+                connection.execute(
+                    """
+                    SELECT type, name, tbl_name, sql
+                    FROM sqlite_master
+                    WHERE name NOT LIKE 'sqlite_%'
+                    ORDER BY type, name
+                    """
+                )
+            )
+
+    before = catalog()
+
+    with pytest.raises(
+        ReconciliationError,
+        match="legacy idempotency schema requires controlled migration",
+    ):
+        SQLiteReconciliationLedger(path)
+
+    assert catalog() == before
+
+
+def test_normal_ledger_open_revalidates_idempotency_before_schema_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A legacy authority introduced after admission preflight is still rejected."""
+
+    path = tmp_path / "legacy-idempotency-race.db"
+    original_preflight = SQLiteReconciliationLedger._preflight_idempotency_schema
+    injected = False
+
+    def introduce_legacy(self: SQLiteReconciliationLedger) -> bool:
+        nonlocal injected
+        if not injected:
+            injected = True
+            with closing(sqlite3.connect(path)) as connection:
+                connection.execute(_LEGACY_IDEMPOTENCY_V05_SCHEMA)
+                connection.commit()
+            return False
+        return original_preflight(self)
+
+    monkeypatch.setattr(
+        SQLiteReconciliationLedger,
+        "_preflight_idempotency_schema",
+        introduce_legacy,
+    )
+
+    with pytest.raises(
+        ReconciliationError,
+        match="legacy idempotency schema requires controlled migration",
+    ):
+        SQLiteReconciliationLedger(path)
+
+    with closing(sqlite3.connect(path)) as connection:
+        reconciliation_objects = connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE name LIKE 'reconciliation_%'
+            ORDER BY name
+            """
+        ).fetchall()
+    assert reconciliation_objects == []
+
+
+def test_controlled_ledger_migration_rejects_orphaned_idempotency_staging_table(
+    tmp_path: Path,
+) -> None:
+    """An interrupted idempotency migration cannot bootstrap a new ledger."""
+
+    path = tmp_path / "orphaned-idempotency-staging.db"
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute(
+            "CREATE TABLE idempotency_records_v07 (sentinel TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO idempotency_records_v07(sentinel) VALUES ('legacy')"
+        )
+        connection.commit()
+
+    with pytest.raises(ReconciliationError, match="reserved migration table name"):
+        SQLiteReconciliationLedger.migrate_legacy(path)
+
+    with closing(sqlite3.connect(path)) as connection:
+        reconciliation_objects = connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE name LIKE 'reconciliation_%'
+            ORDER BY name
+            """
+        ).fetchall()
+        assert reconciliation_objects == []
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'idempotency_records'"
+        ).fetchone() is None
+        assert connection.execute(
+            "SELECT sentinel FROM idempotency_records_v07"
+        ).fetchone() == ("legacy",)
+
+
+@pytest.mark.parametrize(
+    ("object_name", "definition", "message"),
+    [
+        (
+            "idempotency_schema",
+            "CREATE VIEW idempotency_schema AS SELECT 1 AS singleton, 1 AS version",
+            "idempotency_schema must be a table",
+        ),
+        (
+            "idempotency_records_v07",
+            "CREATE TABLE idempotency_records_v07 (sentinel TEXT)",
+            "reserved migration table name",
+        ),
+    ],
+)
+def test_controlled_ledger_migration_rejects_idempotency_migration_artifacts(
+    tmp_path: Path,
+    object_name: str,
+    definition: str,
+    message: str,
+) -> None:
+    path = tmp_path / f"invalid-legacy-{object_name}.db"
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute(_LEGACY_IDEMPOTENCY_V05_SCHEMA)
+        connection.execute(definition)
+        connection.commit()
+
+    with pytest.raises(ReconciliationError, match=message):
+        SQLiteReconciliationLedger.migrate_legacy(path)
+
+    with closing(sqlite3.connect(path)) as connection:
+        reconciliation_objects = connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE name LIKE 'reconciliation_%'
+            ORDER BY name
+            """
+        ).fetchall()
+        assert reconciliation_objects == []
+        assert connection.execute(
+            "SELECT type FROM sqlite_master WHERE name = ?",
+            (object_name,),
+        ).fetchone() is not None
+
+
+def test_controlled_ledger_migration_rolls_back_on_idempotency_upgrade_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "atomic-legacy-migration.db"
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute(_LEGACY_IDEMPOTENCY_V05_SCHEMA)
+        connection.commit()
+
+    def fail_idempotency_upgrade(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        allow_legacy_schema_migration: bool,
+    ) -> None:
+        raise RuntimeError("injected idempotency migration failure")
+
+    monkeypatch.setattr(
+        SQLiteIdempotencyStore,
+        "_initialize_schema",
+        classmethod(fail_idempotency_upgrade),
+    )
+
+    with pytest.raises(ReconciliationError, match="injected idempotency migration"):
+        SQLiteReconciliationLedger.migrate_legacy(path)
+
+    with closing(sqlite3.connect(path)) as connection:
+        reconciliation_objects = connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE name LIKE 'reconciliation_%'
+            ORDER BY name
+            """
+        ).fetchall()
+        assert reconciliation_objects == []
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'idempotency_schema'"
+        ).fetchone() is None
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'idempotency_records'"
+        ).fetchone() is not None
+
+
+def test_reconciliation_version_table_without_row_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "missing-reconciliation-version-row.db"
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute(
+            """
+            CREATE TABLE reconciliation_schema (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                version INTEGER NOT NULL
+            )
+            """
+        )
+        connection.commit()
+
+    with pytest.raises(ReconciliationError, match="version row is missing"):
+        SQLiteReconciliationLedger(path)
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'reconciliation_heads'"
+        ).fetchone() is None
 
 
 @pytest.mark.parametrize("durable", [False, True])
@@ -1465,6 +2590,22 @@ def test_unknown_action_validation_and_repr_fail_closed() -> None:
     )
     with pytest.raises(ReconciliationValidationError, match="must be an array"):
         UnknownAction.from_dict(malformed_kinds)
+
+    orphan_metadata = action.to_dict()
+    orphan_metadata["reconciliation_supported_evidence_kinds"] = ["receipt"]
+    with pytest.raises(ReconciliationValidationError, match="requires a provider ID"):
+        UnknownAction.from_dict(orphan_metadata)
+
+    duplicate_kinds = action.to_dict()
+    duplicate_kinds.update(
+        {
+            "reconciliation_provider_id": "receipt-store",
+            "reconciliation_protocol_version": "1",
+            "reconciliation_supported_evidence_kinds": ["receipt", "receipt"],
+        }
+    )
+    with pytest.raises(ReconciliationValidationError, match="duplicate evidence kinds"):
+        UnknownAction.from_dict(duplicate_kinds)
 
 
 def test_finding_state_and_retry_assertions_fail_closed() -> None:

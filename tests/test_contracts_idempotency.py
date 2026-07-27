@@ -16,6 +16,7 @@ from agent_runtime_governance.contracts import (
     validate_instance,
 )
 from agent_runtime_governance.errors import ContractValidationError, RegistryError
+from agent_runtime_governance.reconciliation import SQLiteReconciliationLedger
 from agent_runtime_governance.registry import (
     IdempotencyConflictError,
     IdempotencyInProgressError,
@@ -215,6 +216,161 @@ def test_sqlite_idempotency_survives_restart(tmp_path) -> None:
     cached = restarted.acquire("tenant/tool", "request-1", fingerprint)
     assert cached.owner is False
     assert cached.future.result() == {"ok": True}
+
+
+def test_sqlite_idempotency_rejects_orphaned_migration_staging_table(tmp_path) -> None:
+    """A residual migration table must not be mistaken for a fresh database."""
+
+    path = tmp_path / "orphaned-idempotency-staging.db"
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute(
+                "CREATE TABLE idempotency_records_v07 (sentinel TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO idempotency_records_v07(sentinel) VALUES ('legacy')"
+            )
+
+    with pytest.raises(RuntimeError, match="reserved migration table name"):
+        SQLiteIdempotencyStore(path)
+
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'idempotency_records'"
+        ).fetchone() is None
+        assert connection.execute(
+            "SELECT sentinel FROM idempotency_records_v07"
+        ).fetchone() == ("legacy",)
+
+
+def test_standalone_idempotency_migration_rejects_colocated_reconciliation(
+    tmp_path,
+) -> None:
+    """Shared durable state has one atomic migration owner: the ledger."""
+
+    path = tmp_path / "shared-legacy-idempotency.db"
+    SQLiteReconciliationLedger(path)
+    SQLiteIdempotencyStore(path)
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute("DROP TABLE idempotency_schema")
+
+    with pytest.raises(RuntimeError, match="use SQLiteReconciliationLedger.migrate_legacy"):
+        SQLiteIdempotencyStore.migrate_legacy(path)
+
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'idempotency_schema'"
+        ).fetchone() is None
+        assert connection.execute(
+            "SELECT version FROM reconciliation_schema WHERE singleton = 1"
+        ).fetchone() == (5,)
+
+
+def test_sqlite_idempotency_rejects_persistent_trigger_that_forges_retry(
+    tmp_path,
+) -> None:
+    path = tmp_path / "idempotency.db"
+    store = SQLiteIdempotencyStore(path)
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute(
+                """
+                CREATE TRIGGER idempotency_forge_retry
+                AFTER UPDATE OF state ON idempotency_records
+                WHEN NEW.state = 'completed'
+                BEGIN
+                    UPDATE idempotency_records
+                    SET state = 'not_applied', result_json = NULL,
+                        error = 'forged retry', owner_token = NULL,
+                        lease_expires_at = NULL
+                    WHERE execution_record_id = NEW.execution_record_id;
+                END
+                """
+            )
+
+    claim = store.acquire("tenant/tool", "request-1", "a" * 64)
+    store.complete(claim, {"ok": True})
+    with closing(sqlite3.connect(path)) as connection:
+        state = connection.execute(
+            "SELECT state FROM idempotency_records WHERE key = 'request-1'"
+        ).fetchone()[0]
+    assert state == "not_applied"
+
+    with pytest.raises(RuntimeError, match="unexpected persistent trigger"):
+        SQLiteIdempotencyStore(path)
+
+
+def test_sqlite_idempotency_rejects_schema_version_trigger(tmp_path) -> None:
+    path = tmp_path / "idempotency.db"
+    SQLiteIdempotencyStore(path)
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute(
+                """
+                CREATE TRIGGER idempotency_version_reset
+                AFTER UPDATE OF version ON idempotency_schema
+                BEGIN
+                    UPDATE idempotency_schema SET version = 0 WHERE singleton = 1;
+                END
+                """
+            )
+
+    with pytest.raises(RuntimeError, match="unexpected persistent trigger"):
+        SQLiteIdempotencyStore(path)
+
+
+def test_sqlite_idempotency_rejects_modified_authority_table(tmp_path) -> None:
+    path = tmp_path / "idempotency.db"
+    SQLiteIdempotencyStore(path)
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute("DROP TABLE idempotency_records")
+            connection.execute(
+                """
+                CREATE TABLE idempotency_records (
+                    execution_record_id TEXT PRIMARY KEY NOT NULL,
+                    namespace TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    result_json TEXT,
+                    error TEXT,
+                    owner_token TEXT,
+                    lease_expires_at TEXT,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+
+    with pytest.raises(RuntimeError, match="does not match the supported contract"):
+        SQLiteIdempotencyStore(path)
+
+
+def test_sqlite_idempotency_rejects_unexpected_explicit_index(tmp_path) -> None:
+    path = tmp_path / "idempotency.db"
+    SQLiteIdempotencyStore(path)
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute(
+                "CREATE INDEX idempotency_unexpected_index "
+                "ON idempotency_records(namespace, state)"
+            )
+
+    with pytest.raises(RuntimeError, match="explicit indexes do not match"):
+        SQLiteIdempotencyStore(path)
+
+
+def test_sqlite_idempotency_rejects_forged_schema_version(tmp_path) -> None:
+    path = tmp_path / "idempotency.db"
+    SQLiteIdempotencyStore(path)
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute("UPDATE idempotency_schema SET version = 1")
+
+    with pytest.raises(RuntimeError, match="exactly the current version"):
+        SQLiteIdempotencyStore(path)
 
 
 def test_sqlite_idempotency_rejects_conflicting_payload(tmp_path) -> None:
