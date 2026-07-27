@@ -1,4 +1,6 @@
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 const test = require("node:test");
 
 const publishCodeRabbitApprovalStatus = require(
@@ -6,6 +8,24 @@ const publishCodeRabbitApprovalStatus = require(
 );
 
 const HEAD = "a".repeat(40);
+
+test("workflow keeps the CodeRabbit handoff from cancelling the current-head check", () => {
+  const workflow = fs.readFileSync(
+    path.resolve(
+      __dirname,
+      "..",
+      "workflows",
+      "coderabbit-approval-status.yml",
+    ),
+    "utf8",
+  );
+
+  assert.match(workflow, /}}-\$\{\{ github\.event_name \}\}/);
+  assert.match(
+    workflow,
+    /cancel-in-progress:\s*\$\{\{ github\.event_name == 'pull_request_target' \}\}/,
+  );
+});
 
 function fixture({
   reviews = [],
