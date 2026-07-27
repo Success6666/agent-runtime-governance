@@ -133,6 +133,7 @@ from .reconciliation import (
     UnknownAction,
     idempotency_namespace_digest,
     new_execution_record_id,
+    tenant_partition_digest,
 )
 from .registry import (
     IdempotencyAlreadyAppliedError,
@@ -321,6 +322,7 @@ __all__ = [
     "IdempotencyStore",
     "idempotency_namespace_digest",
     "new_execution_record_id",
+    "tenant_partition_digest",
     "sqlite_journal_capabilities",
     "sqlite_wal_is_safe",
 ]

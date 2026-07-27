@@ -76,6 +76,7 @@ from .reconciliation import (
     UnknownAction,
     idempotency_namespace_digest,
     new_execution_record_id,
+    tenant_partition_digest,
 )
 from .registry import (
     GovernedTool,
@@ -987,6 +988,7 @@ class Runtime:
         self,
         execution_record_id: str,
         *,
+        identity_claims: Mapping[str, Any] | None = None,
         deadline: datetime | None = None,
     ) -> ReconciliationHead:
         """Run one explicit, read-only reconciliation attempt for UNKNOWN work."""
@@ -998,6 +1000,11 @@ class Runtime:
         ledger = self.reconciliation_ledger
         if ledger is None:
             raise ReconciliationNotFoundError("reconciliation ledger is not configured")
+        principal = await self._verify_reconciliation_principal(
+            identity_claims,
+            deadline=deadline,
+            operation="probe",
+        )
 
         async def read_head_with_audit(
             *,
@@ -1029,6 +1036,7 @@ class Runtime:
             deadline=deadline,
             stage="reconciliation read head",
         )
+        self._assert_reconciliation_tenant_access(principal, head.action)
         if head.state is not ReconciliationState.UNKNOWN:
             return head
         provider, unavailable_reason = self._provider_for_reconciliation_action(
@@ -1212,9 +1220,12 @@ class Runtime:
         ledger = self.reconciliation_ledger
         if ledger is None:
             raise ReconciliationNotFoundError("reconciliation ledger is not configured")
-        if self.identity_provider is None:
-            raise PermissionError("manual reconciliation requires a trusted identity provider")
         profile = self.production_profile
+        principal = await self._verify_reconciliation_principal(
+            identity_claims,
+            deadline=deadline,
+            operation="resolve",
+        )
         if (
             profile is None
             or profile.identity_digest_key_provider is None
@@ -1223,9 +1234,15 @@ class Runtime:
             raise PermissionError(
                 "manual reconciliation requires a production identity digest key"
             )
-        principal = await self._invoke_identity_provider(identity_claims, deadline)
-        if not isinstance(principal, VerifiedPrincipal):
-            raise PermissionError("identity provider returned an invalid principal")
+        if principal is None:
+            raise PermissionError("manual reconciliation requires a trusted identity provider")
+        current = await self._run_reconciliation_operation(
+            ledger.current,
+            execution_record_id,
+            deadline=deadline,
+            stage="reconciliation read head",
+        )
+        self._assert_reconciliation_tenant_access(principal, current.action)
         key = await self._call_binding_provider(
             profile.identity_digest_key_provider.get_key,
             stage="manual reconciliation identity digest key",
@@ -1280,6 +1297,53 @@ class Runtime:
             operator_identity_digest=operator_digest,
         )
         return head
+
+    async def _verify_reconciliation_principal(
+        self,
+        identity_claims: Mapping[str, Any] | None,
+        *,
+        deadline: datetime | None,
+        operation: str,
+    ) -> VerifiedPrincipal | None:
+        """Verify the caller before a strict control-plane read or mutation."""
+
+        profile = self.production_profile
+        if profile is None:
+            return None
+        if self.identity_provider is None:
+            raise PermissionError("reconciliation requires a trusted identity provider")
+        try:
+            principal = await self._invoke_identity_provider(identity_claims, deadline)
+        except StageTimeoutError:
+            # Deadline expiry is operationally distinct from a denied identity
+            # and must not create an attempt or fall through to ledger work.
+            raise
+        except Exception as exc:
+            raise PermissionError("reconciliation authorization denied") from exc
+        if not isinstance(principal, VerifiedPrincipal):
+            raise PermissionError("reconciliation authorization denied")
+        if operation not in {"probe", "resolve"}:
+            raise RuntimeError(f"unsupported reconciliation operation {operation!r}")
+        required_permission = (
+            profile.reconciliation_probe_permission
+            if operation == "probe"
+            else profile.reconciliation_resolve_permission
+        )
+        if required_permission not in principal.permissions:
+            raise PermissionError("reconciliation authorization denied")
+        return principal
+
+    @staticmethod
+    def _assert_reconciliation_tenant_access(
+        principal: VerifiedPrincipal | None,
+        action: UnknownAction,
+    ) -> None:
+        if principal is None:
+            return
+        expected = action.tenant_partition_digest
+        actual = tenant_partition_digest(principal.tenant)
+        if expected is None or not hmac.compare_digest(expected, actual):
+            raise PermissionError("reconciliation authorization denied")
 
     @staticmethod
     def _unavailable_provider_descriptor() -> ProviderDescriptor:
@@ -2452,6 +2516,9 @@ class Runtime:
             ),
             contract_version=(contract.contract_version if contract is not None else 1),
             idempotency_namespace_digest=idempotency_namespace_digest(namespace),
+            tenant_partition_digest=tenant_partition_digest(
+                context.tenant or "global"
+            ),
             uncertainty_reason=(
                 "execution outcome may require explicit reconciliation"
                 if error is None

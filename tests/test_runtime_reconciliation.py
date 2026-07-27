@@ -111,6 +111,214 @@ async def test_explicit_reconciliation_restores_only_a_validated_cached_result(
         await runtime.aclose()
 
 
+def _strict_control_plane_runtime(
+    path: Path,
+    principals: dict[str, VerifiedPrincipal],
+) -> tuple[Runtime, list[str]]:
+    class KeyProvider:
+        def get_key(self, *, tenant: str, version: str) -> bytes:
+            assert version == "key-v1"
+            assert tenant in {principal.tenant for principal in principals.values()}
+            return b"k" * 32
+
+    class ClaimsIdentityProvider:
+        production_trusted = True
+
+        def verify(
+            self, claims: dict[str, object] | None = None
+        ) -> VerifiedPrincipal:
+            if claims is None or not isinstance(claims.get("actor"), str):
+                raise ValueError("trusted reconciliation claims are required")
+            return principals[claims["actor"]]
+
+    provider_calls: list[str] = []
+    runtime = Runtime(
+        [
+            AuditMiddleware(
+                JSONLAuditSink(path.with_suffix(".audit.jsonl"), sign_key=b"a" * 32),
+                fail_closed=True,
+            )
+        ],
+        idempotency_store=SQLiteIdempotencyStore(path),
+        reconciliation_ledger=SQLiteReconciliationLedger(path),
+        identity_provider=ClaimsIdentityProvider(),
+        require_verified_identity=True,
+        production_profile=ProductionProfile(
+            identity_digest_key_provider=KeyProvider(),
+            identity_digest_key_version="key-v1",
+            policy_version="policy-v1",
+            policy_digest="a" * 64,
+        ),
+    )
+
+    contract = ActionContract(
+        contract_id="payments.charge",
+        contract_version=1,
+        tool_name="charge",
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        parameters_schema={"type": "object", "additionalProperties": False},
+        effect_class="payment.charge",
+    )
+
+    async def provider(
+        context: ReconciliationAttemptContext,
+    ) -> ReconciliationFinding:
+        provider_calls.append(context.action.execution_record_id)
+        return ReconciliationFinding(
+            proposed_state=ReconciliationState.MANUAL_REVIEW,
+            evidence_kind="probe",
+            evidence={"case_id": "case-1"},
+            observed_at=datetime.now(timezone.utc),
+        )
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        action_contract=contract,
+        reconciliation_provider=ProviderDescriptor(
+            provider_id="payment-probe",
+            protocol_version="1",
+            supported_evidence_kinds=("probe",),
+            provider=provider,
+        ),
+    )
+    async def charge() -> None:
+        raise TimeoutError("payment outcome is uncertain")
+
+    runtime.seal_production()
+    return runtime, provider_calls
+
+
+async def _strict_unknown_execution(runtime: Runtime, *, actor: str) -> str:
+    with pytest.raises(ToolExecutionError) as failed:
+        await runtime.arun(
+            "charge",
+            _governance=InvocationOptions(
+                idempotency_key="customer-visible-key",
+                identity_claims={"actor": actor},
+            ),
+        )
+    execution_record_id = failed.value.execution_record_id
+    assert execution_record_id is not None
+    return execution_record_id
+
+
+@pytest.mark.asyncio
+async def test_strict_reconciliation_rejects_missing_or_unprivileged_identity(
+    tmp_path: Path,
+) -> None:
+    principals = {
+        "writer": VerifiedPrincipal(
+            issuer="gateway",
+            subject="writer",
+            tenant="tenant-a",
+            permissions=frozenset({"reconciliation:probe"}),
+        ),
+        "unprivileged": VerifiedPrincipal(
+            issuer="gateway",
+            subject="unprivileged",
+            tenant="tenant-a",
+        ),
+    }
+    runtime, provider_calls = _strict_control_plane_runtime(
+        tmp_path / "strict-control.db", principals
+    )
+    try:
+        execution_record_id = await _strict_unknown_execution(runtime, actor="writer")
+        with pytest.raises(PermissionError, match="authorization denied"):
+            await runtime.areconcile(execution_record_id)
+        with pytest.raises(PermissionError, match="authorization denied"):
+            await runtime.areconcile(
+                execution_record_id,
+                identity_claims={"actor": "unprivileged"},
+            )
+        assert provider_calls == []
+        assert runtime.reconciliation_ledger is not None
+        assert runtime.reconciliation_ledger.attempts(execution_record_id) == ()
+    finally:
+        await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_strict_reconciliation_denies_cross_tenant_probe_without_attempt(
+    tmp_path: Path,
+) -> None:
+    principals = {
+        "tenant-a": VerifiedPrincipal(
+            issuer="gateway",
+            subject="tenant-a-operator",
+            tenant="tenant-a",
+            permissions=frozenset({"reconciliation:probe"}),
+        ),
+        "tenant-b": VerifiedPrincipal(
+            issuer="gateway",
+            subject="tenant-b-operator",
+            tenant="tenant-b",
+            permissions=frozenset({"reconciliation:probe", "reconciliation:resolve"}),
+        ),
+    }
+    runtime, provider_calls = _strict_control_plane_runtime(
+        tmp_path / "cross-tenant-control.db", principals
+    )
+    try:
+        execution_record_id = await _strict_unknown_execution(runtime, actor="tenant-a")
+        with pytest.raises(PermissionError, match="authorization denied"):
+            await runtime.areconcile(
+                execution_record_id,
+                identity_claims={"actor": "tenant-b"},
+            )
+        assert provider_calls == []
+        assert runtime.reconciliation_ledger is not None
+        assert runtime.reconciliation_ledger.attempts(execution_record_id) == ()
+    finally:
+        await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_strict_manual_resolution_requires_resolve_permission(
+    tmp_path: Path,
+) -> None:
+    principals = {
+        "operator": VerifiedPrincipal(
+            issuer="gateway",
+            subject="operator",
+            tenant="tenant-a",
+            permissions=frozenset({"reconciliation:probe", "reconciliation:resolve"}),
+        ),
+        "probe-only": VerifiedPrincipal(
+            issuer="gateway",
+            subject="probe-only",
+            tenant="tenant-a",
+            permissions=frozenset({"reconciliation:probe"}),
+        ),
+    }
+    runtime, _provider_calls = _strict_control_plane_runtime(
+        tmp_path / "manual-permission.db", principals
+    )
+    try:
+        execution_record_id = await _strict_unknown_execution(runtime, actor="operator")
+        manual = await runtime.areconcile(
+            execution_record_id,
+            identity_claims={"actor": "operator"},
+        )
+        assert manual.state is ReconciliationState.MANUAL_REVIEW
+        with pytest.raises(PermissionError, match="authorization denied"):
+            await runtime.aresolve_reconciliation(
+                execution_record_id,
+                expected_state=manual.state,
+                expected_revision=manual.revision,
+                new_state=ReconciliationState.CONFIRMED_SUCCEEDED,
+                reason="operator review",
+                evidence_kind="operator",
+                evidence={"case_id": "case-1"},
+                identity_claims={"actor": "probe-only"},
+            )
+        assert runtime.reconciliation_ledger is not None
+        current = runtime.reconciliation_ledger.current(execution_record_id)
+        assert (current.state, current.revision) == (manual.state, manual.revision)
+    finally:
+        await runtime.aclose()
+
+
 @pytest.mark.asyncio
 async def test_runtime_atomically_prepares_recovery_descriptor_before_dispatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -407,6 +615,9 @@ async def test_manual_reconciliation_requires_sealed_identity_and_audits_digest(
                 issuer="trusted-gateway",
                 subject="operator@example.test",
                 tenant="tenant-a",
+                permissions=frozenset(
+                    {"reconciliation:probe", "reconciliation:resolve"}
+                ),
                 source="test",
             )
         ),
