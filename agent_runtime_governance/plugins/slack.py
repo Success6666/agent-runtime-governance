@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import ssl
 from collections.abc import Callable, Mapping
@@ -8,6 +7,7 @@ from typing import Any
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
+from .._blocking import run_blocking
 from ..context import ExecutionContext, ExecutionStatus, HistoryEntry
 from ..middleware.base import ObservingMiddleware
 from ..resilience import CircuitBreaker
@@ -121,7 +121,7 @@ class SlackNotificationMiddleware(ObservingMiddleware):
                 f"trace={context.trace_id}, reason={reason})"
             )
         }
-        await asyncio.to_thread(self.sender, payload)
+        await run_blocking(self.sender, payload)
         return context.append_history(
             HistoryEntry(self.name, "sent", "Slack notification sent")
         )

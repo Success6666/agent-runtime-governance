@@ -48,6 +48,7 @@ class RuntimeBuilder:
         sync_executor: Executor | None = None,
         idempotency_executor: Executor | None = None,
         reconciliation_executor: Executor | None = None,
+        reconciliation_audit_executor: Executor | None = None,
         production_profile: ProductionProfile | None = None,
     ) -> None:
         self._middlewares: list[Middleware] = []
@@ -64,6 +65,7 @@ class RuntimeBuilder:
             "sync_executor": sync_executor,
             "idempotency_executor": idempotency_executor,
             "reconciliation_executor": reconciliation_executor,
+            "reconciliation_audit_executor": reconciliation_audit_executor,
             "production_profile": production_profile,
         }
 
@@ -101,6 +103,14 @@ class RuntimeBuilder:
 
     def with_reconciliation_executor(self, executor: Executor) -> "RuntimeBuilder":
         self._runtime_options["reconciliation_executor"] = executor
+        return self
+
+    def with_reconciliation_audit_executor(
+        self, executor: Executor
+    ) -> "RuntimeBuilder":
+        """Use an application-managed executor for reconciliation audit delivery."""
+
+        self._runtime_options["reconciliation_audit_executor"] = executor
         return self
 
     def with_production_profile(self, profile: ProductionProfile) -> "RuntimeBuilder":

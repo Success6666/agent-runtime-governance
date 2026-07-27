@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 import inspect
 from dataclasses import dataclass
 from typing import Awaitable, Callable, TypeAlias
 
+from .._blocking import run_blocking
 from ..context import ExecutionContext, HistoryEntry
 from ..decisions import DecisionOutcome, DecisionRecord
 from .base import GatingMiddleware
@@ -36,7 +36,7 @@ class LLMMiddleware(GatingMiddleware):
         if inspect.iscoroutinefunction(self._reviewer):
             value = await self._reviewer(context)
         else:
-            value = await asyncio.to_thread(self._reviewer, context)
+            value = await run_blocking(self._reviewer, context)
         if inspect.isawaitable(value):
             value = await value
         if isinstance(value, SemanticReview):

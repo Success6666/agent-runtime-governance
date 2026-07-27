@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import re
 import ssl
@@ -10,6 +9,7 @@ from typing import Any
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
+from .._blocking import run_blocking
 from ..context import ExecutionContext, HistoryEntry
 from ..decisions import DecisionOutcome, DecisionRecord
 from ..middleware.base import GatingMiddleware
@@ -170,7 +170,7 @@ class OPAMiddleware(GatingMiddleware):
 
     async def process(self, context: ExecutionContext) -> ExecutionContext:
         try:
-            decision = await asyncio.to_thread(self.client.evaluate, context)
+            decision = await run_blocking(self.client.evaluate, context)
         except Exception as exc:
             if self.fail_closed:
                 raise

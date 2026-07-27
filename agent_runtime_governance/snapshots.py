@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import hmac
 import json
@@ -16,6 +15,7 @@ from typing import Any, Mapping, Protocol, runtime_checkable
 
 from filelock import FileLock
 
+from ._blocking import run_blocking
 from ._sqlite import connect_sqlite, initialize_sqlite
 from .audit import DEFAULT_SENSITIVE_KEYS, redact_sensitive_data
 from .context import ExecutionContext, ExecutionStatus, HistoryEntry
@@ -551,7 +551,7 @@ class SnapshotMiddleware(ObservingMiddleware):
             return context
         created_at = datetime.now(timezone.utc).isoformat()
         if isinstance(self.store, AtomicSnapshotStore):
-            snapshot = await asyncio.to_thread(
+            snapshot = await run_blocking(
                 self.store.write_context,
                 trace_id=context.trace_id,
                 stage=stage,
@@ -579,7 +579,7 @@ class SnapshotMiddleware(ObservingMiddleware):
             policy_version=updated.metadata.get("policy_version"),
             policy_digest=updated.metadata.get("policy_digest"),
         )
-        await asyncio.to_thread(self.store.write, snapshot)
+        await run_blocking(self.store.write, snapshot)
         if context.status in {
             ExecutionStatus.SUCCEEDED,
             ExecutionStatus.FAILED,

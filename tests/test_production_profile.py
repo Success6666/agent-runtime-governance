@@ -40,6 +40,7 @@ from agent_runtime_governance import (
     ToolSpec,
     VerifiedPrincipal,
 )
+from agent_runtime_governance.pipeline import Pipeline
 from agent_runtime_governance.registry import ToolRegistry
 
 
@@ -475,6 +476,31 @@ def test_profile_rejects_invalid_key_configuration() -> None:
         ProductionProfile(version=2)
     with pytest.raises(TypeError, match="integer"):
         ProductionProfile(version=True)
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "reconciliation_probe_permission",
+        "reconciliation_resolve_permission",
+        "reconciliation_audit_drain_permission",
+    ),
+)
+def test_profile_rejects_invalid_reconciliation_permission(field: str) -> None:
+    with pytest.raises(ValueError, match=field):
+        ProductionProfile(**{field: "invalid permission"})
+
+
+def test_profile_evaluate_accepts_v06_keyword_only_call() -> None:
+    report = ProductionProfile().evaluate(
+        (),
+        pipeline=Pipeline(),
+        idempotency_store=None,
+        identity_provider=None,
+        require_verified_identity=False,
+    )
+
+    assert report.ready is True
 
 
 def test_strict_runtime_rejects_traffic_until_sealed(tmp_path) -> None:

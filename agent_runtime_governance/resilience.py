@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import Enum
 from time import monotonic
-from typing import AsyncIterator, Awaitable, Callable, TypeVar
+from typing import Any, AsyncIterator, Awaitable, Callable, TypeVar
 
 T = TypeVar("T")
 
@@ -106,15 +106,18 @@ class RuntimeLimits:
     hook_timeout_seconds: float = 5.0
     execution_timeout_seconds: float = 30.0
     idempotency_operation_timeout_seconds: float = 30.0
+    admission_timeout_seconds: float = 1.0
+    cancellation_grace_seconds: float = 0.25
+    max_in_flight: int = 128
+
+    # Appended so v0.6 positional construction keeps its published meaning.
     reconciliation_operation_timeout_seconds: float = 30.0
     reconciliation_provider_timeout_seconds: float = 15.0
     reconciliation_finalization_timeout_seconds: float = 5.0
     reconciliation_audit_delivery_timeout_seconds: float = 10.0
-    admission_timeout_seconds: float = 1.0
-    cancellation_grace_seconds: float = 0.25
-    max_in_flight: int = 128
     max_reconciliation_in_flight: int = 16
     max_reconciliation_audit_delivery_in_flight: int = 8
+    max_blocking_extension_in_flight: int = 16
 
     def __post_init__(self) -> None:
         for name in (
@@ -139,6 +142,10 @@ class RuntimeLimits:
         if self.max_reconciliation_audit_delivery_in_flight < 1:
             raise ValueError(
                 "max_reconciliation_audit_delivery_in_flight must be at least one"
+            )
+        if self.max_blocking_extension_in_flight < 1:
+            raise ValueError(
+                "max_blocking_extension_in_flight must be at least one"
             )
 
 
@@ -271,6 +278,7 @@ async def await_stage(
     stage: str,
     timeout_seconds: float,
     cancellation_grace_seconds: float = 0.25,
+    on_detached: Callable[[asyncio.Future[Any]], None] | None = None,
 ) -> T:
     if timeout_seconds <= 0:
         if asyncio.iscoroutine(awaitable):
@@ -283,16 +291,27 @@ async def await_stage(
         if task in done:
             return task.result()
         cancellation_requested = True
-        await _cancel_with_grace(task, cancellation_grace_seconds)
+        await _cancel_with_grace(
+            task,
+            cancellation_grace_seconds,
+            on_detached=on_detached,
+        )
         raise StageTimeoutError(stage, timeout_seconds)
     except BaseException:
         if not task.done() and not cancellation_requested:
-            await _cancel_with_grace(task, cancellation_grace_seconds)
+            await _cancel_with_grace(
+                task,
+                cancellation_grace_seconds,
+                on_detached=on_detached,
+            )
         raise
 
 
 async def _cancel_with_grace(
-    task: asyncio.Future[object], grace_seconds: float
+    task: asyncio.Future[Any],
+    grace_seconds: float,
+    *,
+    on_detached: Callable[[asyncio.Future[Any]], None] | None = None,
 ) -> None:
     task.cancel()
     done, _ = await asyncio.wait({task}, timeout=max(0.0, grace_seconds))
@@ -300,9 +319,11 @@ async def _cancel_with_grace(
         await asyncio.gather(task, return_exceptions=True)
         return
     task.add_done_callback(_consume_future_result)
+    if on_detached is not None:
+        on_detached(task)
 
 
-def _consume_future_result(task: asyncio.Future[object]) -> None:
+def _consume_future_result(task: asyncio.Future[Any]) -> None:
     try:
         task.result()
     except BaseException:
