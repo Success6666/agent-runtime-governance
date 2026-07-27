@@ -25,7 +25,11 @@ from agent_runtime_governance import (
     ReconciliationDisposition,
     ReconciliationEventKind,
     ReconciliationFinding,
+    ReconciliationHead,
+    ReconciliationRecord,
     ReconciliationState,
+    ReconciliationTransition,
+    ReconciliationTransitionSource,
     ReconciliationValidationError,
     SQLiteIdempotencyStore,
     SQLiteReconciliationLedger,
@@ -1131,3 +1135,229 @@ def test_manual_resolution_round_trip_and_validation() -> None:
             match=message,
         ):
             ManualResolution(**invalid)
+
+
+def test_attempt_context_round_trip_and_input_boundaries() -> None:
+    context = _context(_unknown())
+    assert ReconciliationAttemptContext.from_dict(context.to_dict()) == context
+
+    with pytest.raises(TypeError, match="UnknownAction"):
+        ReconciliationAttemptContext(
+            attempt_id="attempt",
+            deadline=datetime.now(timezone.utc),
+            protocol_version=1,
+            action=object(),  # type: ignore[arg-type]
+        )
+
+    for deadline in (None, "not-a-timestamp"):
+        payload = context.to_dict()
+        payload["deadline"] = deadline
+        with pytest.raises(ReconciliationValidationError, match="timestamp"):
+            ReconciliationAttemptContext.from_dict(payload)
+
+
+def test_reconciliation_finding_type_and_json_boundaries() -> None:
+    common = {
+        "proposed_state": ReconciliationState.CONFIRMED_SUCCEEDED,
+        "evidence_kind": "probe",
+        "evidence": {"observed": True},
+        "observed_at": datetime.now(timezone.utc),
+    }
+    with pytest.raises(TypeError, match="proposed_state"):
+        ReconciliationFinding(**{**common, "proposed_state": "confirmed_succeeded"})
+    with pytest.raises(TypeError, match="retry_safe"):
+        ReconciliationFinding(**common, retry_safe=1)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="resolved_result_available"):
+        ReconciliationFinding(
+            **common,
+            resolved_result_available=1,  # type: ignore[arg-type]
+        )
+
+    implicit_result = ReconciliationFinding(**common, resolved_result={"ok": True})
+    assert implicit_result.resolved_result_available is True
+    assert implicit_result.state is ReconciliationState.CONFIRMED_SUCCEEDED
+    assert ReconciliationFinding.from_dict(implicit_result.to_dict()) == implicit_result
+
+    invalid_evidence = (
+        [],
+        {},
+        {1: "not-a-string-key"},
+        {"unsupported": object()},
+        {"integer": 2**53},
+        {"negative_zero": -0.0},
+        {"bad_unicode": "\ud800"},
+    )
+    for evidence in invalid_evidence:
+        with pytest.raises(ReconciliationValidationError):
+            ReconciliationFinding(**{**common, "evidence": evidence})
+
+    cyclic_object: dict[str, object] = {}
+    cyclic_object["self"] = cyclic_object
+    cyclic_array: list[object] = []
+    cyclic_array.append(cyclic_array)
+    for evidence in ({"cycle": cyclic_object}, {"cycle": cyclic_array}):
+        with pytest.raises(ReconciliationValidationError, match="cyclic"):
+            ReconciliationFinding(**{**common, "evidence": evidence})
+
+    nested_sensitive = {"items": [{"Authorization": "secret"}]}
+    with pytest.raises(ReconciliationValidationError, match="sensitive"):
+        ReconciliationFinding(**{**common, "evidence": nested_sensitive})
+
+    list_result = ReconciliationFinding(
+        **common,
+        resolved_result_available=True,
+        resolved_result=[{"ok": True}, [1, 2]],
+    )
+    assert list_result.to_dict()["resolved_result"] == [{"ok": True}, [1, 2]]
+
+
+def test_manual_resolution_enforces_terminal_evidence_semantics() -> None:
+    base = {
+        "execution_record_id": "e" * 64,
+        "operator_identity_digest": _OPERATOR_DIGEST,
+        "reason": "operator verified provider receipt",
+        "expected_state": ReconciliationState.MANUAL_REVIEW,
+        "expected_revision": 2,
+        "new_state": ReconciliationState.CONFIRMED_SUCCEEDED,
+        "resolved_at": datetime.now(timezone.utc),
+        "evidence_kind": "manual",
+        "evidence": {"ticket": "OPS-9"},
+    }
+    with pytest.raises(TypeError, match="retry_safe"):
+        ManualResolution(**base, retry_safe=1)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="resolved_result_available"):
+        ManualResolution(
+            **base,
+            resolved_result_available=1,  # type: ignore[arg-type]
+        )
+    with pytest.raises(ReconciliationValidationError, match="retry-safe"):
+        ManualResolution(
+            **{**base, "new_state": ReconciliationState.CONFIRMED_NOT_APPLIED}
+        )
+    with pytest.raises(ReconciliationValidationError, match="valid only"):
+        ManualResolution(**base, retry_safe=True)
+    with pytest.raises(ReconciliationValidationError, match="valid only"):
+        ManualResolution(
+            **{**base, "new_state": ReconciliationState.CONFIRMED_NOT_APPLIED},
+            retry_safe=True,
+            resolved_result_available=True,
+            resolved_result={"status": "paid"},
+        )
+
+    implicit_result = ManualResolution(**base, resolved_result={"status": "paid"})
+    assert implicit_result.resolved_result_available is True
+
+
+def _transition(**overrides: object) -> ReconciliationTransition:
+    values: dict[str, object] = {
+        "execution_record_id": "e" * 64,
+        "expected_state": ReconciliationState.UNKNOWN,
+        "expected_revision": 2,
+        "new_state": ReconciliationState.CONFIRMED_SUCCEEDED,
+        "source": ReconciliationTransitionSource.PROVIDER,
+        "evidence_kind": "receipt",
+        "evidence": {"receipt_id": "rcpt-1"},
+        "occurred_at": datetime.now(timezone.utc),
+        "retry_safe": False,
+        "resolved_result_available": False,
+        "provider_id": "receipt-store",
+        "attempt_id": "attempt-1",
+    }
+    values.update(overrides)
+    return ReconciliationTransition(**values)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error", "message"),
+    [
+        ("expected_state", "unknown", TypeError, "expected_state"),
+        ("new_state", "confirmed_succeeded", TypeError, "new_state"),
+        ("source", "provider", TypeError, "source"),
+        ("expected_revision", -1, ReconciliationValidationError, "non-negative"),
+        ("retry_safe", 1, TypeError, "retry_safe"),
+        (
+            "resolved_result_available",
+            1,
+            TypeError,
+            "resolved_result_available",
+        ),
+    ],
+)
+def test_transition_rejects_ambiguous_types(
+    field: str, value: object, error: type[Exception], message: str
+) -> None:
+    with pytest.raises(error, match=message):
+        _transition(**{field: value})
+
+
+def test_transition_source_identity_and_round_trip_boundaries() -> None:
+    transition = _transition()
+    assert ReconciliationTransition.from_dict(transition.to_dict()) == transition
+
+    with pytest.raises(ReconciliationValidationError, match="requires provider"):
+        _transition(provider_id=None)
+    with pytest.raises(ReconciliationValidationError, match="cannot carry operator"):
+        _transition(operator_identity_digest=_OPERATOR_DIGEST)
+    with pytest.raises(ReconciliationValidationError, match="manual transition"):
+        _transition(
+            source=ReconciliationTransitionSource.MANUAL,
+            provider_id=None,
+            attempt_id=None,
+        )
+    with pytest.raises(ReconciliationValidationError, match="requires resolved"):
+        _transition(resolved_result={"status": "paid"})
+
+    manual = _transition(
+        source=ReconciliationTransitionSource.MANUAL,
+        provider_id=None,
+        attempt_id=None,
+        operator_identity_digest=_OPERATOR_DIGEST,
+        reason="verified manually",
+    )
+    assert manual.source is ReconciliationTransitionSource.MANUAL
+
+
+def test_record_and_head_round_trip_and_validation_boundaries() -> None:
+    now = datetime.now(timezone.utc)
+    record_values: dict[str, object] = {
+        "event_id": "f" * 64,
+        "execution_record_id": "e" * 64,
+        "revision": 1,
+        "kind": ReconciliationEventKind.STATE_TRANSITION,
+        "state_before": ReconciliationState.UNKNOWN,
+        "state_after": ReconciliationState.MANUAL_REVIEW,
+        "occurred_at": now,
+        "payload": {"operator": {"ticket": "OPS-10"}},
+    }
+    record = ReconciliationRecord(**record_values)  # type: ignore[arg-type]
+    assert ReconciliationRecord.from_dict(record.to_dict()) == record
+    for field, value, error, message in (
+        ("kind", "state_transition", TypeError, "kind"),
+        ("state_before", "unknown", TypeError, "states"),
+        ("revision", 0, ReconciliationValidationError, "positive"),
+    ):
+        with pytest.raises(error, match=message):
+            ReconciliationRecord(**{**record_values, field: value})  # type: ignore[arg-type]
+
+    action = _unknown()
+    head_values: dict[str, object] = {
+        "action": action,
+        "state": ReconciliationState.UNKNOWN,
+        "revision": 0,
+        "disposition": ReconciliationDisposition.BLOCKED_UNKNOWN,
+        "updated_at": now,
+    }
+    head = ReconciliationHead(**head_values)  # type: ignore[arg-type]
+    assert head.execution_record_id == action.execution_record_id
+    assert ReconciliationHead.from_dict(head.to_dict()) == head
+    for field, value, error, message in (
+        ("action", object(), TypeError, "UnknownAction"),
+        ("state", "unknown", TypeError, "state"),
+        ("revision", -1, ReconciliationValidationError, "non-negative"),
+        ("disposition", "blocked_unknown", TypeError, "disposition"),
+        ("resolved_result_available", 1, TypeError, "resolved_result_available"),
+    ):
+        with pytest.raises(error, match=message):
+            ReconciliationHead(**{**head_values, field: value})  # type: ignore[arg-type]
+    with pytest.raises(ReconciliationValidationError, match="requires"):
+        ReconciliationHead(**head_values, resolved_result={"status": "paid"})  # type: ignore[arg-type]
