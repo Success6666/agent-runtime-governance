@@ -120,7 +120,7 @@ def run_opa_smoke(keep_containers: bool) -> None:
             with contextlib.ExitStack() as stack:
                 allowed, sink = _strict_opa_runtime(
                     state / "allowed",
-                    permissions=frozenset({"admin"}),
+                    permissions=frozenset({"admin", "reconciliation:probe"}),
                     policy_digest=policy_digest,
                 )
                 stack.callback(allowed.close)
