@@ -218,6 +218,29 @@ def test_sqlite_idempotency_survives_restart(tmp_path) -> None:
     assert cached.future.result() == {"ok": True}
 
 
+def test_sqlite_idempotency_ignores_unrelated_foreign_key_violations(tmp_path) -> None:
+    """The idempotency startup check must not own another schema's integrity."""
+
+    path = tmp_path / "idempotency.db"
+    SQLiteIdempotencyStore(path)
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute("PRAGMA foreign_keys=OFF")
+            connection.execute("CREATE TABLE unrelated_parent(id INTEGER PRIMARY KEY)")
+            connection.execute(
+                """
+                CREATE TABLE unrelated_child(
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER REFERENCES unrelated_parent(id)
+                )
+                """
+            )
+            connection.execute("INSERT INTO unrelated_child(id, parent_id) VALUES (1, 99)")
+
+    restarted = SQLiteIdempotencyStore(path)
+    assert restarted.acquire("tenant/tool", "request-1", "a" * 64).owner is True
+
+
 def test_sqlite_idempotency_rejects_orphaned_migration_staging_table(tmp_path) -> None:
     """A residual migration table must not be mistaken for a fresh database."""
 

@@ -1724,6 +1724,42 @@ def test_reconciliation_audit_alert_marker_prevents_repeat_poll_writes(
     assert after == before
 
 
+def test_reconciliation_audit_pending_read_tolerates_stall_marker_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    """A best-effort alert marker must not make a durable outbox unreadable."""
+
+    path = tmp_path / "reconciliation-audit-alert-marker-failure.db"
+    store = SQLiteIdempotencyStore(path)
+    claim = store.acquire("tenant/charge", "request-1", _ACTION_DIGEST)
+    assert claim.execution_record_id is not None
+    ledger = SQLiteReconciliationLedger(
+        path,
+        audit_delivery_alert_attempts=1,
+        audit_delivery_alert_age_seconds=3_600,
+    )
+    ledger.record_unknown(
+        claim,
+        _unknown(claim.execution_record_id),
+        TimeoutError("outcome uncertain"),
+    )
+    envelope = ledger.pending_audit_events(
+        execution_record_id=claim.execution_record_id
+    )[0]
+    ledger.record_audit_delivery_failure(envelope.outbox_id, RuntimeError("sink down"))
+
+    def locked_marker(*_args: object) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(ledger, "_warn_if_audit_delivery_is_stalled", locked_marker)
+    caplog.set_level("WARNING", logger="agent_runtime_governance.reconciliation")
+
+    pending = ledger.pending_audit_events(execution_record_id=claim.execution_record_id)
+
+    assert [item.outbox_id for item in pending] == [envelope.outbox_id]
+    assert "reconciliation audit stall alert could not be recorded" in caplog.text
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
