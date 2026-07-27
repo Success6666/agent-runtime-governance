@@ -165,6 +165,23 @@ def test_in_memory_idempotency_evicts_terminal_entries_after_idle_ttl(
     assert store.acquire("tenant/tool", "request", "a" * 64).owner is True
 
 
+def test_sqlite_idempotency_failure_without_reconciliation_schema_releases_claim(
+    tmp_path,
+) -> None:
+    """A standalone idempotency store must not require reconciliation tables."""
+
+    store = SQLiteIdempotencyStore(tmp_path / "idempotency.db")
+    claim = store.acquire("tenant/tool", "request", "a" * 64)
+
+    store.fail(claim, ValueError("tool validation failed"))
+
+    with pytest.raises(ValueError, match="tool validation failed"):
+        claim.future.result()
+    replacement = store.acquire("tenant/tool", "request", "a" * 64)
+    assert replacement.owner is True
+    assert replacement.generation == 1
+
+
 @pytest.mark.parametrize("durable", [False, True])
 def test_unknown_outcome_exposes_stable_execution_record_id(
     tmp_path, durable: bool

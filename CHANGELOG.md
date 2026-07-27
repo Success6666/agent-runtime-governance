@@ -13,10 +13,11 @@ All notable changes are documented here.
   attempt events, provider descriptors, manual resolution, and explicit
   `MANUAL_REVIEW` containment.
 - Atomic SQLite prepared-action persistence: the idempotency owner and its
-  redacted `UnknownAction` recovery descriptor commit before a side-effecting
-  body can be dispatched.
+  minimal `UnknownAction` recovery descriptor commit before a side-effecting
+  body can be dispatched. The descriptor excludes raw idempotency keys and
+  parameters.
 - A schema-v4 transactional reconciliation-audit outbox. SQLite mutations and
-  redacted delivery envelopes commit together; `SQLiteAuditSink` supports
+  fixed-allowlist delivery envelopes commit together; `SQLiteAuditSink` supports
   stable source-event-id de-duplication for safe acknowledgement retries.
 - Recovery for expired unfinished provider attempts. Recovery records a
   terminal `recovery_required` event and moves the action to `MANUAL_REVIEW`
@@ -34,7 +35,8 @@ All notable changes are documented here.
 - Strict idempotent SQLite deployments now require a colocated
   `SQLiteIdempotencyStore` and `SQLiteReconciliationLedger`, a persisted
   reconciliation provider for every idempotent tool, and a signed,
-  source-idempotent `SQLiteAuditSink` behind fail-closed audit middleware.
+  source-idempotent audit sink behind fail-closed audit middleware. The
+  built-in `SQLiteAuditSink` is one verified implementation.
 - Reconciliation provider identity, protocol version, and supported evidence
   kinds are bound into the persisted recovery descriptor and fail closed on
   drift after restart.
@@ -53,6 +55,9 @@ All notable changes are documented here.
 - Runtime close no longer waits on a blocked reconciliation-audit delivery
   thread. In-flight delivery remains unacknowledged and is safely retried by a
   later worker using the source event ID.
+- Standalone `SQLiteIdempotencyStore` failure cleanup no longer assumes a
+  colocated reconciliation schema, preserving the original tool failure and
+  releasing the claim when reconciliation is not configured.
 
 ## [0.6.0] - 2026-07-27
 

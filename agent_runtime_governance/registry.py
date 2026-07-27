@@ -631,18 +631,32 @@ class SQLiteIdempotencyStore:
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("idempotency ownership was lost before failure")
-            connection.execute(
-                """
-                DELETE FROM reconciliation_prepared_actions
-                WHERE execution_record_id = ?
-                  AND NOT EXISTS (
-                      SELECT 1 FROM reconciliation_heads
-                      WHERE reconciliation_heads.execution_record_id =
-                            reconciliation_prepared_actions.execution_record_id
-                  )
-                """,
-                (claim.execution_record_id,),
-            )
+            reconciliation_tables = {
+                str(row[0])
+                for row in connection.execute(
+                    """
+                    SELECT name FROM sqlite_master
+                    WHERE type = 'table'
+                      AND name IN ('reconciliation_prepared_actions', 'reconciliation_heads')
+                    """
+                )
+            }
+            if {
+                "reconciliation_prepared_actions",
+                "reconciliation_heads",
+            }.issubset(reconciliation_tables):
+                connection.execute(
+                    """
+                    DELETE FROM reconciliation_prepared_actions
+                    WHERE execution_record_id = ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM reconciliation_heads
+                          WHERE reconciliation_heads.execution_record_id =
+                                reconciliation_prepared_actions.execution_record_id
+                      )
+                    """,
+                    (claim.execution_record_id,),
+                )
             connection.commit()
         if not claim.future.done():
             claim.future.set_exception(error)
