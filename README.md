@@ -60,6 +60,8 @@ exactly-once unless the downstream system independently supports that property.
 | Strict control-plane operations require separate probe, manual-resolution, and audit-drain permissions, plus tenant binding for per-action access | [`test_strict_reconciliation_denies_cross_tenant_probe_without_attempt`](tests/test_runtime_reconciliation.py), [`test_strict_global_audit_recovery_requires_its_own_permission`](tests/test_runtime_reconciliation.py) |
 | A durable started probe is finalized under an independent budget. An expired unclosed probe is closed with `recovery_required` and moved to `MANUAL_REVIEW`; a second provider probe is not started | [`test_cancellation_during_finish_keeps_finalization_running`](tests/test_runtime_reconciliation.py), [`test_restart_quarantines_an_expired_unfinished_provider_attempt`](tests/test_runtime_reconciliation.py) |
 | Control-plane caller deadlines bound audit recovery and delivery; a stalled sink leaves the durable envelope pending rather than corrupting the ledger or holding the process open after shutdown | [`test_global_audit_recovery_honors_its_caller_deadline`](tests/test_runtime_reconciliation.py), [`test_blocked_reconciliation_audit_sink_cannot_hold_python_process_open`](tests/test_runtime_reconciliation.py) |
+| Shared SQLite migration rejects orphaned staging objects and cannot upgrade idempotency independently of an existing reconciliation authority | [`test_sqlite_idempotency_rejects_orphaned_migration_staging_table`](tests/test_contracts_idempotency.py), [`test_standalone_idempotency_migration_rejects_colocated_reconciliation`](tests/test_contracts_idempotency.py) |
+| Async shutdown rejects self- and cross-loop deadlocks, stops new admission, and waits for already-admitted, cancellation-ignoring, and thread-backed runtime work before releasing executors | [`test_aclose_waits_for_active_public_operation`](tests/test_runtime.py), [`test_aclose_waits_for_detached_uncooperative_async_tool`](tests/test_runtime.py), [`test_aclose_waits_for_timed_out_uncooperative_sync_hook`](tests/test_runtime.py), [`test_aclose_waits_for_timed_out_uncooperative_sync_audit_sink`](tests/test_runtime.py), [`test_aclose_waits_for_timed_out_sync_tool_on_external_executor`](tests/test_runtime.py), [`test_aclose_waits_for_a_cancellation_ignoring_provider`](tests/test_runtime_reconciliation.py), [`test_aclose_rejects_self_shutdown_from_active_operation`](tests/test_runtime.py), [`test_aclose_rejects_cross_loop_shutdown_while_work_is_active`](tests/test_runtime.py) |
 
 The staged v0.8-v1.0 direction and its exit criteria are in
 [`ROADMAP.md`](ROADMAP.md) and [`docs/production-roadmap.md`](docs/production-roadmap.md).
@@ -321,6 +323,12 @@ outbox source ID. The application must supply a read-only receipt/probe provider
 the runtime binds its identifier, protocol version, and evidence kinds to the
 persisted action but cannot prove that third-party provider code has no side
 effects.
+Pre-outbox reconciliation databases require the dedicated offline
+`SQLiteReconciliationLedger.migrate_legacy(...)` operation; ordinary runtime
+construction fails closed rather than recreating an outbox. A pre-versioned
+standalone idempotency database likewise requires the dedicated offline
+`SQLiteIdempotencyStore.migrate_legacy(...)` operation; normal startup accepts
+only the current protected idempotency schema.
 See [`docs/production.md`](docs/production.md) and
 [`docs/migration-v0.7.md`](docs/migration-v0.7.md) before enabling it for
 production traffic.
@@ -355,8 +363,8 @@ provider at that boundary in production.
 
 The production smoke suite starts real Docker services for OPA and the
 OpenTelemetry Collector, exports through OTLP HTTP, scrapes a real HTTP
-`/metrics` exposition endpoint, and can run a local Kind smoke with a pinned
-node image:
+`/metrics` exposition endpoint, and can build the local package into a pinned
+Python image before running a hardened Runtime Job in a local Kind cluster:
 
 ```bash
 python integration/production_smoke.py --skip-kind
@@ -377,10 +385,12 @@ trusted identity, while `Runtime.areconcile()` and
 
 ### Release verification
 
-Before a GitHub release is published, maintainers review the required protected
-CI matrix (Python 3.10-3.13) and Docker-backed integration smoke. The
-post-publication release workflow then repeats the full suite on Python 3.13,
-runs dependency audit and package installation checks, and attaches the SPDX
+Before a GitHub release is published, maintainers review the protected CI matrix
+required by branch protection (Python 3.10-3.13) and Docker-backed integration
+smoke. The
+post-publication release workflow then repeats the full Python suite and
+Docker-backed smoke on Python 3.13, runs dependency audit and package
+installation checks, and attaches the SPDX
 SBOM, SHA256 checksums, and GitHub provenance. PyPI Trusted Publishing is a
 separate workflow that consumes those verified release artifacts. Migration
 restore drills and public-index installation checks are recorded release

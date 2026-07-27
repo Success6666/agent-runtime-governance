@@ -61,6 +61,36 @@ SQLite stores coordinate multiple processes on one host. They are not a
 distributed database. Deployments spanning hosts must provide store adapters
 with equivalent atomic claim, lease, compare-and-set, and durability semantics.
 
+On every `SQLiteIdempotencyStore` startup, the idempotency authority must match
+the released DDL exactly: `idempotency_records`, `idempotency_schema`, the
+single current schema-version row, and the two canonical indexes. Persistent
+triggers and additional explicit indexes on either authority table fail
+startup. A pre-versioned standalone idempotency database is an offline
+migration operation through `SQLiteIdempotencyStore.migrate_legacy(...)`, not
+a service-startup repair. When it shares a path with reconciliation, use
+`SQLiteReconciliationLedger.migrate_legacy(...)` to upgrade both authorities.
+The SDK detects durable in-place schema tampering at startup; protect the
+database volume and validate backup provenance because an entirely replaced
+empty file is indistinguishable from a first deployment.
+
+The shared migration validates both authority inventories before mutation and
+performs the reconciliation and idempotency upgrades inside one SQLite
+`BEGIN IMMEDIATE` transaction protected by the database initialization lock.
+An invalid legacy idempotency schema, a reserved staging-table collision, or a
+later migration error rolls back the reconciliation changes too. Do not bypass
+this entry point by calling both migration APIs independently against a shared
+database file.
+
+`idempotency_records_v07` is reserved for the controlled migration transaction
+even if the versioned idempotency authority is otherwise absent. Any persistent
+object using that name fails startup and migration before a new authority is
+created. Do not remove it manually: restore a verified source database and
+rerun the controlled migration. Conversely,
+`SQLiteIdempotencyStore.migrate_legacy(...)` rejects every path containing a
+reconciliation authority object, including a partial one. It is a standalone
+operation only; shared storage always goes through the ledger migration entry
+point.
+
 ## Deadlines and cancellation
 
 The request deadline is absolute and propagates through governance,
@@ -84,6 +114,40 @@ Never automatically retry an unresolved `UNKNOWN`. The original key remains
 blocked while its reconciliation disposition is `BLOCKED_UNKNOWN` or
 `BLOCKED_MANUAL_REVIEW`. Use the deterministic reconciliation protocol below;
 do not delete a durable record to force a retry.
+
+## Runtime shutdown
+
+`Runtime.close()` is a synchronous, fail-closed shutdown operation. It succeeds
+only when no public invocation, reconciliation workflow, durable finalizer, or
+submitted synchronous tool is still active; on refusal it keeps the runtime
+open so the caller can drain or await the existing work. Strict-production
+runtimes reject `close(wait=False)` because a non-waiting close cannot prove
+that a thread-backed effect has stopped.
+
+`await Runtime.aclose()` seals admission, waits for already-admitted `arun`,
+`apreview`, and `areplay` work to complete naturally, and waits for
+reconciliation finalization, provider tasks, submitted synchronous tools, and
+any coroutine that remained live after the configured cancellation grace period
+before owned authoritative executors are released. When invoked through
+`Runtime`, synchronous hooks, middleware callbacks, identity/precondition
+providers, approval stores, audit sinks, snapshot stores, and built-in
+OPA/Slack adapters run through a runtime-owned bounded extension executor. Its
+queue is limited by
+`RuntimeLimits.max_blocking_extension_in_flight` (default `16`); a timed-out
+thread retains its permit until the underlying call actually finishes, and
+`aclose()` waits for that call rather than reporting a false clean shutdown.
+
+Do not submit nested blocking work from a synchronous extension callback. The
+runtime fails that pattern closed instead of escaping to an untracked global
+thread. Calling either `close()` or `aclose()` from a tool, hook, or middleware
+already executing for the same runtime is rejected to prevent a self-wait
+deadlock. The outbox-backed daemon delivery executor remains the narrow
+exception described below: a delivery attempt that has exceeded its bounded
+budget can be left pending for a later authorized worker.
+
+Run asynchronous lifecycle operations from the event loop that owns outstanding
+runtime work. Cross-loop shutdown is rejected rather than awaiting a foreign
+`asyncio.Task`.
 
 ## Deterministic UNKNOWN reconciliation
 
@@ -186,6 +250,58 @@ independently checks its hash chain and source-event payload identity, so back
 up its database and signing key with the same care. The outbox is delivery
 intent, not a second authoritative copy of the external side effect.
 
+For a database that declares reconciliation schema version 1, 2, or 3, normal
+runtime startup fails closed. Upgrade a verified pre-outbox database only from
+a dedicated offline process through `SQLiteReconciliationLedger.migrate_legacy(...)`;
+do not retain that call in a long-lived service. For a database that declares
+reconciliation schema version 4 or 5, startup
+requires an exact normalized DDL match for the version table, a valid version
+row, the schema table, every
+authority table (`reconciliation_heads`, `reconciliation_events`,
+`reconciliation_prepared_actions`, and `reconciliation_audit_outbox`), the
+pending-delivery index, and all append-only, prepared-action, immutable-payload,
+and retention guards. No additional persistent trigger or explicit index may
+attach to those tables. This rejects comment-based constraint lookalikes,
+conditional trigger variants, partial or unique index replacements, and a
+schema version inconsistent with existing authority objects. SQLite
+foreign-key integrity is checked for reconciliation events and outbox rows; the
+outbox mutation and deletion guards are also exercised in a rolled-back
+savepoint. Any mismatch, orphan, missing, or partial authority set fails
+closed; restore a verified database rather than letting empty tables hide a
+lost recovery or delivery obligation.
+
+The controlled v4-to-v5 upgrade adds the alert marker and normalizes the outbox
+enqueue time only for a still-pending, unattempted
+`migration_snapshot_recorded` envelope with no recorded delivery error. The
+payload continues to retain the historical lineage timestamp; the upgrade only
+corrects mutable delivery-queue metadata so that the snapshot does not appear
+already overdue merely because its lineage predates the outbox.
+
+The colocated SQLite idempotency authority is also versioned and integrity
+checked. Normal `SQLiteIdempotencyStore` startup requires the exact released
+records/schema-table DDL, the one current version row, the two released
+indexes, and no persistent trigger or additional explicit index on either
+authority table. A standalone pre-versioned idempotency store must be upgraded
+offline with `SQLiteIdempotencyStore.migrate_legacy(...)`; when it shares the
+reconciliation database, use the ledger migration entry point so both
+authorities are upgraded under the same controlled process.
+
+`SQLiteReconciliationLedger` records a durable alert marker and emits one
+structured warning per still-pending execution when its audit delivery reaches
+the configured threshold (3 attempts or 300 seconds by default). Forward the
+`agent_runtime_governance.reconciliation` logger to the service's monitoring
+system. The warning contains only execution lineage counters and age, never raw
+evidence, identity, tenant, or idempotency values. The ledger writes
+`alerted_at` only once for the same unresolved pending execution; that durable
+claim prevents duplicate marker writes and warning storms across restarts or
+later failures.
+
+Do not compact, archive, or delete reconciliation history or outbox rows by
+hand. The runtime does not automatically do so. Long-term retention and
+archival require a tested, explicit controlled migration with a verified backup
+and restore path because these rows remain part of the recovery and evidence
+lineage.
+
 Configure `sign_key` for snapshot stores when tamper evidence is required. In
 unsigned mode the snapshot sequence state uses only a recomputable
 `state_hash`; anyone able to rewrite the state file can forge it, so unsigned
@@ -271,6 +387,16 @@ python -m build
 Run the audit in a clean environment. Auditing a shared developer interpreter
 mixes unrelated project dependencies into the result and cannot establish the
 SDK dependency closure.
+
+The full Kind command builds the local source into the pinned smoke image,
+loads that image into the cluster, and waits for a non-root, read-only-root
+filesystem Job to execute a real Runtime invocation and rule-denial path. It
+uses a unique cluster name and local image tag per invocation, so concurrent
+local checks do not delete each other's resources. It is optional in hosted CI
+because it needs Docker, Kind, and kubectl. An exit
+status `137` while creating the Kind control plane is an out-of-memory failure
+of the local Docker environment, not a passed Kubernetes check; increase the
+Docker memory allocation and rerun the full command after cleanup.
 
 Verify a restart with pending approval and idempotency records, a forced OPA
 failure, a critical audit failure, cancellation of an in-flight mutating tool,

@@ -90,6 +90,9 @@ behavior without a downstream idempotency or receipt/probe guarantee.
 - Versioned, privacy-aware Governance Evidence Bundle
 - Offline verification and schema compatibility tests
 - Cross-framework conformance for standalone, LangGraph, and OpenAI Agents SDK
+- Async-first extension dispatch with controlled synchronous fallback,
+  event-loop-isolation tests, native async external-adapter compatibility, and
+  bounded worker/queue observability ([#43](https://github.com/Success6666/agent-runtime-governance/issues/43))
 
 ## v0.9 - Distributed production adapters
 
