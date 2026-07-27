@@ -27,6 +27,18 @@ test("workflow keeps the CodeRabbit handoff from cancelling the current-head che
   );
 });
 
+test("CI pins the Codecov action and validated CLI release", () => {
+  const workflow = fs.readFileSync(
+    path.resolve(__dirname, "..", "workflows", "ci.yml"),
+    "utf8",
+  );
+
+  const action =
+    "codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f";
+  assert.equal(workflow.split(action).length - 1, 2);
+  assert.equal((workflow.match(/^\s+version: "11\.3\.1"$/gm) || []).length, 2);
+});
+
 function fixture({
   reviews = [],
   comments = [],

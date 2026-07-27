@@ -62,21 +62,23 @@ jobs:
           matrix.python-version == '3.13' &&
           (github.event_name != 'pull_request' ||
           github.event.pull_request.head.repo.full_name == github.repository)
-        uses: codecov/codecov-action@04b047e8bb82a0c002c8312c1c880fbc6a999d45 # v5
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
         with:
           files: coverage.xml
           fail_ci_if_error: true
           use_oidc: true
+          version: "11.3.1"
       - name: Upload coverage for fork pull requests
         if: >-
           matrix.python-version == '3.13' &&
           github.event_name == 'pull_request' &&
           github.event.pull_request.head.repo.full_name != github.repository
-        uses: codecov/codecov-action@04b047e8bb82a0c002c8312c1c880fbc6a999d45 # v5
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
         with:
           files: coverage.xml
           fail_ci_if_error: false
           use_oidc: false
+          version: "11.3.1"
 
   build:
     runs-on: ubuntu-latest
