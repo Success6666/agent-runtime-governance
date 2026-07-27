@@ -802,7 +802,8 @@ def test_v06_idempotency_schema_is_rebuilt_without_data_loss(tmp_path: Path) -> 
         )
         connection.commit()
 
-    SQLiteReconciliationLedger(path)
+    ledger = SQLiteReconciliationLedger(path, journal_mode="delete")
+    assert ledger.journal_mode == "delete"
     with closing(sqlite3.connect(path)) as connection:
         columns = {
             row[1]: row
