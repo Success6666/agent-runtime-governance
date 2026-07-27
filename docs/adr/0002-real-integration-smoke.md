@@ -17,8 +17,12 @@ boundaries.
 - The smoke test exercises the SDK against real OPA HTTP decisions, real OTLP
   HTTP export, and a real HTTP `/metrics` exposition endpoint served by the
   Prometheus client library.
-- Kubernetes is validated as an example smoke with `kind` and a pinned node
-  image. The SDK does not claim to be a Kubernetes controller or control plane.
+- The optional Kind check builds the current source into a pinned Python image,
+  loads it into a Kind cluster, and waits for a hardened non-root Job to run a
+  real Runtime invocation and rule-denial path. Each invocation uses a unique
+  cluster name and local image tag, then verifies cleanup of only those exact
+  resources. The SDK does not claim to be a Kubernetes controller or control
+  plane.
 - CI runs the Docker smoke without Kind. Local release verification can run the
   full script when Docker, Kind, and kubectl are available.
 

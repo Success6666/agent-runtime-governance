@@ -4,7 +4,7 @@ All notable changes are documented here.
 
 ## [Unreleased]
 
-## [0.7.0] - 2026-07-27
+## [0.7.0] - Pending publication
 
 ### Added
 
@@ -16,7 +16,7 @@ All notable changes are documented here.
   minimal `UnknownAction` recovery descriptor commit before a side-effecting
   body can be dispatched. The descriptor excludes raw idempotency keys and
   parameters.
-- A schema-v4 transactional reconciliation-audit outbox. SQLite mutations and
+- A schema-v5 transactional reconciliation-audit outbox. SQLite mutations and
   fixed-allowlist delivery envelopes commit together; `SQLiteAuditSink` supports
   stable source-event-id de-duplication for safe acknowledgement retries.
 - Recovery for expired unfinished provider attempts. Recovery records a
@@ -43,6 +43,10 @@ All notable changes are documented here.
 - Reconciliation audit delivery has its own deadline, bulkhead, and durable
   recovery-worker entry point; a sink delivery timeout leaves the envelope
   pending rather than poisoning the reconciliation ledger.
+- Normal ledger startup refuses pre-outbox reconciliation schema versions.
+  A verified v1-v3 database must be upgraded through the explicit,
+  offline `SQLiteReconciliationLedger.migrate_legacy(...)` operation instead
+  of allowing a long-lived runtime to recreate an outbox.
 
 ### Fixed
 
@@ -58,6 +62,50 @@ All notable changes are documented here.
 - Standalone `SQLiteIdempotencyStore` failure cleanup no longer assumes a
   colocated reconciliation schema, preserving the original tool failure and
   releasing the claim when reconciliation is not configured.
+- Reconciliation schema validation now compares the released DDL without
+  folding SQL string-literal case, rejects forged v1-v3 downgrade paths,
+  validates the complete legacy authority set during controlled migration,
+  and detects orphaned foreign-key records before startup.
+- SQLite idempotency initialization now validates its complete authority
+  contract (table DDL, current version row, canonical indexes, and persistent
+  trigger inventory) before accepting durable execution state. Pre-versioned
+  stores require the explicit offline `SQLiteIdempotencyStore.migrate_legacy(...)`
+  path instead of automatic service-startup migration.
+- Reconciliation construction now validates a colocated idempotency authority
+  before creating or migrating reconciliation tables, so a rejected legacy
+  store cannot leave a partial reconciliation schema behind.
+- Controlled shared SQLite migration now validates both authority inventories
+  and upgrades them in one `BEGIN IMMEDIATE` transaction, rolling back the
+  reconciliation authority when the idempotency upgrade cannot complete.
+- Idempotency startup and controlled migration now reject an orphaned
+  `idempotency_records_v07` staging object before creating any new authority;
+  standalone idempotency migration also refuses a database that contains any
+  reconciliation authority object.
+- Runtime shutdown now tracks every public asynchronous operation, keeps the
+  close transition exclusive until owned executors are released, waits for
+  admitted normal work, cancellation-ignoring tool coroutines, and detached
+  reconciliation providers during `aclose()`, and rejects self- or
+  cross-event-loop shutdown that would otherwise deadlock or leave executors
+  live.
+- Synchronous hooks, middleware callbacks, identity/precondition providers,
+  approval stores, audit and snapshot sinks, and built-in OPA/Slack adapters
+  now use a bounded Runtime-owned executor. Timed-out thread-backed work holds
+  capacity until it actually exits, and graceful shutdown waits for it instead
+  of reporting a false clean stop; nested blocking submission fails closed.
+- Synchronous tools submitted through an application-provided executor remain
+  tracked after their asyncio wrapper times out, so `aclose()` cannot return
+  while that tool body is still running.
+- The reconciliation audit daemon executor now fails queued deliveries and
+  rejects new submission after a queue-read failure rather than leaving a
+  `Future` pending indefinitely, and preserves caller cancellation in its
+  post-dequeue failure path; the durable outbox remains available for a fresh
+  runtime to retry the source-idempotent delivery.
+- The optional Kind smoke now builds and executes the local SDK in a hardened
+  Kubernetes Job instead of only applying and reading a ConfigMap; Docker OPA,
+  OTLP, and Prometheus smoke checks likewise require runtime-produced evidence.
+- A transient Docker build failure retries a cache-busting Docker build; a
+  failed build is never treated as a successful integration check. Artifact
+  hash pinning is not claimed without a hash-locked dependency input.
 
 ## [0.6.0] - 2026-07-27
 
