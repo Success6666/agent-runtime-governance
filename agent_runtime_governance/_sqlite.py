@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -77,6 +78,7 @@ def sqlite_journal_capabilities(
 
 
 def connect_sqlite(path: str | Path, timeout_seconds: float) -> sqlite3.Connection:
+    _validate_timeout_seconds(timeout_seconds)
     connection = sqlite3.connect(
         path,
         timeout=timeout_seconds,
@@ -88,7 +90,6 @@ def connect_sqlite(path: str | Path, timeout_seconds: float) -> sqlite3.Connecti
         connection.close()
         raise SQLiteJournalModeError("SQLite foreign-key enforcement is unavailable")
     connection.execute(f"PRAGMA busy_timeout={int(timeout_seconds * 1000)}")
-    connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA synchronous=FULL")
     return connection
 
@@ -100,6 +101,7 @@ def initialize_sqlite(
     *,
     journal_mode: str = "auto",
 ) -> Iterator[sqlite3.Connection]:
+    _validate_timeout_seconds(timeout_seconds)
     capabilities = sqlite_journal_capabilities(journal_mode)
     lock = FileLock(f"{path}.initialize.lock", timeout=timeout_seconds)
     with lock:
@@ -121,3 +123,13 @@ def initialize_sqlite(
                     f"SQLite synchronous level is {synchronous}, expected FULL (2)"
                 )
             yield connection
+
+
+def _validate_timeout_seconds(timeout_seconds: float) -> None:
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, int | float)
+        or not math.isfinite(timeout_seconds)
+        or timeout_seconds <= 0
+    ):
+        raise ValueError("timeout_seconds must be a positive finite number")

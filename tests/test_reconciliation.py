@@ -694,8 +694,10 @@ def test_sqlite_restarts_without_losing_history(tmp_path: Path) -> None:
     restarted = SQLiteReconciliationLedger(path)
     assert restarted.current(action.execution_record_id).revision == 1
     assert len(restarted.attempts(action.execution_record_id)) == 1
-    assert restarted.journal_mode == "delete"
-    with closing(sqlite3.connect(path)) as connection:
+    assert restarted.journal_mode == sqlite_journal_capabilities(
+        "auto"
+    ).selected_mode
+    with connect_sqlite(path, 1.0) as connection:
         assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2
 
 
@@ -825,6 +827,66 @@ def test_v06_idempotency_schema_is_rebuilt_without_data_loss(tmp_path: Path) -> 
     assert reopened_ids == migrated_ids
 
 
+def test_v06_migration_normalizes_malformed_rows_fail_closed(tmp_path: Path) -> None:
+    path = tmp_path / "malformed-legacy.db"
+    now = datetime.now(timezone.utc).isoformat()
+    future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute(
+            """
+            CREATE TABLE idempotency_records (
+                namespace TEXT NOT NULL,
+                key TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                state TEXT NOT NULL,
+                result_json TEXT,
+                error TEXT,
+                owner_token TEXT,
+                lease_expires_at TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(namespace, key)
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT INTO idempotency_records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                ("ns", "missing-result", "1" * 64, "completed", None, None, "stale", future, now),
+                ("ns", "invalid-state", "2" * 64, "corrupt", "1", None, "stale", future, now),
+                ("ns", "missing-lease", "3" * 64, "pending", None, None, "owner", None, now),
+                ("ns", "invalid-lease", "4" * 64, "pending", None, None, "owner", "not-a-time", now),
+                ("ns", "stale-pending-result", "5" * 64, "pending", "1", None, "owner", future, now),
+                ("ns", "invalid-result", "6" * 64, "completed", "{", None, None, None, now),
+                ("ns", "unknown-residue", "7" * 64, "unknown", "1", "lost", "stale", future, now),
+                ("ns", "valid", "8" * 64, "completed", "{ \"ok\" : true }", "stale", None, None, now),
+            ],
+        )
+        connection.commit()
+
+    SQLiteIdempotencyStore(path, journal_mode="delete")
+    with connect_sqlite(path, 1.0) as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+        rows = {
+            key: (state, result_json, error, owner, lease)
+            for key, state, result_json, error, owner, lease in connection.execute(
+                """
+                SELECT key, state, result_json, error, owner_token, lease_expires_at
+                FROM idempotency_records
+                """
+            )
+        }
+
+    assert rows["missing-result"][0] == "applied_no_result"
+    assert rows["invalid-state"][0] == "unknown"
+    assert rows["missing-lease"][0] == "unknown"
+    assert rows["invalid-lease"][0] == "unknown"
+    assert rows["stale-pending-result"][0] == "unknown"
+    assert rows["invalid-result"][0] == "applied_no_result"
+    assert rows["unknown-residue"] == ("unknown", None, "lost", None, None)
+    assert rows["valid"] == ("completed", '{"ok":true}', None, None, None)
+    assert all(row[3] is None and row[4] is None for row in rows.values())
+
+
 @pytest.mark.parametrize("durable", [False, True])
 def test_same_action_with_different_keys_has_distinct_execution_records(
     tmp_path: Path, durable: bool
@@ -837,6 +899,13 @@ def test_same_action_with_different_keys_has_distinct_execution_records(
     first = store.acquire("tenant/charge", "one", _ACTION_DIGEST)
     second = store.acquire("tenant/charge", "two", _ACTION_DIGEST)
     assert first.execution_record_id != second.execution_record_id
+
+
+def test_in_memory_idempotency_claims_report_first_generation_only() -> None:
+    store = InMemoryIdempotencyStore()
+    first = store.acquire("tenant/charge", "one", _ACTION_DIGEST)
+    repeated = store.acquire("tenant/charge", "one", _ACTION_DIGEST)
+    assert first.generation == repeated.generation == 1
 
 
 def test_sqlite_reconciliation_storage_does_not_persist_raw_idempotency_key(
@@ -885,6 +954,23 @@ def test_sqlite_wal_version_gate(version: tuple[int, int, int], safe: bool) -> N
     if not safe:
         with pytest.raises(SQLiteJournalModeError):
             sqlite_journal_capabilities("wal", version=version)
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("nan"), float("inf"), True])
+def test_sqlite_connection_rejects_invalid_timeout_at_public_boundary(
+    tmp_path: Path, timeout: float
+) -> None:
+    with pytest.raises(ValueError, match="positive finite"):
+        connect_sqlite(tmp_path / "invalid-timeout.db", timeout)
+
+
+def test_sqlite_journal_capability_input_validation() -> None:
+    assert sqlite_wal_is_safe((3, 50)) is False  # type: ignore[arg-type]
+    assert sqlite_wal_is_safe((3, "50", 7)) is False  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="string"):
+        sqlite_journal_capabilities(1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="auto"):
+        sqlite_journal_capabilities("truncate")
 
 
 def test_explicit_wal_requirement_fails_closed_on_affected_runtime(
