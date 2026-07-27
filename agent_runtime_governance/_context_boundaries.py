@@ -146,6 +146,11 @@ def _same_result(left: object, right: object) -> bool:
 def _same_metadata_value(left: object, right: object) -> bool:
     if left is right:
         return True
-    if isinstance(left, float) and isinstance(right, float):
-        return math.isnan(left) and math.isnan(right)
+    if (
+        isinstance(left, float)
+        and isinstance(right, float)
+        and math.isnan(left)
+        and math.isnan(right)
+    ):
+        return True
     return _same_result(left, right)
