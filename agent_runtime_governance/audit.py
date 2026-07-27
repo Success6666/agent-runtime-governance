@@ -687,6 +687,63 @@ def context_event(context: ExecutionContext, *, stage: str) -> dict[str, Any]:
     }
 
 
+def reconciliation_event(
+    head: Any,
+    *,
+    event_type: str,
+    provider: Any | None = None,
+    attempt_id: str | None = None,
+    outcome: str | None = None,
+    evidence_kind: str | None = None,
+    evidence: Mapping[str, Any] | None = None,
+    operator_identity_digest: str | None = None,
+) -> dict[str, Any]:
+    """Build a lineage-only audit record for explicit reconciliation work.
+
+    Reconciliation evidence can contain provider-specific receipt data, so the
+    audit channel records only its canonical digest.  The durable reconciliation
+    ledger remains the authority for the bounded evidence payload.
+    """
+
+    action = head.action
+    metadata = action.metadata
+    provider_data = None
+    if provider is not None:
+        provider_data = {
+            "provider_id": provider.provider_id,
+            "protocol_version": str(provider.protocol_version),
+            "supported_evidence_kinds": list(provider.supported_evidence_kinds),
+        }
+    evidence_digest = None
+    if evidence is not None:
+        evidence_digest = hashlib.sha256(
+            _canonical_json({"evidence": _safe_json_value(evidence)}).encode("utf-8")
+        ).hexdigest()
+    return {
+        "schema_version": 1,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "stage": "reconciliation",
+        "event_type": event_type,
+        "trace_id": metadata.get("trace_id"),
+        "request_id": metadata.get("request_id"),
+        "execution_record_id": head.execution_record_id,
+        "tool_name": action.tool_name,
+        "contract_id": action.contract_id,
+        "contract_version": action.contract_version,
+        "action_digest": action.action_digest,
+        "idempotency_namespace_digest": action.idempotency_namespace_digest,
+        "state": head.state.value,
+        "revision": head.revision,
+        "disposition": head.disposition.value,
+        "provider": provider_data,
+        "attempt_id": attempt_id,
+        "outcome": outcome,
+        "evidence_kind": evidence_kind,
+        "evidence_digest": evidence_digest,
+        "operator_identity_digest": operator_identity_digest,
+    }
+
+
 def sign_event(event: Mapping[str, Any], key: bytes) -> str:
     return hmac.new(key, _canonical_json(event).encode("utf-8"), hashlib.sha256).hexdigest()
 

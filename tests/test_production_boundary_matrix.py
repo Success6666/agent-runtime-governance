@@ -52,6 +52,7 @@ from agent_runtime_governance.plugins.prometheus import (
     PrometheusMiddleware,
     PrometheusPlugin,
 )
+from agent_runtime_governance.reconciliation import InMemoryReconciliationLedger
 from agent_runtime_governance.registry import (
     IdempotencyClaim,
     IdempotencyConflictError,
@@ -596,24 +597,30 @@ def test_runtime_builder_applies_all_runtime_dependencies() -> None:
     principal = VerifiedPrincipal("gateway", "alice", "tenant-a")
     identity = StaticIdentityProvider(principal)
     idempotency = InMemoryIdempotencyStore()
+    reconciliation = InMemoryReconciliationLedger()
     limits = RuntimeLimits(max_in_flight=2)
     with (
         ThreadPoolExecutor(max_workers=1) as executor,
         ThreadPoolExecutor(max_workers=1) as idempotency_executor,
+        ThreadPoolExecutor(max_workers=1) as reconciliation_executor,
     ):
         builder = RuntimeBuilder()
         assert builder.with_identity(identity) is builder
         assert builder.with_idempotency_store(idempotency) is builder
+        assert builder.with_reconciliation_ledger(reconciliation) is builder
         assert builder.with_limits(limits) is builder
         assert builder.with_sync_executor(executor) is builder
         assert builder.with_idempotency_executor(idempotency_executor) is builder
+        assert builder.with_reconciliation_executor(reconciliation_executor) is builder
         runtime = builder.build()
         assert runtime.identity_provider is identity
         assert runtime.require_verified_identity is True
         assert runtime.idempotency_store is idempotency
+        assert runtime.reconciliation_ledger is reconciliation
         assert runtime.limits is limits
         assert runtime.sync_executor is executor
         assert runtime.idempotency_executor is idempotency_executor
+        assert runtime.reconciliation_executor is reconciliation_executor
         runtime.close()
 
 

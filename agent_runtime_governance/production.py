@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Iterable, Mapping, Protocol
 
 from ._serialization import thaw as _thaw
@@ -11,7 +12,8 @@ from .context import ExecutionMode
 from .middleware.audit import AuditMiddleware
 from .middleware.decision import DecisionMiddleware
 from .pipeline import Pipeline
-from .registry import ToolSpec
+from .reconciliation import SQLiteReconciliationLedger
+from .registry import SQLiteIdempotencyStore, ToolSpec
 
 _KEY_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _POLICY_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}$")
@@ -62,6 +64,10 @@ class ProductionReadinessReason(str, Enum):
     VERIFIED_IDENTITY_REQUIRED = "identity.verification_required"
     IDENTITY_REPLAY_DURABLE_REQUIRED = "identity.replay_store_durable_required"
     IDEMPOTENCY_DURABLE_REQUIRED = "idempotency.durable_store_required"
+    RECONCILIATION_DURABLE_REQUIRED = "reconciliation.durable_ledger_required"
+    RECONCILIATION_ATOMIC_LEDGER_REQUIRED = "reconciliation.atomic_ledger_required"
+    RECONCILIATION_COLOCATED_REQUIRED = "reconciliation.colocated_ledger_required"
+    RECONCILIATION_PROVIDER_REQUIRED = "reconciliation.provider_required"
     APPROVAL_MIDDLEWARE_REQUIRED = "approval.middleware_required"
     APPROVAL_STORE_DURABLE_REQUIRED = "approval.durable_store_required"
     APPROVAL_INTEGRITY_REQUIRED = "approval.integrity_protection_required"
@@ -179,6 +185,7 @@ class ProductionProfile:
         *,
         pipeline: Pipeline,
         idempotency_store: Any,
+        reconciliation_ledger: Any,
         identity_provider: Any,
         require_verified_identity: bool,
     ) -> ProductionReadinessReport:
@@ -189,6 +196,11 @@ class ProductionProfile:
             tool.execution_mode is not ExecutionMode.READ_ONLY for tool in entries
         )
         approval_required = any(spec.requires_approval for spec in tool_items)
+        idempotent_tools = tuple(
+            spec
+            for spec in tool_items
+            if spec.execution_mode is ExecutionMode.IDEMPOTENT
+        )
         reasons: list[ProductionReadinessReason] = []
 
         if entries:
@@ -212,6 +224,12 @@ class ProductionProfile:
                 reasons.append(
                     ProductionReadinessReason.IDEMPOTENCY_DURABLE_REQUIRED
                 )
+            self._reconciliation_reasons(
+                idempotent_tools,
+                idempotency_store,
+                reconciliation_ledger,
+                reasons,
+            )
             self._audit_reasons(pipeline, reasons)
             if any(tool.contract_id is not None for tool in entries):
                 self._policy_reasons(pipeline, reasons)
@@ -355,6 +373,30 @@ class ProductionProfile:
             reasons.append(ProductionReadinessReason.APPROVAL_INTEGRITY_REQUIRED)
 
     @staticmethod
+    def _reconciliation_reasons(
+        tools: tuple[ToolSpec[Any, Any], ...],
+        idempotency_store: Any,
+        reconciliation_ledger: Any,
+        reasons: list[ProductionReadinessReason],
+    ) -> None:
+        if not tools:
+            return
+        if not _capability(reconciliation_ledger, "production_durable"):
+            reasons.append(ProductionReadinessReason.RECONCILIATION_DURABLE_REQUIRED)
+        elif not isinstance(
+            reconciliation_ledger, SQLiteReconciliationLedger
+        ) or not isinstance(idempotency_store, SQLiteIdempotencyStore):
+            reasons.append(
+                ProductionReadinessReason.RECONCILIATION_ATOMIC_LEDGER_REQUIRED
+            )
+        elif not _same_sqlite_database(idempotency_store, reconciliation_ledger):
+            reasons.append(
+                ProductionReadinessReason.RECONCILIATION_COLOCATED_REQUIRED
+            )
+        if any(spec.reconciliation_provider is None for spec in tools):
+            reasons.append(ProductionReadinessReason.RECONCILIATION_PROVIDER_REQUIRED)
+
+    @staticmethod
     def _audit_reasons(
         pipeline: Pipeline, reasons: list[ProductionReadinessReason]
     ) -> None:
@@ -391,3 +433,10 @@ def _schemas_equal(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
 
 def _capability(value: Any, name: str) -> bool:
     return getattr(value, name, False) is True
+
+
+def _same_sqlite_database(
+    idempotency_store: SQLiteIdempotencyStore,
+    reconciliation_ledger: SQLiteReconciliationLedger,
+) -> bool:
+    return Path(idempotency_store.path).resolve() == Path(reconciliation_ledger.path).resolve()

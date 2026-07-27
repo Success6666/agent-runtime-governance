@@ -106,9 +106,12 @@ class RuntimeLimits:
     hook_timeout_seconds: float = 5.0
     execution_timeout_seconds: float = 30.0
     idempotency_operation_timeout_seconds: float = 30.0
+    reconciliation_operation_timeout_seconds: float = 30.0
+    reconciliation_provider_timeout_seconds: float = 15.0
     admission_timeout_seconds: float = 1.0
     cancellation_grace_seconds: float = 0.25
     max_in_flight: int = 128
+    max_reconciliation_in_flight: int = 16
 
     def __post_init__(self) -> None:
         for name in (
@@ -117,6 +120,8 @@ class RuntimeLimits:
             "hook_timeout_seconds",
             "execution_timeout_seconds",
             "idempotency_operation_timeout_seconds",
+            "reconciliation_operation_timeout_seconds",
+            "reconciliation_provider_timeout_seconds",
             "admission_timeout_seconds",
             "cancellation_grace_seconds",
         ):
@@ -124,6 +129,8 @@ class RuntimeLimits:
                 raise ValueError(f"{name} must be greater than zero")
         if self.max_in_flight < 1:
             raise ValueError("max_in_flight must be at least one")
+        if self.max_reconciliation_in_flight < 1:
+            raise ValueError("max_reconciliation_in_flight must be at least one")
 
 
 class RuntimeBulkhead:
