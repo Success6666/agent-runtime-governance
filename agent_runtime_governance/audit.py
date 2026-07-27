@@ -15,6 +15,7 @@ from typing import Any, Protocol
 
 from filelock import FileLock
 
+from ._serialization import json_safe as _json_safe
 from ._sqlite import connect_sqlite, initialize_sqlite
 from .context import ExecutionContext
 from .errors import AuditIntegrityError
@@ -928,7 +929,9 @@ def _matches_path(path: str, patterns: frozenset[str]) -> bool:
 
 
 def _safe_json_value(value: Any) -> Any:
-    if value is None or isinstance(value, str | int | float | bool):
+    if isinstance(value, float):
+        return _json_safe(value)
+    if value is None or isinstance(value, str | int | bool):
         return value
     if isinstance(value, Mapping):
         return {str(key): _safe_json_value(item) for key, item in value.items()}

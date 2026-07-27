@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping
 from enum import Enum
 from types import MappingProxyType
@@ -40,7 +41,17 @@ def thaw(value: Any) -> Any:
 def json_safe(value: Any) -> Any:
     if isinstance(value, Enum):
         return json_safe(value.value)
-    if value is None or isinstance(value, str | int | float | bool):
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return value
+        if math.isnan(value):
+            return "[NONFINITE_FLOAT:NAN]"
+        return (
+            "[NONFINITE_FLOAT:POSITIVE_INFINITY]"
+            if value > 0
+            else "[NONFINITE_FLOAT:NEGATIVE_INFINITY]"
+        )
+    if value is None or isinstance(value, str | int | bool):
         return value
     if isinstance(value, Mapping | list | tuple | set | frozenset):
         return thaw(value)

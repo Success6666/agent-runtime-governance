@@ -13,6 +13,7 @@ import pytest
 from agent_runtime_governance import (
     ActionContract,
     InMemoryReconciliationLedger,
+    InvocationOptions,
     ProviderDescriptor,
     ReconciliationAttemptContext,
     ReconciliationFinding,
@@ -197,26 +198,76 @@ def test_jsonl_audit_rejects_malformed_segment_anchor(tmp_path, raw: str) -> Non
         sink._first_raw_event()
 
 
-def test_audit_and_snapshot_hashes_reject_nonfinite_numbers(tmp_path) -> None:
+@pytest.mark.parametrize(
+    ("value", "marker"),
+    [
+        (float("nan"), "[NONFINITE_FLOAT:NAN]"),
+        (float("inf"), "[NONFINITE_FLOAT:POSITIVE_INFINITY]"),
+        (float("-inf"), "[NONFINITE_FLOAT:NEGATIVE_INFINITY]"),
+    ],
+)
+def test_audit_and_snapshot_hashes_normalize_nonfinite_numbers(
+    tmp_path, value: float, marker: str
+) -> None:
     audit = JSONLAuditSink(tmp_path / "audit.jsonl")
-    with pytest.raises(ValueError, match="Out of range float"):
-        audit.write({"risk_score": float("nan")})
+    audit.write({"risk_score": value})
+    assert audit.read_verified()[0]["risk_score"] == marker
 
     context = ExecutionContext.create(
-        ToolCall("measure"), metadata={"risk_score": float("inf")}
+        ToolCall("measure", args=(value,), kwargs={"measurement": value}),
+        metadata={"risk_score": value},
+    ).evolve(result=value).append_history(
+        HistoryEntry("test", "record", data={"measurement": value})
     )
+    payload = context.to_dict()
+    assert payload["tool_call"]["args"] == [marker]
+    assert payload["tool_call"]["kwargs"]["measurement"] == marker
+    assert payload["metadata"]["risk_score"] == marker
+    assert payload["history"][0]["data"]["measurement"] == marker
+    assert payload["result"] == marker
+
     snapshots = JSONLSnapshotStore(
         tmp_path / "snapshots.jsonl", redact_sensitive=False
     )
-    with pytest.raises(ValueError, match="Out of range float"):
-        snapshots.write_context(
-            trace_id=context.trace_id,
-            stage="governance",
-            context=context,
-            created_at="2026-01-01T00:00:00+00:00",
-            policy_version=None,
-            policy_digest=None,
-        )
+    snapshots.write_context(
+        trace_id=context.trace_id,
+        stage="governance",
+        context=context,
+        created_at="2026-01-01T00:00:00+00:00",
+        policy_version=None,
+        policy_digest=None,
+    )
+    assert snapshots.read_trace(context.trace_id)[0].context.metadata["risk_score"] == marker
+
+
+def test_nonfinite_metadata_keeps_noncritical_audit_and_snapshot_observers(tmp_path) -> None:
+    audit = JSONLAuditSink(tmp_path / "audit.jsonl")
+    snapshots = JSONLSnapshotStore(
+        tmp_path / "snapshots.jsonl", redact_sensitive=False
+    )
+    runtime = Runtime([AuditMiddleware(audit), SnapshotMiddleware(snapshots)])
+
+    @runtime.tool()
+    def measure() -> str:
+        return "ok"
+
+    assert runtime.invoke(
+        "measure",
+        _governance=InvocationOptions(metadata={"measurement": float("nan")}),
+    ) == "ok"
+
+    events = audit.read_verified()
+    assert len(events) == 2
+    assert all(
+        event["context"]["metadata"]["measurement"] == "[NONFINITE_FLOAT:NAN]"
+        for event in events
+    )
+    restored = snapshots.read_trace(events[0]["trace_id"])
+    assert len(restored) == 2
+    assert all(
+        snapshot.context.metadata["measurement"] == "[NONFINITE_FLOAT:NAN]"
+        for snapshot in restored
+    )
 
 
 def test_sqlite_audit_missing_state_row_fails_closed(tmp_path) -> None:
