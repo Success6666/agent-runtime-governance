@@ -67,7 +67,7 @@ jobs:
           files: coverage.xml
           fail_ci_if_error: true
           use_oidc: true
-          version: "11.3.1"
+          version: "v11.3.1"
       - name: Upload coverage for fork pull requests
         if: >-
           matrix.python-version == '3.13' &&
@@ -78,7 +78,7 @@ jobs:
           files: coverage.xml
           fail_ci_if_error: false
           use_oidc: false
-          version: "11.3.1"
+          version: "v11.3.1"
 
   build:
     runs-on: ubuntu-latest
