@@ -4,6 +4,56 @@ All notable changes are documented here.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-27
+
+### Added
+
+- A deterministic, append-only reconciliation protocol for idempotent actions
+  whose external outcome is `UNKNOWN`, with revision-checked heads, durable
+  attempt events, provider descriptors, manual resolution, and explicit
+  `MANUAL_REVIEW` containment.
+- Atomic SQLite prepared-action persistence: the idempotency owner and its
+  redacted `UnknownAction` recovery descriptor commit before a side-effecting
+  body can be dispatched.
+- A schema-v4 transactional reconciliation-audit outbox. SQLite mutations and
+  redacted delivery envelopes commit together; `SQLiteAuditSink` supports
+  stable source-event-id de-duplication for safe acknowledgement retries.
+- Recovery for expired unfinished provider attempts. Recovery records a
+  terminal `recovery_required` event and moves the action to `MANUAL_REVIEW`
+  instead of issuing another provider probe.
+- Separate strict-production permissions for reconciliation probing, manual
+  resolution, and global reconciliation-audit recovery, with tenant binding
+  for per-action control-plane operations.
+- A dedicated daemon delivery executor for abandonable reconciliation-audit
+  attempts. The durable outbox remains pending until acknowledgement, so a
+  blocked third-party sink cannot prevent process termination or lose the
+  redelivery obligation.
+
+### Changed
+
+- Strict idempotent SQLite deployments now require a colocated
+  `SQLiteIdempotencyStore` and `SQLiteReconciliationLedger`, a persisted
+  reconciliation provider for every idempotent tool, and a signed,
+  source-idempotent `SQLiteAuditSink` behind fail-closed audit middleware.
+- Reconciliation provider identity, protocol version, and supported evidence
+  kinds are bound into the persisted recovery descriptor and fail closed on
+  drift after restart.
+- Reconciliation audit delivery has its own deadline, bulkhead, and durable
+  recovery-worker entry point; a sink delivery timeout leaves the envelope
+  pending rather than poisoning the reconciliation ledger.
+
+### Fixed
+
+- Caller deadlines now bound outbox reads, audit delivery, acknowledgement, and
+  failure recording consistently. Naive public reconciliation deadlines are
+  rejected with a stable validation error.
+- A configured audit-delivery timeout now returns a recoverable error carrying
+  the execution and outbox identities while the caller deadline remains valid;
+  only an exhausted caller deadline is surfaced as a stage timeout.
+- Runtime close no longer waits on a blocked reconciliation-audit delivery
+  thread. In-flight delivery remains unacknowledged and is safely retried by a
+  later worker using the source event ID.
+
 ## [0.6.0] - 2026-07-27
 
 ### Added

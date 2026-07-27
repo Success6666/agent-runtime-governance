@@ -20,8 +20,10 @@ final execution boundary - the moment a proposed tool call is about to touch the
 world within the configured storage guarantees. It runs inside the agent stack
 you already use rather than replacing it. The default in-memory idempotency
 store has bounded TTL/LRU retention and does not survive restarts; longer-lived
-protection requires a durable store. Deterministic `UNKNOWN` reconciliation is
-planned for v0.7.
+protection requires a durable store. The current v0.7 implementation adds
+durable, deterministic reconciliation for `UNKNOWN` outcomes; it remains under
+release verification until the required CI, integration, release-artifact, and
+publication evidence is recorded.
 
 Every shipped guarantee links to its regression test:
 
@@ -45,10 +47,23 @@ claim below is covered by a regression test or recorded benchmark:
 | Audit evidence carries the action identity without duplicating raw parameters, and OpenTelemetry exports the same contract/action attributes | [`test_audit_bound_action_never_duplicates_raw_parameters`](tests/test_bound_action_runtime.py), [`test_opentelemetry_exports_bound_action_identity`](tests/test_audit_otel_hardening.py) |
 | At 1,000 requests and concurrency 100 on the recorded Windows/Python 3.12 host, the median of three alternating paired runs measured action bind plus verification at 1.553x mean, 1.720x p95, 1.850x p99, and 1.040x peak traced memory versus its strict baseline | [`v0.6.0-windows-python312.json`](benchmarks/results/v0.6.0-windows-python312.json), [`v0.6.0 budget`](benchmarks/budgets/v0.6.0.json) |
 
-The v0.7-v1.0 direction adds deterministic reconciliation for `UNKNOWN`
-outcomes and portable evidence. The staged plan and its exit criteria are in
-[`docs/production-roadmap.md`](docs/production-roadmap.md); planned features
-are never presented as shipped.
+The current v0.7 implementation keeps `UNKNOWN` recovery on a durable,
+compare-and-set ledger. The following behaviors are implemented and covered by
+regression tests; they are not a claim that an external side effect is
+exactly-once unless the downstream system independently supports that property.
+
+| Implemented for v0.7 release verification | Evidence |
+| --- | --- |
+| Before an idempotent side effect can be dispatched, the SQLite claim and bounded recovery descriptor (excluding raw caller key and tool parameters) are created in one transaction; an expired prepared lease materializes an `UNKNOWN` head instead of becoming retryable | [`test_runtime_atomically_prepares_recovery_descriptor_before_dispatch`](tests/test_runtime_reconciliation.py), [`test_expired_atomically_prepared_lease_materializes_reconciliation_head`](tests/test_reconciliation.py) |
+| Reconciliation records are append-only and revision-checked. The provider identity, protocol version, and supported evidence kinds persisted with the action must still match after restart | [`test_reconciliation_rejects_provider_drift_after_restart`](tests/test_runtime_reconciliation.py) |
+| Reconciliation head/event lineage intent is committed to a SQLite outbox with the matching mutation. Delivery is ordered per execution, retryable, and deduplicated by a stable source event ID at `SQLiteAuditSink` | [`test_reconciliation_audit_outbox_is_ordered_and_redacted`](tests/test_reconciliation.py), [`test_sqlite_audit_source_id_prevents_duplicate_after_ack_failure`](tests/test_runtime_reconciliation.py) |
+| Strict control-plane operations require separate probe, manual-resolution, and audit-drain permissions, plus tenant binding for per-action access | [`test_strict_reconciliation_denies_cross_tenant_probe_without_attempt`](tests/test_runtime_reconciliation.py), [`test_strict_global_audit_recovery_requires_its_own_permission`](tests/test_runtime_reconciliation.py) |
+| A durable started probe is finalized under an independent budget. An expired unclosed probe is closed with `recovery_required` and moved to `MANUAL_REVIEW`; a second provider probe is not started | [`test_cancellation_during_finish_keeps_finalization_running`](tests/test_runtime_reconciliation.py), [`test_restart_quarantines_an_expired_unfinished_provider_attempt`](tests/test_runtime_reconciliation.py) |
+| Control-plane caller deadlines bound audit recovery and delivery; a stalled sink leaves the durable envelope pending rather than corrupting the ledger or holding the process open after shutdown | [`test_global_audit_recovery_honors_its_caller_deadline`](tests/test_runtime_reconciliation.py), [`test_blocked_reconciliation_audit_sink_cannot_hold_python_process_open`](tests/test_runtime_reconciliation.py) |
+
+The staged v0.8-v1.0 direction and its exit criteria are in
+[`ROADMAP.md`](ROADMAP.md) and [`docs/production-roadmap.md`](docs/production-roadmap.md).
+Planned capabilities are never presented as shipped.
 
 ## Quick start
 
@@ -117,7 +132,7 @@ documentation and describe scope, not quality.
 | --- | --- | --- |
 | Framework-native approvals: [OpenAI Agents SDK](https://openai.github.io/openai-agents-js/guides/human-in-the-loop/), [LangGraph](https://docs.langchain.com/oss/python/langchain/human-in-the-loop), [pydantic-ai deferred tools](https://ai.pydantic.dev/deferred-tools/) | Pause-and-approve flows inside one framework | One framework-neutral runtime where approval is revalidated against the normalized call immediately before execution, combined with idempotent commit and `UNKNOWN` semantics |
 | [Microsoft Agent Governance Toolkit](https://github.com/microsoft/agent-governance-toolkit) | Broad policy, identity, sandboxing, and SRE toolkit | Its [versioned limitations document](https://github.com/microsoft/agent-governance-toolkit/blob/2962693358c26201f2bbc13a54b5966af933accf/docs/LIMITATIONS.md) records that audit captures attempts and allow/deny results, with outcome attestation planned; this project's entire scope is that commit-and-outcome boundary |
-| Durable execution engines: [Temporal](https://github.com/temporalio/temporal), [Restate](https://github.com/restatedev/restate), [DBOS](https://github.com/dbos-inc/dbos-transact-py) | Durable workflow state with automatic retries | The governance-layer default is different: an uncertain side effect is recorded as `UNKNOWN` and is not automatically retried while its idempotency record is retained; deterministic reconciliation is planned for v0.7, and human approval binds to the action identity |
+| Durable execution engines: [Temporal](https://github.com/temporalio/temporal), [Restate](https://github.com/restatedev/restate), [DBOS](https://github.com/dbos-inc/dbos-transact-py) | Durable workflow state with automatic retries | The governance-layer default is different: an uncertain side effect is recorded as `UNKNOWN` and is not automatically retried while unresolved. v0.7 adds a receipt/probe reconciliation ledger and explicit manual-review path; human approval remains bound to the action identity |
 | Content guardrails: [NeMo Guardrails](https://github.com/NVIDIA-NeMo/Guardrails), [Guardrails AI](https://github.com/guardrails-ai/guardrails) | Input, output, and dialog rails | A different layer that composes with this one; this project governs the side-effect boundary, not prompts or content |
 
 Prompt instructions are useful guidance, but they are not an authorization
@@ -296,6 +311,20 @@ versioned v0.5 migration readers. See
 [`docs/migration-v0.6.md`](docs/migration-v0.6.md) and the runnable
 [`strict_action_contract.py`](examples/strict_action_contract.py) example.
 
+The current v0.7 implementation adds an explicit recovery protocol for
+idempotent actions whose external outcome is uncertain. Strict deployments
+co-locate `SQLiteIdempotencyStore` and `SQLiteReconciliationLedger` in the
+same SQLite database so a claim and its recovery descriptor are created before
+dispatch. Reconciliation head/event lineage mutations and their audit envelopes
+commit together; `SQLiteAuditSink` deduplicates retried envelope delivery with the
+outbox source ID. The application must supply a read-only receipt/probe provider;
+the runtime binds its identifier, protocol version, and evidence kinds to the
+persisted action but cannot prove that third-party provider code has no side
+effects.
+See [`docs/production.md`](docs/production.md) and
+[`docs/migration-v0.7.md`](docs/migration-v0.7.md) before enabling it for
+production traffic.
+
 The example hashes the exact policy artifact in `examples/policies/`, passes
 that identity through
 `PolicyMiddleware` and `ProductionProfile`, seals the runtime, and persists
@@ -338,16 +367,25 @@ Production deployments must configure a trusted identity provider with
 `require_verified_identity=True`; caller-supplied `user`, `tenant`, and
 `permissions` fields are compatibility inputs, not a trust boundary. SQLite
 stores coordinate processes on one host and require a distributed adapter for
-multi-host deployments.
+multi-host deployments. For strict v0.7 reconciliation, configure a signed,
+durable, source-idempotent audit sink behind a fail-closed `AuditMiddleware`.
+`SQLiteAuditSink` is the built-in tested implementation; JSONL audit cannot
+deduplicate a replayed outbox envelope. A recovery worker invokes
+`Runtime.adrain_reconciliation_audit_outbox()` with a separately authorized
+trusted identity, while `Runtime.areconcile()` and
+`Runtime.aresolve_reconciliation()` use their own control-plane permissions.
 
 ### Release verification
 
-Each release is verified before publishing: the full test matrix on Python
-3.10-3.13, Docker-backed integration smoke, an isolated dependency audit, and
-wheel/sdist installation from clean environments, with the SPDX SBOM, SHA256
-checksums, and GitHub provenance attached to the release. Complete
-point-in-time records for published releases are in
-[`docs/release-verification.md`](docs/release-verification.md).
+Before a GitHub release is published, maintainers review the required protected
+CI matrix (Python 3.10-3.13) and Docker-backed integration smoke. The
+post-publication release workflow then repeats the full suite on Python 3.13,
+runs dependency audit and package installation checks, and attaches the SPDX
+SBOM, SHA256 checksums, and GitHub provenance. PyPI Trusted Publishing is a
+separate workflow that consumes those verified release artifacts. Migration
+restore drills and public-index installation checks are recorded release
+evidence, not inferred from a successful build. Complete point-in-time records
+for published releases are in [`docs/release-verification.md`](docs/release-verification.md).
 
 Benchmarks measure incremental runtime overhead for baseline, Rule, OPA, Audit,
 OpenTelemetry, 10-middleware pipelines, and paired strict runtimes with and

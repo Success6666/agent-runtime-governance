@@ -28,6 +28,21 @@ planning, model selection, prompts, or framework state.
    execution, telemetry, and audit use its `action_digest`.
 10. Executor-boundary mismatch denies before tool entry and is never reported
     as an uncertain side effect.
+11. For strict idempotent SQLite deployments, the idempotency owner and the
+    immutable recovery descriptor are committed before the tool body can be
+    dispatched.
+12. `UNKNOWN` actions are never silently made retryable. Reconciliation is an
+    append-only, expected-revision protocol; unresolved and manual-review
+    dispositions continue to block the original key.
+13. A persisted reconciliation provider identity, protocol version, and
+    supported evidence kinds must match the registered provider before a new
+    receipt/probe call can start.
+14. A reconciliation head/event lineage mutation and its fixed-allowlist
+    audit-outbox envelope commit together. Retried delivery is ordered per
+    execution and must use a source-idempotent sink in strict production.
+15. A started reconciliation probe has a terminal-record obligation. If its
+    deadline expires without one, recovery records `recovery_required` and
+    moves the action to `MANUAL_REVIEW`, rather than invoking another provider.
 
 ## Context boundaries
 
@@ -79,6 +94,44 @@ approval without that identity is readable but cannot authorize a contracted
 v0.6 tool. Contracted idempotency uses a separate `action/v1` namespace and the
 same digest as its fingerprint; non-contracted tools retain the v0.5 path.
 
+## UNKNOWN reconciliation
+
+An idempotent action with an uncertain external outcome receives an
+`UnknownAction` descriptor. It contains the action and contract identities,
+a hashed tenant partition, bounded receipt/probe schemas, and the
+reconciliation provider binding (identifier, protocol version, and evidence
+kinds); it does not persist a raw caller idempotency key or provider callable.
+In the strict SQLite path, `SQLiteIdempotencyStore` writes that descriptor
+atomically with the initial ownership claim. A lease that expires before
+dispatch can therefore materialize the same durable `UNKNOWN` head instead of
+reopening the action for execution.
+
+`Runtime.areconcile()` is a control-plane workflow: the application must make
+its provider invocation read-only receipt/probe work, while the runtime durably appends
+`ATTEMPT_STARTED`, `ATTEMPT_FINISHED`, and `STATE_TRANSITION` records. Each is
+guarded by the head revision. A provider cannot be substituted after a restart:
+its identifier, protocol version, and supported evidence kinds must equal the
+persisted binding. In a strict production profile, probe access, manual
+resolution, and global audit recovery have separate permissions; a per-action
+operation also requires the caller tenant to match the persisted tenant
+partition.
+
+Once an attempt start has committed, completion is finalized under an
+independent bounded deadline even when the request is cancelled. A finalization
+overrun or storage failure disables further reconciliation rather than treating
+an incomplete ledger as authoritative. An unclosed attempt remains exclusive
+until its deadline; after expiry, recovery appends a
+`RECOVERY_REQUIRED` terminal attempt and a `RECOVERY -> MANUAL_REVIEW`
+transition. A trusted operator can then resolve only that review state with an
+expected revision, reason, evidence, and a keyed operator-identity digest.
+
+The protocol distinguishes a confirmed success from a confirmed-not-applied
+result. A retryable disposition requires an explicit retry-safe assertion on a
+validated provider finding or manual resolution for `CONFIRMED_NOT_APPLIED`; it
+does not infer external non-application from a timeout or missing record.
+Receipt/probe evidence can support a particular downstream system's guarantee,
+but the runtime does not claim general external exactly-once execution.
+
 ## Audit and replay
 
 Audit events contain the context snapshot before execution and after completion.
@@ -103,6 +156,22 @@ drift analysis may use semantic identity. Duplicate tool rules are rejected
 instead of introducing an implicit conflict-resolution language. Drift
 detection compares outcomes and risk tiers after applying two deterministic
 pipelines to the same historical request input.
+
+SQLite reconciliation uses a transactional outbox for its own lineage events.
+The envelope payload is constructed from a fixed allowlist: raw provider
+evidence, raw tenant identities, and idempotency keys are excluded. Its
+identity and payload are immutable while delivery attempts, acknowledgement,
+and last-error state remain mutable. It is enqueued with the matching head/event
+lineage mutation and delivered in revision order for each execution.
+`SQLiteAuditSink.write_idempotent(source_event_id, event)` makes a replay after
+an acknowledgement failure safe only when the event payload is identical. A
+sink timeout or process shutdown leaves the envelope pending for
+`Runtime.adrain_reconciliation_audit_outbox()`; it does not rewrite the
+reconciliation history. Audit delivery has an isolated bounded executor so a
+blocked third-party sink cannot indefinitely delay runtime shutdown. The
+runtime-owned delivery executor uses daemon workers only for this
+source-idempotent, outbox-backed side work; reconciliation ledger and
+finalization work remain authoritative, non-abandonable operations.
 
 ## Plugin boundary
 
