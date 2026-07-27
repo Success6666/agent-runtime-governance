@@ -17,8 +17,12 @@ concurrency:
       github.event.pull_request.number ||
       github.event.workflow_run.pull_requests[0].number ||
       github.event.workflow_run.id
-    }}
-  cancel-in-progress: true
+    }}-${{ github.event_name }}
+  # A CodeRabbit review event is the handoff that completes the long-running
+  # pull_request_target poll. Keep those two event classes independent so the
+  # handoff does not cancel a check on the current PR head. Synchronize events
+  # may still supersede their own obsolete poll.
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
 
 jobs:
   publish-coderabbit-approval-status:
