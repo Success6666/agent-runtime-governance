@@ -10,6 +10,7 @@ from contextvars import copy_context
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import partial
+from pathlib import Path
 from threading import Lock
 from time import perf_counter
 from typing import Any, Callable, Iterable, Mapping, ParamSpec, TypeVar
@@ -74,6 +75,7 @@ from .reconciliation import (
     SQLiteReconciliationLedger,
     UnknownAction,
     idempotency_namespace_digest,
+    new_execution_record_id,
 )
 from .registry import (
     GovernedTool,
@@ -83,6 +85,7 @@ from .registry import (
     IdempotencyOutcomeUnknownError,
     IdempotencyStore,
     InMemoryIdempotencyStore,
+    SQLiteIdempotencyStore,
     ToolRegistry,
     ToolSpec,
 )
@@ -578,6 +581,7 @@ class Runtime:
             context = await self._handle_cancellation(context, started, uncertain=False)
             raise GovernanceCancelledError(context) from exc
         claim: IdempotencyClaim | None = None
+        prepared_action: UnknownAction | None = None
         heartbeat_task: asyncio.Task[None] | None = None
         tool_returned = False
         execution_started = False
@@ -589,12 +593,22 @@ class Runtime:
                 fingerprint = self._idempotency_fingerprint(
                     context, spec.name, normalized_parameters
                 )
+                namespace = self._idempotency_namespace(context)
+                if self._supports_atomic_reconciliation_preparation():
+                    prepared_action = self._prepared_unknown_action(
+                        spec,
+                        context,
+                        execution_record_id=new_execution_record_id(),
+                        action_digest=fingerprint,
+                        namespace=namespace,
+                    )
                 try:
                     claim = await self._acquire_idempotency(
-                        self._idempotency_namespace(context),
+                        namespace,
                         context.idempotency_key,
                         fingerprint,
                         context.deadline,
+                        prepared_action=prepared_action,
                     )
                 except IdempotencyConflictError as exc:
                     decision = DecisionRecord(
@@ -662,7 +676,12 @@ class Runtime:
                     claim = None
                     context = await self._run_observers(context, post=True)
                     raise denial
-                if isinstance(self.reconciliation_ledger, SQLiteReconciliationLedger):
+                if (
+                    isinstance(self.reconciliation_ledger, SQLiteReconciliationLedger)
+                    and prepared_action is None
+                ):
+                    # Compatibility path for non-co-located development adapters.
+                    # Production sealing requires the atomic store/ledger path above.
                     prepared_action = self._unknown_action(spec, context, claim)
                     await self._run_reconciliation_operation(
                         self.reconciliation_ledger.prepare_action,
@@ -1975,6 +1994,17 @@ class Runtime:
         tenant = context.tenant or "global"
         return f"{tenant}:{context.tool_call.name}"
 
+    def _supports_atomic_reconciliation_preparation(self) -> bool:
+        """Return whether a claim and recovery descriptor share one SQLite DB."""
+
+        store = self.idempotency_store
+        ledger = self.reconciliation_ledger
+        return (
+            isinstance(store, SQLiteIdempotencyStore)
+            and isinstance(ledger, SQLiteReconciliationLedger)
+            and Path(store.path).resolve() == Path(ledger.path).resolve()
+        )
+
     @staticmethod
     def _normalize_result(
         spec: ToolSpec[Any, Any],
@@ -2006,6 +2036,8 @@ class Runtime:
         key: str,
         fingerprint: str,
         deadline: datetime | None,
+        *,
+        prepared_action: UnknownAction | None = None,
     ) -> IdempotencyClaim:
         self._raise_if_idempotency_store_poisoned()
         timeout = self._bounded_timeout(
@@ -2023,12 +2055,26 @@ class Runtime:
             poison_on_timeout = (
                 timeout >= self.limits.idempotency_operation_timeout_seconds
             )
-            future = self._idempotency_executor.submit(
-                self.idempotency_store.acquire,
-                namespace,
-                key,
-                fingerprint,
-            )
+            if prepared_action is None:
+                future = self._idempotency_executor.submit(
+                    self.idempotency_store.acquire,
+                    namespace,
+                    key,
+                    fingerprint,
+                )
+            else:
+                store = self.idempotency_store
+                if not isinstance(store, SQLiteIdempotencyStore):
+                    raise RuntimeError(
+                        "atomic reconciliation preparation requires SQLite idempotency"
+                    )
+                future = self._idempotency_executor.submit(
+                    store.acquire_prepared,
+                    namespace,
+                    key,
+                    fingerprint,
+                    prepared_action,
+                )
         except BaseException:
             lease.release()
             raise
@@ -2042,10 +2088,18 @@ class Runtime:
             if not claim.owner:
                 return
             try:
-                self.idempotency_store.mark_unknown(
-                    claim,
-                    TimeoutError("request stopped waiting during acquisition"),
-                )
+                error = TimeoutError("request stopped waiting during acquisition")
+                if (
+                    prepared_action is not None
+                    and isinstance(self.reconciliation_ledger, SQLiteReconciliationLedger)
+                ):
+                    # The descriptor and claim were committed together. Preserve
+                    # that invariant when an abandoned acquisition is settled.
+                    self.reconciliation_ledger.record_unknown(
+                        claim, prepared_action, error
+                    )
+                else:
+                    self.idempotency_store.mark_unknown(claim, error)
             except BaseException:
                 return
 
@@ -2367,18 +2421,37 @@ class Runtime:
             raise ReconciliationConflictError(
                 "idempotency claim has no execution record identifier"
             )
+        return Runtime._prepared_unknown_action(
+            spec,
+            context,
+            execution_record_id=claim.execution_record_id,
+            action_digest=claim.fingerprint,
+            namespace=claim.namespace,
+            error=error,
+        )
+
+    @staticmethod
+    def _prepared_unknown_action(
+        spec: ToolSpec[Any, Any],
+        context: ExecutionContext,
+        *,
+        execution_record_id: str,
+        action_digest: str,
+        namespace: str,
+        error: BaseException | None = None,
+    ) -> UnknownAction:
         bound_action = context.bound_action
         contract = None if bound_action is None else bound_action.contract
         provider = spec.reconciliation_provider
         return UnknownAction(
-            execution_record_id=claim.execution_record_id,
-            action_digest=claim.fingerprint,
+            execution_record_id=execution_record_id,
+            action_digest=action_digest,
             tool_name=spec.name,
             contract_id=(
                 contract.contract_id if contract is not None else f"runtime.{spec.name}"
             ),
             contract_version=(contract.contract_version if contract is not None else 1),
-            idempotency_namespace_digest=idempotency_namespace_digest(claim.namespace),
+            idempotency_namespace_digest=idempotency_namespace_digest(namespace),
             uncertainty_reason=(
                 "execution outcome may require explicit reconciliation"
                 if error is None
