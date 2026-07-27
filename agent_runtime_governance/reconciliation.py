@@ -135,6 +135,7 @@ class UnknownAction:
     idempotency_namespace_digest: str
     uncertainty_reason: str
     attempted_at: datetime
+    tenant_partition_digest: str | None = None
     receipt_schema: Mapping[str, Any] | None = field(default=None, repr=False)
     probe_schema: Mapping[str, Any] | None = field(default=None, repr=False)
     result_schema: Mapping[str, Any] | None = field(default=None, repr=False)
@@ -157,6 +158,8 @@ class UnknownAction:
         _require_digest(
             "idempotency_namespace_digest", self.idempotency_namespace_digest
         )
+        if self.tenant_partition_digest is not None:
+            _require_digest("tenant_partition_digest", self.tenant_partition_digest)
         _require_bounded_text(
             "uncertainty_reason", self.uncertainty_reason, _MAX_REASON_BYTES
         )
@@ -245,6 +248,8 @@ class UnknownAction:
             "max_result_bytes": self.max_result_bytes,
             "metadata": thaw(self.metadata),
         }
+        if self.tenant_partition_digest is not None:
+            value["tenant_partition_digest"] = self.tenant_partition_digest
         if self.reconciliation_provider_id is not None:
             value.update(
                 {
@@ -1268,6 +1273,7 @@ class SQLiteReconciliationLedger:
             or prepared.contract_version != supplied.contract_version
             or prepared.idempotency_namespace_digest
             != supplied.idempotency_namespace_digest
+            or prepared.tenant_partition_digest != supplied.tenant_partition_digest
         ):
             raise ReconciliationValidationError(
                 "prepared action identity does not match the UNKNOWN transition"
@@ -1793,6 +1799,25 @@ def idempotency_namespace_digest(namespace: str) -> str:
                 "namespace": namespace,
             },
             label="idempotency namespace",
+        )
+    ).hexdigest()
+
+
+def tenant_partition_digest(tenant: str) -> str:
+    """Return a domain-separated non-reversible tenant partition identifier."""
+
+    if type(tenant) is not str or not tenant:
+        raise ReconciliationValidationError("tenant must be a non-empty string")
+    import hashlib
+
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "domain": "arg.reconciliation-tenant-partition",
+                "version": 1,
+                "tenant": tenant,
+            },
+            label="reconciliation tenant partition",
         )
     ).hexdigest()
 

@@ -133,6 +133,8 @@ class ProductionProfile:
     precondition_digest_provider: PreconditionDigestProvider | None = field(
         default=None, repr=False, compare=False
     )
+    reconciliation_probe_permission: str = "reconciliation:probe"
+    reconciliation_resolve_permission: str = "reconciliation:resolve"
     version: int = 1
 
     def __post_init__(self) -> None:
@@ -169,6 +171,12 @@ class ProductionProfile:
             raise TypeError(
                 "precondition_digest_provider must define get_digest(...)"
             )
+        for label, permission in (
+            ("reconciliation_probe_permission", self.reconciliation_probe_permission),
+            ("reconciliation_resolve_permission", self.reconciliation_resolve_permission),
+        ):
+            if type(permission) is not str or not _POLICY_VERSION.fullmatch(permission):
+                raise ValueError(f"{label} is invalid")
 
     def inventory(
         self, tools: Iterable[ToolSpec[Any, Any]]
