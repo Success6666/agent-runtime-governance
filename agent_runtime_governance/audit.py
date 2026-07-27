@@ -778,6 +778,8 @@ def reconciliation_event(
 
     action = head.action
     metadata = action.metadata
+    trace_id = metadata.get("trace_id")
+    request_id = metadata.get("request_id")
     provider_data = None
     if provider is not None:
         provider_data = {
@@ -795,14 +797,15 @@ def reconciliation_event(
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "stage": "reconciliation",
         "event_type": event_type,
-        "trace_id": metadata.get("trace_id"),
-        "request_id": metadata.get("request_id"),
+        "trace_id": trace_id if type(trace_id) is str else None,
+        "request_id": request_id if type(request_id) is str else None,
         "execution_record_id": head.execution_record_id,
         "tool_name": action.tool_name,
         "contract_id": action.contract_id,
         "contract_version": action.contract_version,
         "action_digest": action.action_digest,
         "idempotency_namespace_digest": action.idempotency_namespace_digest,
+        "tenant_partition_digest": action.tenant_partition_digest,
         "state": head.state.value,
         "revision": head.revision,
         "disposition": head.disposition.value,

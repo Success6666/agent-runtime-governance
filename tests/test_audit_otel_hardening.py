@@ -5,12 +5,26 @@ import json
 import sqlite3
 import warnings
 from contextlib import closing, contextmanager
+from datetime import datetime, timezone
 from urllib.error import HTTPError
 
 import pytest
 
-from agent_runtime_governance import ActionContract, Runtime
-from agent_runtime_governance.audit import JSONLAuditSink, SQLiteAuditSink
+from agent_runtime_governance import (
+    ActionContract,
+    InMemoryReconciliationLedger,
+    ProviderDescriptor,
+    ReconciliationAttemptContext,
+    ReconciliationFinding,
+    Runtime,
+    UnknownAction,
+    idempotency_namespace_digest,
+)
+from agent_runtime_governance.audit import (
+    JSONLAuditSink,
+    SQLiteAuditSink,
+    reconciliation_event,
+)
 from agent_runtime_governance.context import (
     ExecutionContext,
     ExecutionMode,
@@ -54,6 +68,65 @@ def make_context(**changes) -> ExecutionContext:
     if changes:
         context = context.evolve(**changes)
     return context
+
+
+async def _lineage_provider(
+    _: ReconciliationAttemptContext,
+) -> ReconciliationFinding:
+    raise AssertionError("audit lineage construction must not invoke the provider")
+
+
+def test_reconciliation_audit_event_keeps_provider_lineage_and_hashes_evidence() -> None:
+    raw_receipt = "receipt-secret-value"
+    action = UnknownAction(
+        execution_record_id="e" * 64,
+        action_digest="a" * 64,
+        tool_name="charge",
+        contract_id="billing.charge",
+        contract_version=1,
+        idempotency_namespace_digest=idempotency_namespace_digest("tenant/charge"),
+        uncertainty_reason="connection dropped after dispatch",
+        attempted_at=datetime.now(timezone.utc),
+        receipt_schema={"type": "object"},
+        probe_schema={"type": "object"},
+        result_schema={"type": ["object", "null"]},
+        max_evidence_bytes=1024,
+        max_result_bytes=1024,
+        metadata={"trace_id": "trace-1", "request_id": "request-1"},
+    )
+    head = InMemoryReconciliationLedger().create_unknown(action)
+    provider = ProviderDescriptor(
+        provider_id="receipt-store",
+        protocol_version="1",
+        supported_evidence_kinds=("receipt",),
+        provider=_lineage_provider,
+    )
+    evidence = {"receipt_id": raw_receipt}
+
+    event = reconciliation_event(
+        head,
+        event_type="attempt_finished",
+        provider=provider,
+        attempt_id="attempt-1",
+        evidence_kind="receipt",
+        evidence=evidence,
+    )
+    repeat = reconciliation_event(
+        head,
+        event_type="attempt_finished",
+        provider=provider,
+        attempt_id="attempt-1",
+        evidence_kind="receipt",
+        evidence=evidence,
+    )
+
+    assert event["provider"] == {
+        "provider_id": "receipt-store",
+        "protocol_version": "1",
+        "supported_evidence_kinds": ["receipt"],
+    }
+    assert event["evidence_digest"] == repeat["evidence_digest"]
+    assert raw_receipt not in json.dumps(event, sort_keys=True)
 
 
 @pytest.mark.asyncio
@@ -316,6 +389,8 @@ def test_sqlite_audit_sink_migrates_legacy_schema_for_source_idempotency(tmp_pat
             )
 
     sink = SQLiteAuditSink(path, sign_key="k")
+    with pytest.raises(ValueError, match="stable identifier"):
+        sink.write_idempotent("unsafe source id", {"stage": "reconciliation"})
     sink.write_idempotent("outbox-1", {"stage": "reconciliation", "event": 1})
     sink.write_idempotent("outbox-1", {"stage": "reconciliation", "event": 1})
     with pytest.raises(AuditIntegrityError, match="different content"):

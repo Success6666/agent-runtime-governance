@@ -29,13 +29,18 @@ from .context import ExecutionMode, RiskTier
 from .contracts import canonical_json_bytes, validate_schema
 from .errors import ContractValidationError, RegistryError
 from .reconciliation import (
+    _RECONCILIATION_AUTHORITY_TABLES,
     ProviderDescriptor,
     ReconciliationDisposition,
     ReconciliationHead,
     ReconciliationState,
     UnknownAction,
+    _normalize_schema_sql,
     enqueue_reconciliation_audit_outbox,
     idempotency_namespace_digest,
+)
+from .reconciliation import (
+    _dump as _dump_reconciliation,
 )
 
 if TYPE_CHECKING:
@@ -72,6 +77,78 @@ CREATE TABLE idempotency_records (
     )
 )
 """
+
+_IDEMPOTENCY_SCHEMA_TABLE = """
+CREATE TABLE idempotency_schema (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    version INTEGER NOT NULL
+)
+"""
+_IDEMPOTENCY_SCHEMA_VERSION = 2
+_IDEMPOTENCY_AUTHORITY_TABLES = frozenset(
+    {"idempotency_records", "idempotency_schema"}
+)
+_IDEMPOTENCY_TABLE_DDL = {
+    "idempotency_records": _IDEMPOTENCY_SCHEMA,
+    "idempotency_schema": _IDEMPOTENCY_SCHEMA_TABLE,
+}
+_IDEMPOTENCY_MIGRATED_RECORDS_DDL = _IDEMPOTENCY_SCHEMA.replace(
+    "CREATE TABLE idempotency_records",
+    'CREATE TABLE "idempotency_records"',
+    1,
+)
+_IDEMPOTENCY_INDEX_DDL = {
+    "idx_idempotency_state_updated": """
+        CREATE INDEX idx_idempotency_state_updated
+        ON idempotency_records(state, updated_at)
+    """,
+    "idx_idempotency_key_generation": """
+        CREATE INDEX idx_idempotency_key_generation
+        ON idempotency_records(namespace, key, generation DESC)
+    """,
+}
+_IDEMPOTENCY_LEGACY_V05_SCHEMA = """
+CREATE TABLE idempotency_records (
+    namespace TEXT NOT NULL,
+    key TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('pending', 'completed', 'unknown')),
+    result_json TEXT,
+    error TEXT,
+    owner_token TEXT,
+    lease_expires_at TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(namespace, key),
+    CHECK(
+        (state = 'pending' AND owner_token IS NOT NULL AND lease_expires_at IS NOT NULL)
+        OR (state != 'pending' AND owner_token IS NULL AND lease_expires_at IS NULL)
+    )
+)
+"""
+
+
+def _create_idempotency_table(
+    connection: sqlite3.Connection,
+    table_name: str,
+) -> None:
+    """Install one exact idempotency authority table when it is absent."""
+
+    try:
+        definition = _IDEMPOTENCY_TABLE_DDL[table_name]
+    except KeyError as exc:  # pragma: no cover - internal misuse guard
+        raise ValueError(f"unknown idempotency table {table_name!r}") from exc
+    connection.execute(
+        definition.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1)
+    )
+
+
+def _create_idempotency_indexes(connection: sqlite3.Connection) -> None:
+    """Install the canonical idempotency indexes when they are absent."""
+
+    for definition in _IDEMPOTENCY_INDEX_DDL.values():
+        connection.execute(
+            definition.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ", 1)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -341,17 +418,53 @@ class SQLiteIdempotencyStore:
         lease_seconds: float = 300.0,
         timeout_seconds: float = 30.0,
         journal_mode: str = "auto",
+        _allow_legacy_schema_migration: bool = False,
+        _require_standalone_legacy_migration: bool = False,
     ) -> None:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
+        if type(_allow_legacy_schema_migration) is not bool:
+            raise TypeError("_allow_legacy_schema_migration must be a bool")
+        if type(_require_standalone_legacy_migration) is not bool:
+            raise TypeError("_require_standalone_legacy_migration must be a bool")
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lease_seconds = lease_seconds
         self.timeout_seconds = timeout_seconds
         self.journal_mode = journal_mode
+        self._allow_legacy_schema_migration = _allow_legacy_schema_migration
+        self._require_standalone_legacy_migration = (
+            _require_standalone_legacy_migration
+        )
         self._initialize()
+
+    @classmethod
+    def migrate_legacy(
+        cls,
+        path: str | Path,
+        *,
+        lease_seconds: float = 300.0,
+        timeout_seconds: float = 30.0,
+        journal_mode: str = "auto",
+    ) -> "SQLiteIdempotencyStore":
+        """Upgrade a verified pre-versioned store in a dedicated process.
+
+        This method is an explicit operator action. Run it offline after a
+        verified backup and restore test; do not leave it in a serving
+        configuration. Ordinary construction rejects a legacy database so a
+        production worker cannot silently rewrite its idempotency authority.
+        """
+
+        return cls(
+            path,
+            lease_seconds=lease_seconds,
+            timeout_seconds=timeout_seconds,
+            journal_mode=journal_mode,
+            _allow_legacy_schema_migration=True,
+            _require_standalone_legacy_migration=True,
+        )
 
     def acquire(self, namespace: str, key: str, fingerprint: str) -> IdempotencyClaim:
         return self._acquire(namespace, key, fingerprint)
@@ -592,9 +705,7 @@ class SQLiteIdempotencyStore:
             """,
             (
                 action.execution_record_id,
-                canonical_json_bytes(
-                    action.to_dict(), label="prepared reconciliation action"
-                ).decode("utf-8"),
+                _dump_reconciliation(action.to_dict()),
                 action.attempted_at.isoformat(),
             ),
         )
@@ -878,57 +989,297 @@ class SQLiteIdempotencyStore:
             journal_mode=self.journal_mode,
         ) as connection:
             connection.execute("BEGIN IMMEDIATE")
-            table_exists = connection.execute(
-                """
-                SELECT 1 FROM sqlite_master
-                WHERE type = 'table' AND name = 'idempotency_records'
-                """
-            ).fetchone()
-            if table_exists is None:
-                connection.execute(_IDEMPOTENCY_SCHEMA)
-            else:
-                columns = {
-                    row[1]
-                    for row in connection.execute(
-                        "PRAGMA table_info(idempotency_records)"
-                    )
-                }
-                if not {"execution_record_id", "generation"}.issubset(columns):
-                    self._migrate_v06(connection, columns)
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS idempotency_schema (
-                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-                    version INTEGER NOT NULL
-                )
-                """
-            )
-            schema_version = connection.execute(
-                "SELECT version FROM idempotency_schema WHERE singleton = 1"
-            ).fetchone()
-            if schema_version is not None and schema_version[0] != 2:
-                raise RuntimeError(
-                    f"unsupported idempotency schema version {schema_version[0]}"
-                )
-            connection.execute(
-                "INSERT OR IGNORE INTO idempotency_schema(singleton, version) VALUES (1, 2)"
-            )
-            connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_idempotency_state_updated
-                ON idempotency_records(state, updated_at)
-                """
-            )
-            connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_idempotency_key_generation
-                ON idempotency_records(namespace, key, generation DESC)
-                """
+            self._initialize_schema(
+                connection,
+                allow_legacy_schema_migration=self._allow_legacy_schema_migration,
+                require_standalone_legacy_migration=(
+                    self._require_standalone_legacy_migration
+                ),
             )
             connection.commit()
 
+    @classmethod
+    def _initialize_schema(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        allow_legacy_schema_migration: bool,
+        require_standalone_legacy_migration: bool = False,
+    ) -> None:
+        """Initialize or upgrade idempotency authority within the caller transaction."""
+
+        if require_standalone_legacy_migration:
+            cls._assert_standalone_migration_target(connection)
+
+        state = cls._preflight_schema(
+            connection,
+            allow_legacy_schema_migration=allow_legacy_schema_migration,
+        )
+        if state == "current":
+            return
+        if state == "absent":
+            _create_idempotency_table(connection, "idempotency_records")
+            _create_idempotency_table(connection, "idempotency_schema")
+            _create_idempotency_indexes(connection)
+            connection.execute(
+                "INSERT INTO idempotency_schema(singleton, version) VALUES (1, ?)",
+                (_IDEMPOTENCY_SCHEMA_VERSION,),
+            )
+        elif state == "legacy":
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(idempotency_records)")
+            }
+            if not {"execution_record_id", "generation"}.issubset(columns):
+                cls._migrate_legacy_records(connection, columns)
+            _create_idempotency_table(connection, "idempotency_schema")
+            _create_idempotency_indexes(connection)
+            connection.execute(
+                "INSERT INTO idempotency_schema(singleton, version) VALUES (1, ?)",
+                (_IDEMPOTENCY_SCHEMA_VERSION,),
+            )
+        else:  # pragma: no cover - internal exhaustive guard
+            raise RuntimeError(f"unknown idempotency schema state {state!r}")
+        cls._assert_schema_integrity(connection)
+
     @staticmethod
-    def _migrate_v06(connection: sqlite3.Connection, columns: set[str]) -> None:
+    def _schema_object(
+        connection: sqlite3.Connection,
+        name: str,
+    ) -> tuple[str, str] | None:
+        row = connection.execute(
+            """
+            SELECT type, sql FROM sqlite_master
+            WHERE name = ? COLLATE NOCASE
+            """,
+            (name,),
+        ).fetchone()
+        if row is None:
+            return None
+        return str(row[0]), str(row[1] or "")
+
+    @classmethod
+    def _preflight_schema(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        allow_legacy_schema_migration: bool,
+    ) -> str:
+        """Classify and fully validate the authority without writing to it."""
+
+        records_object = cls._schema_object(connection, "idempotency_records")
+        schema_object = cls._schema_object(connection, "idempotency_schema")
+        if cls._schema_object(connection, "idempotency_records_v07") is not None:
+            raise RuntimeError(
+                "idempotency schema integrity failure: reserved migration table "
+                "name idempotency_records_v07 is occupied"
+            )
+        if records_object is None:
+            if schema_object is not None:
+                raise RuntimeError(
+                    "idempotency schema integrity failure: "
+                    "idempotency_schema exists without idempotency_records"
+                )
+            return "absent"
+        if records_object[0] != "table":
+            raise RuntimeError(
+                "idempotency schema integrity failure: "
+                "idempotency_records must be a table"
+            )
+        if schema_object is None:
+            if not allow_legacy_schema_migration:
+                raise RuntimeError(
+                    "legacy idempotency schema requires controlled migration via "
+                    "SQLiteIdempotencyStore.migrate_legacy"
+                )
+            cls._assert_legacy_schema_integrity(connection)
+            return "legacy"
+        if schema_object[0] != "table":
+            raise RuntimeError(
+                "idempotency schema integrity failure: "
+                "idempotency_schema must be a table"
+            )
+        cls._assert_schema_integrity(connection)
+        return "current"
+
+    @staticmethod
+    def _assert_standalone_migration_target(connection: sqlite3.Connection) -> None:
+        """Reject an idempotency-only migration against a colocated ledger."""
+
+        names = tuple(sorted(_RECONCILIATION_AUTHORITY_TABLES))
+        placeholders = ", ".join("?" for _ in names)
+        rows = connection.execute(
+            f"""
+            SELECT name FROM sqlite_master
+            WHERE lower(name) IN ({placeholders})
+            ORDER BY lower(name)
+            """,
+            names,
+        ).fetchall()
+        if rows:
+            found = ", ".join(str(row[0]) for row in rows)
+            raise RuntimeError(
+                "standalone idempotency migration cannot run when reconciliation "
+                f"authority objects exist: {found}; use "
+                "SQLiteReconciliationLedger.migrate_legacy"
+            )
+
+    @staticmethod
+    def _persistent_triggers(
+        connection: sqlite3.Connection,
+    ) -> dict[str, str]:
+        names = tuple(sorted(_IDEMPOTENCY_AUTHORITY_TABLES))
+        placeholders = ", ".join("?" for _ in names)
+        rows = connection.execute(
+            f"""
+            SELECT name, sql FROM sqlite_master
+            WHERE type = 'trigger' AND lower(tbl_name) IN ({placeholders})
+            """,
+            names,
+        )
+        return {str(name).lower(): str(sql or "") for name, sql in rows}
+
+    @staticmethod
+    def _explicit_indexes(
+        connection: sqlite3.Connection,
+    ) -> dict[str, str]:
+        names = tuple(sorted(_IDEMPOTENCY_AUTHORITY_TABLES))
+        placeholders = ", ".join("?" for _ in names)
+        rows = connection.execute(
+            f"""
+            SELECT name, sql FROM sqlite_master
+            WHERE type = 'index' AND sql IS NOT NULL
+              AND lower(tbl_name) IN ({placeholders})
+            """,
+            names,
+        )
+        return {str(name).lower(): str(sql or "") for name, sql in rows}
+
+    @classmethod
+    def _assert_schema_integrity(cls, connection: sqlite3.Connection) -> None:
+        for table_name, expected_ddl in _IDEMPOTENCY_TABLE_DDL.items():
+            schema_object = cls._schema_object(connection, table_name)
+            if schema_object is None or schema_object[0] != "table":
+                raise RuntimeError(
+                    "idempotency schema integrity failure: "
+                    f"required table {table_name!r} is missing"
+                )
+            supported_definitions = (expected_ddl,)
+            if table_name == "idempotency_records":
+                # SQLite emits this equivalent quoted identifier after the
+                # transactional legacy table rename.
+                supported_definitions += (_IDEMPOTENCY_MIGRATED_RECORDS_DDL,)
+            if _normalize_schema_sql(schema_object[1]) not in {
+                _normalize_schema_sql(definition)
+                for definition in supported_definitions
+            }:
+                raise RuntimeError(
+                    "idempotency schema integrity failure: "
+                    f"table {table_name!r} does not match the supported contract"
+                )
+
+        version_rows = connection.execute(
+            "SELECT singleton, version FROM idempotency_schema ORDER BY singleton"
+        ).fetchall()
+        if version_rows != [(1, _IDEMPOTENCY_SCHEMA_VERSION)]:
+            raise RuntimeError(
+                "idempotency schema integrity failure: "
+                "idempotency_schema must contain exactly the current version"
+            )
+
+        triggers = cls._persistent_triggers(connection)
+        if triggers:
+            raise RuntimeError(
+                "idempotency schema integrity failure: unexpected persistent trigger(s) "
+                + ", ".join(sorted(triggers))
+            )
+
+        indexes = cls._explicit_indexes(connection)
+        expected_indexes = {
+            name.lower(): definition
+            for name, definition in _IDEMPOTENCY_INDEX_DDL.items()
+        }
+        if set(indexes) != set(expected_indexes):
+            raise RuntimeError(
+                "idempotency schema integrity failure: explicit indexes do not match "
+                "the supported contract"
+            )
+        for index_name, expected_ddl in expected_indexes.items():
+            if _normalize_schema_sql(indexes[index_name]) != _normalize_schema_sql(
+                expected_ddl
+            ):
+                raise RuntimeError(
+                    "idempotency schema integrity failure: "
+                    f"index {index_name!r} does not match the supported contract"
+                )
+
+        foreign_key_violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if foreign_key_violations:
+            raise RuntimeError(
+                "idempotency schema integrity failure: foreign-key check failed"
+            )
+
+    @classmethod
+    def _assert_legacy_schema_integrity(cls, connection: sqlite3.Connection) -> None:
+        records_object = cls._schema_object(connection, "idempotency_records")
+        if records_object is None or records_object[0] != "table":
+            raise RuntimeError(
+                "legacy idempotency schema integrity failure: "
+                "idempotency_records must be a table"
+            )
+        normalized_records = _normalize_schema_sql(records_object[1])
+        known_legacy_definitions = {
+            _normalize_schema_sql(_IDEMPOTENCY_LEGACY_V05_SCHEMA),
+            _normalize_schema_sql(_IDEMPOTENCY_SCHEMA),
+        }
+        if normalized_records not in known_legacy_definitions:
+            raise RuntimeError(
+                "legacy idempotency schema integrity failure: "
+                "idempotency_records does not match a supported legacy contract"
+            )
+
+        triggers = cls._persistent_triggers(connection)
+        if triggers:
+            raise RuntimeError(
+                "legacy idempotency schema integrity failure: unexpected persistent "
+                "trigger(s) "
+                + ", ".join(sorted(triggers))
+            )
+
+        indexes = cls._explicit_indexes(connection)
+        allowed_indexes = {
+            "idx_idempotency_state_updated": _IDEMPOTENCY_INDEX_DDL[
+                "idx_idempotency_state_updated"
+            ],
+        }
+        if normalized_records == _normalize_schema_sql(_IDEMPOTENCY_SCHEMA):
+            allowed_indexes["idx_idempotency_key_generation"] = (
+                _IDEMPOTENCY_INDEX_DDL["idx_idempotency_key_generation"]
+            )
+        if not set(indexes).issubset(allowed_indexes):
+            raise RuntimeError(
+                "legacy idempotency schema integrity failure: unexpected explicit index"
+            )
+        for index_name, ddl in indexes.items():
+            if _normalize_schema_sql(ddl) != _normalize_schema_sql(
+                allowed_indexes[index_name]
+            ):
+                raise RuntimeError(
+                    "legacy idempotency schema integrity failure: "
+                    f"index {index_name!r} does not match the supported contract"
+                )
+
+        foreign_key_violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if foreign_key_violations:
+            raise RuntimeError(
+                "legacy idempotency schema integrity failure: foreign-key check failed"
+            )
+
+    @staticmethod
+    def _migrate_legacy_records(
+        connection: sqlite3.Connection,
+        columns: set[str],
+    ) -> None:
         reconciliation_tables = {
             row[0]
             for row in connection.execute(
@@ -942,8 +1293,11 @@ class SQLiteIdempotencyStore:
                 """
             )
         }
-        has_prepared_actions = "reconciliation_prepared_actions" in reconciliation_tables
-        if has_prepared_actions:
+        has_reconciliation_guard_tables = reconciliation_tables == {
+            "reconciliation_heads",
+            "reconciliation_prepared_actions",
+        }
+        if has_reconciliation_guard_tables:
             # SQLite validates trigger references while renaming the legacy
             # authority table. Reinstall the same retention guard after the
             # atomic table swap completes.
@@ -1000,10 +1354,7 @@ class SQLiteIdempotencyStore:
         connection.execute(
             "ALTER TABLE idempotency_records_v07 RENAME TO idempotency_records"
         )
-        if reconciliation_tables == {
-            "reconciliation_heads",
-            "reconciliation_prepared_actions",
-        }:
+        if has_reconciliation_guard_tables:
             connection.execute(
                 """
                 CREATE TRIGGER reconciliation_prepared_actions_delete_guard

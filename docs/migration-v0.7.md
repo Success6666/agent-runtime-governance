@@ -3,7 +3,7 @@
 v0.7 extends the durable SQLite path with deterministic `UNKNOWN`
 reconciliation. It retains generation-aware idempotency records, uses a
 prepared-action recovery descriptor, and upgrades the reconciliation schema to
-version 4 with a transactional reconciliation-audit outbox. The migration is
+version 5 with a transactional reconciliation-audit outbox. The migration is
 deliberately conservative. It never converts an uncertain prior side effect
 into a retryable one and never fabricates historical provider evidence.
 
@@ -18,13 +18,43 @@ implementation, not the only valid adapter.
 
 ## What the schema migration changes
 
-The reconciliation database is upgraded transactionally to schema version 4.
+The reconciliation database is upgraded transactionally to schema version 5.
 It creates `reconciliation_audit_outbox` and its ordering, payload-identity
 immutability, and retention guards. Each reconciliation head/event lineage
 mutation can then commit its fixed-allowlist audit-delivery intent in the same
 transaction. Raw provider evidence, raw tenant identities, and idempotency keys
 do not enter that delivery queue; delivery-attempt and acknowledgement fields
 remain mutable operational state.
+
+Schema versions 4 and 5 treat the reconciliation store as authoritative, not
+as a bootstrap target. Normal runtime startup also refuses a declared
+pre-outbox version (1, 2, or 3): only the dedicated,
+operator-invoked `SQLiteReconciliationLedger.migrate_legacy(...)` path may
+upgrade a verified legacy database. Do not leave that migration call in a
+long-lived service. At startup, a declared version-4 or version-5 database
+must match the released, normalized DDL contract for its version table and have
+a valid version row; the schema table and all four authority tables
+(`reconciliation_heads`,
+`reconciliation_events`, `reconciliation_prepared_actions`, and
+`reconciliation_audit_outbox`); the pending-delivery index; and the
+append-only, prepared-action, immutable-payload, and retention guards. No
+additional persistent trigger or explicit index may attach to those tables. The
+check rejects comments, conditional triggers, changed constraint expressions,
+partial or unique replacement indexes, and a version value that is inconsistent
+with existing authority objects. It also runs a SQLite foreign-key integrity
+check for reconciliation events and outbox rows, and probes the outbox mutation
+and deletion guards inside a rolled-back savepoint. A missing or partial
+authority set is a fail-closed integrity error, not a cue to create empty
+tables. Restore a verified backup and reconcile the affected delivery
+obligations; do not repair the schema by hand.
+
+The controlled v4-to-v5 upgrade adds the durable alert marker and corrects the
+delivery-queue enqueue time for a `migration_snapshot_recorded` envelope only
+when it is still pending, has never been attempted, and has no recorded delivery
+error. This prevents a newly introduced snapshot from immediately aging into an
+alert because v4 stored the historical lineage time in `created_at`. The
+historical lineage timestamp remains in the envelope payload; only the mutable
+queue metadata is normalized in the upgrade transaction.
 
 For a pre-outbox reconciliation head, the migration emits exactly one
 `migration_snapshot_recorded` envelope when no outbox event already exists for
@@ -37,6 +67,35 @@ Malformed legacy idempotency rows are normalized conservatively to `unknown`
 or `applied_no_result`, never to a retryable state. Do not delete those rows to
 force a new execution. Reconcile the downstream effect or follow the manual
 incident process first.
+
+The versioned idempotency authority has the same startup boundary. Normal
+`SQLiteIdempotencyStore(...)` construction accepts only the released
+`idempotency_records` and `idempotency_schema` DDL, exactly one current schema
+version row, the two released indexes, and no persistent trigger or additional
+explicit index attached to either authority table. It rejects an unversioned
+legacy store rather than discovering its shape from a partial column set. For a
+standalone idempotency database, perform a verified offline migration with
+`SQLiteIdempotencyStore.migrate_legacy(path)`. When the idempotency and
+reconciliation stores share a path, use
+`SQLiteReconciliationLedger.migrate_legacy(path)` instead; it upgrades both
+authorities in one controlled `BEGIN IMMEDIATE` transaction. That entry point
+validates both existing authorities, including reserved migration-object names,
+before it creates or upgrades either one. A rejected idempotency authority or
+any later upgrade error rolls back the reconciliation changes as well, so it
+cannot bootstrap a partial v5 schema. These checks detect persistent schema
+tampering on restart, but cannot distinguish an entirely replaced empty
+database from a first deployment. Protect the configured volume and verify
+backup/restore provenance outside the SDK.
+
+`idempotency_records_v07` is a reserved migration staging name even when no
+other idempotency table exists. Any persistent SQLite object with that name is
+a fail-closed condition; do not delete, rename, or copy it by hand to make
+startup succeed. Restore the verified migration input and rerun the controlled
+operation. `SQLiteIdempotencyStore.migrate_legacy(path)` also rejects a path
+that contains any reconciliation authority object, including an incomplete
+legacy authority. It is only for a truly standalone store. A shared path must
+always use `SQLiteReconciliationLedger.migrate_legacy(path)` so neither
+authority can be upgraded independently.
 
 ## SQLite journal-mode change
 
@@ -69,10 +128,14 @@ set `journal_mode="wal"`; v0.7 rejects that explicit mode on affected versions.
    of the idempotency/reconciliation database, the SQLite audit database, audit
    chain state, and the associated signing and identity-digest keys. Validate a
    restore in an isolated location before continuing.
-4. Start exactly one v0.7 process against each state database. Let it perform
-   the schema and journal migration. If journal initialization fails, return to
-   step 3; do not disable the safety check.
-5. Inspect the resulting state. Confirm the reconciliation schema is version 4,
+4. In one controlled, offline process, call
+   `SQLiteReconciliationLedger.migrate_legacy(path)` for each verified
+   pre-outbox database. For a standalone idempotency database with no
+   reconciliation ledger, call `SQLiteIdempotencyStore.migrate_legacy(path)`.
+   Do not use ordinary runtime construction for either step, and do not leave
+   a migration call in a service configuration. If journal initialization
+   fails, return to step 3; do not disable the safety check.
+5. Inspect the resulting state. Confirm the reconciliation schema is version 5,
    existing heads have either historical outbox records or one
    `migration_snapshot_recorded` envelope, and any normalized idempotency rows
    remain blocked as expected.
@@ -111,11 +174,23 @@ the envelope pending. Restart the authorized recovery worker; do not mutate
 same-payload redelivery idempotent and rejects a different payload under the
 same source ID.
 
+The SQLite ledger emits one structured warning for each execution record whose
+pending outbox crosses the configured delivery-attempt or age threshold (the
+defaults are 3 attempts and 300 seconds). It atomically writes the durable
+`alerted_at` marker only when that pending execution has not already claimed one;
+the existing marker prevents another write or warning for the same unresolved
+incident after a restart or subsequent delivery failure. Route the
+`agent_runtime_governance.reconciliation` logger to the operational alerting
+system and investigate the persisted outbox rather than suppressing or editing
+it.
+
 ## Rollback and retention
 
 Rolling back application code does not roll back the SQLite schema or journal
 mode. Restore the verified pre-upgrade backup if a v0.6 binary must be
 reinstated. Do not attempt a manual schema downgrade, delete reconciliation
 history or immutable outbox payloads, or reuse unresolved idempotency keys as a
-rollback mechanism. Retention and archival changes require a tested migration
+rollback mechanism. The runtime performs no automatic outbox compaction,
+archival, or deletion. Long-term retention and archival changes require a
+tested, explicit controlled migration with a verified backup and restore path,
 because the outbox and reconciliation history are part of the evidence lineage.
