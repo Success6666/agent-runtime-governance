@@ -116,3 +116,21 @@ class AuditDeliveryError(GovernanceError):
         self.post_execution = post_execution
         stage = "after execution" if post_execution else "before execution"
         super().__init__(f"critical audit delivery failed {stage}: {cause}")
+
+
+class ReconciliationAuditDeliveryPendingError(GovernanceError):
+    """A committed reconciliation event remains durably queued for audit delivery."""
+
+    def __init__(
+        self,
+        execution_record_id: str,
+        outbox_id: str,
+        cause: BaseException,
+    ) -> None:
+        self.execution_record_id = execution_record_id
+        self.outbox_id = outbox_id
+        self.cause = cause
+        super().__init__(
+            "reconciliation audit delivery is pending for committed execution "
+            f"{execution_record_id}"
+        )

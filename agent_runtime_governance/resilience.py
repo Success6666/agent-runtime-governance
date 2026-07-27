@@ -108,10 +108,13 @@ class RuntimeLimits:
     idempotency_operation_timeout_seconds: float = 30.0
     reconciliation_operation_timeout_seconds: float = 30.0
     reconciliation_provider_timeout_seconds: float = 15.0
+    reconciliation_finalization_timeout_seconds: float = 5.0
+    reconciliation_audit_delivery_timeout_seconds: float = 10.0
     admission_timeout_seconds: float = 1.0
     cancellation_grace_seconds: float = 0.25
     max_in_flight: int = 128
     max_reconciliation_in_flight: int = 16
+    max_reconciliation_audit_delivery_in_flight: int = 8
 
     def __post_init__(self) -> None:
         for name in (
@@ -122,6 +125,8 @@ class RuntimeLimits:
             "idempotency_operation_timeout_seconds",
             "reconciliation_operation_timeout_seconds",
             "reconciliation_provider_timeout_seconds",
+            "reconciliation_finalization_timeout_seconds",
+            "reconciliation_audit_delivery_timeout_seconds",
             "admission_timeout_seconds",
             "cancellation_grace_seconds",
         ):
@@ -131,6 +136,10 @@ class RuntimeLimits:
             raise ValueError("max_in_flight must be at least one")
         if self.max_reconciliation_in_flight < 1:
             raise ValueError("max_reconciliation_in_flight must be at least one")
+        if self.max_reconciliation_audit_delivery_in_flight < 1:
+            raise ValueError(
+                "max_reconciliation_audit_delivery_in_flight must be at least one"
+            )
 
 
 class RuntimeBulkhead:

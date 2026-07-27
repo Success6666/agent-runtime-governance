@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import math
 import re
@@ -82,6 +84,7 @@ class ReconciliationAttemptOutcome(str, Enum):
     ERROR = "error"
     TIMEOUT = "timeout"
     CANCELLED = "cancelled"
+    RECOVERY_REQUIRED = "recovery_required"
 
 
 class ReconciliationDisposition(str, Enum):
@@ -95,6 +98,7 @@ class ReconciliationDisposition(str, Enum):
 class ReconciliationTransitionSource(str, Enum):
     PROVIDER = "provider"
     MANUAL = "manual"
+    RECOVERY = "recovery"
 
 
 class ReconciliationError(RuntimeError):
@@ -616,6 +620,23 @@ class ReconciliationTransition:
                 raise ReconciliationValidationError(
                     "provider transition cannot carry operator identity"
                 )
+        elif self.source is ReconciliationTransitionSource.RECOVERY:
+            if (
+                self.provider_id is not None
+                or self.attempt_id is not None
+                or self.operator_identity_digest is not None
+            ):
+                raise ReconciliationValidationError(
+                    "recovery transition cannot carry provider or operator identity"
+                )
+            if self.reason is None:
+                raise ReconciliationValidationError(
+                    "recovery transition requires a reason"
+                )
+            if self.new_state is not ReconciliationState.MANUAL_REVIEW:
+                raise ReconciliationValidationError(
+                    "recovery transition must enter MANUAL_REVIEW"
+                )
         elif self.operator_identity_digest is None or self.reason is None:
             raise ReconciliationValidationError(
                 "manual transition requires operator identity and reason"
@@ -708,6 +729,55 @@ class ReconciliationRecord:
 
 
 @dataclass(frozen=True, slots=True, repr=False)
+class ReconciliationAuditEnvelope:
+    """An immutable, redacted reconciliation audit event awaiting delivery."""
+
+    outbox_id: str
+    execution_record_id: str
+    revision: int
+    event_type: str
+    event: Mapping[str, Any] = field(repr=False)
+    created_at: datetime
+    delivery_attempts: int = 0
+
+    def __post_init__(self) -> None:
+        _require_execution_record_id(self.outbox_id)
+        _require_execution_record_id(self.execution_record_id)
+        if type(self.revision) is not int or self.revision < 0:
+            raise ReconciliationValidationError(
+                "reconciliation audit revision must be non-negative"
+            )
+        _require_identifier("reconciliation audit event type", self.event_type)
+        object.__setattr__(self, "created_at", _require_timestamp(self.created_at))
+        if type(self.delivery_attempts) is not int or self.delivery_attempts < 0:
+            raise ReconciliationValidationError(
+                "reconciliation audit delivery attempts must be non-negative"
+            )
+        object.__setattr__(
+            self,
+            "event",
+            _bounded_mapping(
+                self.event,
+                label="reconciliation audit envelope",
+                max_bytes=_MAX_METADATA_BYTES,
+                allow_empty=False,
+                reject_sensitive_keys=False,
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "outbox_id": self.outbox_id,
+            "execution_record_id": self.execution_record_id,
+            "revision": self.revision,
+            "event_type": self.event_type,
+            "event": thaw(self.event),
+            "created_at": _timestamp_text(self.created_at),
+            "delivery_attempts": self.delivery_attempts,
+        }
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class ReconciliationHead:
     action: UnknownAction
     state: ReconciliationState
@@ -796,6 +866,13 @@ class ReconciliationLedger(Protocol):
         error: str | None = None,
         finished_at: datetime | None = None,
     ) -> ReconciliationRecord: ...
+
+    def recover_unfinished_attempts(
+        self,
+        execution_record_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> ReconciliationHead | None: ...
 
     def compare_and_append_transition(
         self,
@@ -888,6 +965,61 @@ class InMemoryReconciliationLedger:
                 datetime.now(timezone.utc),
                 payload,
             )
+
+    def recover_unfinished_attempts(
+        self,
+        execution_record_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> ReconciliationHead | None:
+        """Quarantine expired unclosed attempts before another probe can start.
+
+        A start record is a durable claim that a read-only provider was invoked.
+        While its deadline is still valid, a competing runtime must not start a
+        second provider call. Once it expires without a terminal record, the
+        only deterministic outcome is a terminal recovery event followed by
+        MANUAL_REVIEW.
+        """
+
+        recovered_at = _require_timestamp(now or datetime.now(timezone.utc))
+        with self._lock:
+            head = self._head_locked(execution_record_id)
+            records = self._events[execution_record_id]
+            attempts = _unfinished_attempt_contexts(head.action, records)
+            if not attempts:
+                return None
+            if head.state is not ReconciliationState.UNKNOWN:
+                raise ReconciliationError(
+                    "a non-UNKNOWN reconciliation head has an unfinished attempt"
+                )
+            if any(context.deadline > recovered_at for _, context, _ in attempts):
+                return head
+
+            for _start, context, provider in attempts:
+                payload, occurred_at = _finish_payload(
+                    context,
+                    provider,
+                    ReconciliationAttemptOutcome.RECOVERY_REQUIRED,
+                    None,
+                    "provider attempt expired before a terminal record was persisted",
+                    recovered_at,
+                )
+                self._append_attempt_locked(
+                    execution_record_id,
+                    head.action,
+                    self._heads[execution_record_id].revision,
+                    ReconciliationEventKind.ATTEMPT_FINISHED,
+                    occurred_at,
+                    payload,
+                )
+
+            current = self._heads[execution_record_id]
+            transition = _recovery_transition(current, len(attempts), recovered_at)
+            _validate_transition_evidence(current.action, transition)
+            record, updated = _transition_record(current, transition)
+            self._events[execution_record_id].append(record)
+            self._heads[execution_record_id] = updated
+            return updated
 
     def finish_attempt(
         self,
@@ -1046,6 +1178,13 @@ class SQLiteReconciliationLedger:
     def create_unknown(self, action: UnknownAction) -> ReconciliationHead:
         if not isinstance(action, UnknownAction):
             raise TypeError("action must be an UnknownAction")
+        head = ReconciliationHead(
+            action=action,
+            state=ReconciliationState.UNKNOWN,
+            revision=0,
+            disposition=ReconciliationDisposition.BLOCKED_UNKNOWN,
+            updated_at=action.attempted_at,
+        )
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._validate_idempotency_link(connection, action)
@@ -1068,8 +1207,11 @@ class SQLiteReconciliationLedger:
                 raise ReconciliationConflictError(
                     "a reconciliation head already exists for this execution record"
                 ) from exc
+            enqueue_reconciliation_audit_outbox(
+                connection, head, event_type="unknown_recorded"
+            )
             connection.commit()
-        return self.current(action.execution_record_id)
+        return head
 
     def prepare_action(
         self, claim: "IdempotencyClaim", action: UnknownAction
@@ -1221,6 +1363,16 @@ class SQLiteReconciliationLedger:
                 raise ReconciliationConflictError(
                     "a reconciliation head already exists for this execution record"
                 ) from exc
+            head = ReconciliationHead(
+                action=action,
+                state=ReconciliationState.UNKNOWN,
+                revision=0,
+                disposition=ReconciliationDisposition.BLOCKED_UNKNOWN,
+                updated_at=now,
+            )
+            enqueue_reconciliation_audit_outbox(
+                connection, head, event_type="unknown_recorded"
+            )
             connection.commit()
 
         from .registry import IdempotencyOutcomeUnknownError
@@ -1232,7 +1384,7 @@ class SQLiteReconciliationLedger:
                 )
             )
             claim.future.exception()
-        return self.current(action.execution_record_id)
+        return head
 
     @staticmethod
     def _validate_prepared_claim(
@@ -1339,6 +1491,8 @@ class SQLiteReconciliationLedger:
                 "protocol_version": context.protocol_version,
                 "provider_id": provider.provider_id,
             },
+            audit_event_type="attempt_started",
+            provider=provider,
         )
 
     def finish_attempt(
@@ -1363,7 +1517,106 @@ class SQLiteReconciliationLedger:
             ReconciliationEventKind.ATTEMPT_FINISHED,
             occurred_at,
             payload,
+            audit_event_type="attempt_finished",
+            provider=provider,
+            outcome=outcome,
+            finding=finding,
         )
+
+    def recover_unfinished_attempts(
+        self,
+        execution_record_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> ReconciliationHead | None:
+        """Close only expired unmatched attempts, then quarantine the action.
+
+        The provider deadline is a durable lease for the recorded read-only
+        attempt. A concurrent or restarted runtime observes that lease and
+        must not issue another probe while it remains valid. After expiry, a
+        synthetic terminal outcome plus a RECOVERY transition preserves a
+        complete evidence chain without inferring the external side effect.
+        """
+
+        recovered_at = _require_timestamp(now or datetime.now(timezone.utc))
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            head = self._current(connection, execution_record_id)
+            attempts = _unfinished_attempt_contexts(
+                head.action,
+                self._attempt_records(connection, execution_record_id),
+            )
+            if not attempts:
+                connection.commit()
+                return None
+            if head.state is not ReconciliationState.UNKNOWN:
+                raise ReconciliationError(
+                    "a non-UNKNOWN reconciliation head has an unfinished attempt"
+                )
+            if any(context.deadline > recovered_at for _, context, _ in attempts):
+                connection.commit()
+                return head
+
+            for _start, context, provider in attempts:
+                payload, occurred_at = _finish_payload(
+                    context,
+                    provider,
+                    ReconciliationAttemptOutcome.RECOVERY_REQUIRED,
+                    None,
+                    "provider attempt expired before a terminal record was persisted",
+                    recovered_at,
+                )
+                _record, head = self._append_attempt_in_transaction(
+                    connection,
+                    head,
+                    ReconciliationEventKind.ATTEMPT_FINISHED,
+                    occurred_at,
+                    payload,
+                    audit_event_type="attempt_recovery_recorded",
+                    provider=provider,
+                    outcome=ReconciliationAttemptOutcome.RECOVERY_REQUIRED,
+                )
+
+            transition = _recovery_transition(head, len(attempts), recovered_at)
+            _validate_transition_evidence(head.action, transition)
+            record, updated = _transition_record(head, transition)
+            cursor = connection.execute(
+                """
+                UPDATE reconciliation_heads
+                SET state = ?, revision = ?, disposition = ?,
+                    resolved_result_available = ?, resolved_result_json = ?,
+                    updated_at = ?
+                WHERE execution_record_id = ? AND state = ? AND revision = ?
+                """,
+                (
+                    updated.state.value,
+                    updated.revision,
+                    updated.disposition.value,
+                    int(updated.resolved_result_available),
+                    _optional_dump(
+                        updated.resolved_result, updated.resolved_result_available
+                    ),
+                    _timestamp_text(updated.updated_at),
+                    execution_record_id,
+                    head.state.value,
+                    head.revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ReconciliationConflictError(
+                    "reconciliation revision changed before recovery transition"
+                )
+            self._insert_event(connection, record)
+            self._update_idempotency_disposition(connection, updated)
+            enqueue_reconciliation_audit_outbox(
+                connection,
+                updated,
+                event_type="recovery_transition_recorded",
+                evidence_kind=transition.evidence_kind,
+                evidence=transition.evidence,
+            )
+            connection.commit()
+            return updated
 
     def compare_and_append_transition(
         self,
@@ -1419,6 +1672,29 @@ class SQLiteReconciliationLedger:
                 )
             self._insert_event(connection, record)
             self._update_idempotency_disposition(connection, updated)
+            enqueue_reconciliation_audit_outbox(
+                connection,
+                updated,
+                event_type=(
+                    "manual_transition_recorded"
+                    if transition.source is ReconciliationTransitionSource.MANUAL
+                    else (
+                        "recovery_transition_recorded"
+                        if transition.source is ReconciliationTransitionSource.RECOVERY
+                        else "transition_recorded"
+                    )
+                ),
+                provider=provider,
+                attempt_id=attempt_id,
+                outcome=(
+                    ReconciliationAttemptOutcome.SUCCESS
+                    if transition.source is ReconciliationTransitionSource.PROVIDER
+                    else None
+                ),
+                evidence_kind=transition.evidence_kind,
+                evidence=transition.evidence,
+                operator_identity_digest=transition.operator_identity_digest,
+            )
             connection.commit()
         return updated
 
@@ -1454,6 +1730,97 @@ class SQLiteReconciliationLedger:
             }
         )
 
+    def pending_audit_events(
+        self,
+        *,
+        execution_record_id: str | None = None,
+        limit: int = 128,
+    ) -> tuple[ReconciliationAuditEnvelope, ...]:
+        """Return immutable, not-yet-acknowledged audit envelopes in order."""
+
+        if execution_record_id is not None:
+            _require_execution_record_id(execution_record_id)
+        if type(limit) is not int or not 1 <= limit <= 1_000:
+            raise ValueError("audit outbox limit must be between 1 and 1000")
+        where = """
+            current.delivered_at IS NULL
+            AND NOT EXISTS (
+                SELECT 1 FROM reconciliation_audit_outbox AS earlier
+                WHERE earlier.execution_record_id = current.execution_record_id
+                  AND earlier.delivered_at IS NULL
+                  AND earlier.revision < current.revision
+            )
+        """
+        parameters: list[Any] = []
+        if execution_record_id is not None:
+            where += " AND current.execution_record_id = ?"
+            parameters.append(execution_record_id)
+        parameters.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT outbox_id, execution_record_id, revision, event_type,
+                       event_json, event_digest, created_at, delivery_attempts
+                FROM reconciliation_audit_outbox AS current
+                WHERE {where}
+                ORDER BY execution_record_id, revision, event_type
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+        return tuple(_audit_envelope_from_row(row) for row in rows)
+
+    def mark_audit_event_delivered(self, outbox_id: str) -> None:
+        _require_execution_record_id(outbox_id)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE reconciliation_audit_outbox
+                SET delivered_at = ?, last_error_class = NULL
+                WHERE outbox_id = ? AND delivered_at IS NULL
+                """,
+                (_timestamp_text(datetime.now(timezone.utc)), outbox_id),
+            )
+            if cursor.rowcount == 0:
+                exists = connection.execute(
+                    "SELECT 1 FROM reconciliation_audit_outbox WHERE outbox_id = ?",
+                    (outbox_id,),
+                ).fetchone()
+                if exists is None:
+                    raise ReconciliationNotFoundError(
+                        "reconciliation audit outbox event is not present"
+                    )
+            connection.commit()
+
+    def record_audit_delivery_failure(
+        self, outbox_id: str, error: BaseException
+    ) -> None:
+        _require_execution_record_id(outbox_id)
+        error_class = type(error).__name__
+        _require_identifier("reconciliation audit delivery error class", error_class)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE reconciliation_audit_outbox
+                SET delivery_attempts = delivery_attempts + 1,
+                    last_error_class = ?
+                WHERE outbox_id = ? AND delivered_at IS NULL
+                """,
+                (error_class, outbox_id),
+            )
+            if cursor.rowcount == 0:
+                exists = connection.execute(
+                    "SELECT 1 FROM reconciliation_audit_outbox WHERE outbox_id = ?",
+                    (outbox_id,),
+                ).fetchone()
+                if exists is None:
+                    raise ReconciliationNotFoundError(
+                        "reconciliation audit outbox event is not present"
+                    )
+            connection.commit()
+
     def _append_attempt(
         self,
         execution_record_id: str,
@@ -1462,6 +1829,11 @@ class SQLiteReconciliationLedger:
         kind: ReconciliationEventKind,
         occurred_at: datetime,
         payload: Mapping[str, Any],
+        *,
+        audit_event_type: str | None = None,
+        provider: ProviderDescriptor | None = None,
+        outcome: ReconciliationAttemptOutcome | None = None,
+        finding: ReconciliationFinding | None = None,
     ) -> ReconciliationRecord:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1510,8 +1882,102 @@ class SQLiteReconciliationLedger:
                     "reconciliation revision changed before attempt append"
                 )
             self._insert_event(connection, record)
+            if audit_event_type is not None:
+                updated = ReconciliationHead(
+                    action=head.action,
+                    state=head.state,
+                    revision=record.revision,
+                    disposition=head.disposition,
+                    updated_at=record.occurred_at,
+                    resolved_result_available=head.resolved_result_available,
+                    resolved_result=head.resolved_result,
+                )
+                enqueue_reconciliation_audit_outbox(
+                    connection,
+                    updated,
+                    event_type=audit_event_type,
+                    provider=provider,
+                    attempt_id=payload.get("attempt_id"),
+                    outcome=outcome,
+                    finding=finding,
+                )
             connection.commit()
             return record
+
+    def _append_attempt_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        head: ReconciliationHead,
+        kind: ReconciliationEventKind,
+        occurred_at: datetime,
+        payload: Mapping[str, Any],
+        *,
+        audit_event_type: str | None = None,
+        provider: ProviderDescriptor | None = None,
+        outcome: ReconciliationAttemptOutcome | None = None,
+        finding: ReconciliationFinding | None = None,
+    ) -> tuple[ReconciliationRecord, ReconciliationHead]:
+        """Append one attempt event inside the caller's existing transaction."""
+
+        if (
+            kind is ReconciliationEventKind.ATTEMPT_STARTED
+            and head.state is not ReconciliationState.UNKNOWN
+        ):
+            raise InvalidReconciliationTransitionError(
+                "provider attempts are valid only while state is UNKNOWN"
+            )
+        _validate_attempt_append(
+            self._attempt_records(connection, head.execution_record_id), kind, payload
+        )
+        record = ReconciliationRecord(
+            event_id=_new_id(),
+            execution_record_id=head.execution_record_id,
+            revision=head.revision + 1,
+            kind=kind,
+            state_before=head.state,
+            state_after=head.state,
+            occurred_at=occurred_at,
+            payload=payload,
+        )
+        cursor = connection.execute(
+            """
+            UPDATE reconciliation_heads
+            SET revision = ?, updated_at = ?
+            WHERE execution_record_id = ? AND state = ? AND revision = ?
+            """,
+            (
+                record.revision,
+                _timestamp_text(record.occurred_at),
+                head.execution_record_id,
+                head.state.value,
+                head.revision,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ReconciliationConflictError(
+                "reconciliation revision changed before attempt append"
+            )
+        self._insert_event(connection, record)
+        updated = ReconciliationHead(
+            action=head.action,
+            state=head.state,
+            revision=record.revision,
+            disposition=head.disposition,
+            updated_at=record.occurred_at,
+            resolved_result_available=head.resolved_result_available,
+            resolved_result=head.resolved_result,
+        )
+        if audit_event_type is not None:
+            enqueue_reconciliation_audit_outbox(
+                connection,
+                updated,
+                event_type=audit_event_type,
+                provider=provider,
+                attempt_id=payload.get("attempt_id"),
+                outcome=outcome,
+                finding=finding,
+            )
+        return record, updated
 
     @staticmethod
     def _attempt_records(
@@ -1640,7 +2106,7 @@ class SQLiteReconciliationLedger:
                 "SELECT version FROM reconciliation_schema WHERE singleton = 1"
             ).fetchone()
             version = 0 if version_row is None else version_row[0]
-            if version not in {0, 1, 2}:
+            if version not in {0, 1, 2, 3, 4}:
                 raise ReconciliationError(
                     f"unsupported reconciliation schema version {version}"
                 )
@@ -1699,6 +2165,26 @@ class SQLiteReconciliationLedger:
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS reconciliation_audit_outbox (
+                    outbox_id TEXT PRIMARY KEY NOT NULL,
+                    execution_record_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL CHECK(revision >= 0),
+                    event_type TEXT NOT NULL,
+                    event_json TEXT NOT NULL,
+                    event_digest TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    delivery_attempts INTEGER NOT NULL DEFAULT 0
+                        CHECK(delivery_attempts >= 0),
+                    delivered_at TEXT,
+                    last_error_class TEXT,
+                    UNIQUE(execution_record_id, revision, event_type),
+                    FOREIGN KEY(execution_record_id)
+                        REFERENCES reconciliation_heads(execution_record_id)
+                )
+                """
+            )
+            connection.execute(
+                """
                 CREATE TRIGGER IF NOT EXISTS reconciliation_events_no_update
                 BEFORE UPDATE ON reconciliation_events
                 BEGIN
@@ -1721,6 +2207,32 @@ class SQLiteReconciliationLedger:
                 BEFORE UPDATE ON reconciliation_prepared_actions
                 BEGIN
                     SELECT RAISE(ABORT, 'prepared reconciliation actions are immutable');
+                END
+                """
+            )
+            connection.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS reconciliation_audit_outbox_immutable
+                BEFORE UPDATE OF outbox_id, execution_record_id, revision, event_type,
+                                 event_json, event_digest, created_at
+                ON reconciliation_audit_outbox
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'reconciliation audit outbox payload is immutable'
+                    );
+                END
+                """
+            )
+            connection.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS reconciliation_audit_outbox_no_delete
+                BEFORE DELETE ON reconciliation_audit_outbox
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'reconciliation audit outbox retention requires an explicit migration'
+                    );
                 END
                 """
             )
@@ -1753,11 +2265,51 @@ class SQLiteReconciliationLedger:
             )
             connection.execute(
                 """
-                INSERT INTO reconciliation_schema(singleton, version) VALUES (1, 2)
+                CREATE INDEX IF NOT EXISTS idx_reconciliation_audit_outbox_pending
+                ON reconciliation_audit_outbox(delivered_at, execution_record_id, revision)
+                """
+            )
+            if version < 4:
+                self._backfill_legacy_audit_outbox(connection)
+            connection.execute(
+                """
+                INSERT INTO reconciliation_schema(singleton, version) VALUES (1, 4)
                 ON CONFLICT(singleton) DO UPDATE SET version = excluded.version
                 """
             )
             connection.commit()
+
+    def _backfill_legacy_audit_outbox(self, connection: sqlite3.Connection) -> None:
+        """Establish an auditable migration boundary for pre-outbox records.
+
+        Earlier ledger versions had durable heads and events but no transactional
+        audit outbox.  Reconstructing historical provider evidence would be
+        misleading, so each entirely untracked execution receives one explicit
+        current-state snapshot.  The snapshot is committed with the v4 schema
+        upgrade and makes lease recovery before the upgrade visible to future
+        audit delivery without inventing historical event semantics.
+        """
+
+        rows = connection.execute(
+            "SELECT execution_record_id FROM reconciliation_heads"
+        ).fetchall()
+        for (execution_record_id,) in rows:
+            existing = connection.execute(
+                """
+                SELECT 1 FROM reconciliation_audit_outbox
+                WHERE execution_record_id = ?
+                LIMIT 1
+                """,
+                (execution_record_id,),
+            ).fetchone()
+            if existing is not None:
+                continue
+            head = self._current(connection, execution_record_id)
+            enqueue_reconciliation_audit_outbox(
+                connection,
+                head,
+                event_type="migration_snapshot_recorded",
+            )
 
     def _migrate_legacy_idempotency_if_needed(self) -> None:
         with self._connect() as connection:
@@ -1820,6 +2372,149 @@ def tenant_partition_digest(tenant: str) -> str:
             label="reconciliation tenant partition",
         )
     ).hexdigest()
+
+
+def enqueue_reconciliation_audit_outbox(
+    connection: sqlite3.Connection,
+    head: ReconciliationHead,
+    *,
+    event_type: str,
+    provider: ProviderDescriptor | None = None,
+    attempt_id: str | None = None,
+    outcome: ReconciliationAttemptOutcome | None = None,
+    finding: ReconciliationFinding | None = None,
+    evidence_kind: str | None = None,
+    evidence: Mapping[str, Any] | None = None,
+    operator_identity_digest: str | None = None,
+) -> str:
+    """Atomically enqueue a lineage-only audit event for a ledger mutation.
+
+    Callers must use the same SQLite transaction that mutates the reconciliation
+    state.  The payload is deliberately constructed from fixed allowlisted
+    fields; raw provider evidence, raw tenant identities, and idempotency keys
+    never enter the delivery queue.
+    """
+
+    if not isinstance(head, ReconciliationHead):
+        raise TypeError("head must be a ReconciliationHead")
+    _require_identifier("reconciliation audit event type", event_type)
+    if provider is not None and not isinstance(provider, ProviderDescriptor):
+        raise TypeError("provider must be a ProviderDescriptor")
+    if outcome is not None and not isinstance(outcome, ReconciliationAttemptOutcome):
+        raise TypeError("outcome must be a ReconciliationAttemptOutcome")
+    if finding is not None and not isinstance(finding, ReconciliationFinding):
+        raise TypeError("finding must be a ReconciliationFinding")
+    if finding is not None:
+        evidence_kind = finding.evidence_kind
+        evidence = finding.evidence
+    if evidence is not None and not isinstance(evidence, Mapping):
+        raise TypeError("evidence must be a mapping")
+    if operator_identity_digest is not None:
+        _require_digest("operator_identity_digest", operator_identity_digest)
+
+    payload = _reconciliation_audit_payload(
+        head,
+        event_type=event_type,
+        provider=provider,
+        attempt_id=attempt_id,
+        outcome=outcome,
+        evidence_kind=evidence_kind,
+        evidence=evidence,
+        operator_identity_digest=operator_identity_digest,
+    )
+    encoded = _dump(payload)
+    payload_digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    existing = connection.execute(
+        """
+        SELECT outbox_id, event_digest
+        FROM reconciliation_audit_outbox
+        WHERE execution_record_id = ? AND revision = ? AND event_type = ?
+        """,
+        (head.execution_record_id, head.revision, event_type),
+    ).fetchone()
+    if existing is not None:
+        if existing[1] != payload_digest:
+            raise ReconciliationConflictError(
+                "reconciliation audit outbox event identity was reused with different content"
+            )
+        return str(existing[0])
+
+    outbox_id = _new_id()
+    connection.execute(
+        """
+        INSERT INTO reconciliation_audit_outbox(
+            outbox_id, execution_record_id, revision, event_type, event_json,
+            event_digest, created_at, delivery_attempts, delivered_at,
+            last_error_class
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL)
+        """,
+        (
+            outbox_id,
+            head.execution_record_id,
+            head.revision,
+            event_type,
+            encoded,
+            payload_digest,
+            _timestamp_text(head.updated_at),
+        ),
+    )
+    return outbox_id
+
+
+def _reconciliation_audit_payload(
+    head: ReconciliationHead,
+    *,
+    event_type: str,
+    provider: ProviderDescriptor | None,
+    attempt_id: str | None,
+    outcome: ReconciliationAttemptOutcome | None,
+    evidence_kind: str | None,
+    evidence: Mapping[str, Any] | None,
+    operator_identity_digest: str | None,
+) -> dict[str, Any]:
+    action = head.action
+    provider_data = None
+    if provider is not None:
+        provider_data = {
+            "provider_id": provider.provider_id,
+            "protocol_version": str(provider.protocol_version),
+            "supported_evidence_kinds": list(provider.supported_evidence_kinds),
+        }
+    evidence_digest = None
+    if evidence is not None:
+        evidence_digest = hashlib.sha256(
+            canonical_json_bytes(
+                {"evidence": thaw(evidence)},
+                label="reconciliation audit evidence digest",
+            )
+        ).hexdigest()
+    metadata = action.metadata
+    trace_id = metadata.get("trace_id")
+    request_id = metadata.get("request_id")
+    return {
+        "schema_version": 1,
+        "timestamp": _timestamp_text(head.updated_at),
+        "stage": "reconciliation",
+        "event_type": event_type,
+        "trace_id": trace_id if type(trace_id) is str else None,
+        "request_id": request_id if type(request_id) is str else None,
+        "execution_record_id": head.execution_record_id,
+        "tool_name": action.tool_name,
+        "contract_id": action.contract_id,
+        "contract_version": action.contract_version,
+        "action_digest": action.action_digest,
+        "idempotency_namespace_digest": action.idempotency_namespace_digest,
+        "tenant_partition_digest": action.tenant_partition_digest,
+        "state": head.state.value,
+        "revision": head.revision,
+        "disposition": head.disposition.value,
+        "provider": provider_data,
+        "attempt_id": attempt_id,
+        "outcome": None if outcome is None else outcome.value,
+        "evidence_kind": evidence_kind,
+        "evidence_digest": evidence_digest,
+        "operator_identity_digest": operator_identity_digest,
+    }
 
 
 def new_execution_record_id() -> str:
@@ -1889,6 +2584,10 @@ def _validate_attempt_append(
     if kind is ReconciliationEventKind.ATTEMPT_STARTED:
         if matching:
             raise ReconciliationConflictError("attempt_id has already been persisted")
+        if _unmatched_attempt_start_records(records):
+            raise ReconciliationConflictError(
+                "a previous reconciliation attempt is still unfinished"
+            )
         return
     starts = [
         record
@@ -1908,6 +2607,102 @@ def _validate_attempt_append(
         raise ReconciliationValidationError(
             "attempt finish provider does not match the persisted start"
         )
+
+
+def _unmatched_attempt_start_records(
+    records: list[ReconciliationRecord] | tuple[ReconciliationRecord, ...],
+) -> tuple[ReconciliationRecord, ...]:
+    """Return durable starts that do not yet have a matching terminal record."""
+
+    starts: dict[str, ReconciliationRecord] = {}
+    finished: set[str] = set()
+    for record in records:
+        attempt_id = record.payload.get("attempt_id")
+        if not isinstance(attempt_id, str):
+            raise ReconciliationError("persisted reconciliation attempt lacks attempt_id")
+        if record.kind is ReconciliationEventKind.ATTEMPT_STARTED:
+            if attempt_id in starts:
+                raise ReconciliationError("persisted reconciliation attempt_id is duplicated")
+            starts[attempt_id] = record
+        elif record.kind is ReconciliationEventKind.ATTEMPT_FINISHED:
+            if attempt_id not in starts or attempt_id in finished:
+                raise ReconciliationError(
+                    "persisted reconciliation attempt finish has no unique start"
+                )
+            finished.add(attempt_id)
+    return tuple(
+        record for attempt_id, record in starts.items() if attempt_id not in finished
+    )
+
+
+async def _recovery_provider_sentinel(
+    _context: ReconciliationAttemptContext,
+) -> ReconciliationFinding:
+    raise RuntimeError("recovery provider sentinel must not be invoked")
+
+
+def _unfinished_attempt_contexts(
+    action: UnknownAction,
+    records: list[ReconciliationRecord] | tuple[ReconciliationRecord, ...],
+) -> tuple[
+    tuple[ReconciliationRecord, ReconciliationAttemptContext, ProviderDescriptor], ...
+]:
+    """Reconstruct only enough durable metadata to close expired attempts."""
+
+    contexts: list[
+        tuple[ReconciliationRecord, ReconciliationAttemptContext, ProviderDescriptor]
+    ] = []
+    for record in _unmatched_attempt_start_records(records):
+        payload = record.payload
+        try:
+            context = ReconciliationAttemptContext(
+                attempt_id=payload["attempt_id"],
+                deadline=_parse_timestamp(payload["deadline"]),
+                protocol_version=payload["protocol_version"],
+                action=action,
+            )
+            evidence_kinds = action.reconciliation_supported_evidence_kinds or (
+                "runtime",
+            )
+            provider = ProviderDescriptor(
+                provider_id=payload["provider_id"],
+                protocol_version=context.protocol_version,
+                supported_evidence_kinds=evidence_kinds,
+                provider=_recovery_provider_sentinel,
+            )
+        except (KeyError, TypeError, ValueError, ReconciliationError) as exc:
+            raise ReconciliationError(
+                "persisted unfinished reconciliation attempt is invalid"
+            ) from exc
+        contexts.append((record, context, provider))
+    return tuple(contexts)
+
+
+def _recovery_transition(
+    head: ReconciliationHead,
+    unfinished_attempt_count: int,
+    recovered_at: datetime,
+) -> ReconciliationTransition:
+    if type(unfinished_attempt_count) is not int or unfinished_attempt_count < 1:
+        raise ReconciliationValidationError(
+            "unfinished_attempt_count must be a positive integer"
+        )
+    return ReconciliationTransition(
+        execution_record_id=head.execution_record_id,
+        expected_state=head.state,
+        expected_revision=head.revision,
+        new_state=ReconciliationState.MANUAL_REVIEW,
+        source=ReconciliationTransitionSource.RECOVERY,
+        evidence_kind="runtime",
+        evidence={
+            "reason_code": "expired_unfinished_reconciliation_attempt",
+            "unfinished_attempt_count": unfinished_attempt_count,
+        },
+        occurred_at=recovered_at,
+        retry_safe=False,
+        resolved_result_available=False,
+        reason="expired reconciliation attempt requires manual review",
+    )
 
 
 def _require_finished_attempt(
@@ -2150,6 +2945,39 @@ def _record_from_row(row: tuple[Any, ...]) -> ReconciliationRecord:
         state_after=ReconciliationState(after),
         occurred_at=_parse_timestamp(occurred_at),
         payload=json.loads(payload),
+    )
+
+
+def _audit_envelope_from_row(
+    row: tuple[Any, ...],
+) -> ReconciliationAuditEnvelope:
+    (
+        outbox_id,
+        execution_record_id,
+        revision,
+        event_type,
+        event_json,
+        stored_digest,
+        created_at,
+        delivery_attempts,
+    ) = row
+    actual_digest = hashlib.sha256(event_json.encode("utf-8")).hexdigest()
+    if not isinstance(stored_digest, str) or not hmac.compare_digest(
+        stored_digest, actual_digest
+    ):
+        raise ReconciliationError("reconciliation audit outbox payload digest mismatch")
+    try:
+        event = json.loads(event_json)
+    except json.JSONDecodeError as exc:
+        raise ReconciliationError("reconciliation audit outbox payload is invalid") from exc
+    return ReconciliationAuditEnvelope(
+        outbox_id=outbox_id,
+        execution_record_id=execution_record_id,
+        revision=revision,
+        event_type=event_type,
+        event=event,
+        created_at=_parse_timestamp(created_at),
+        delivery_attempts=delivery_attempts,
     )
 
 
@@ -2410,6 +3238,7 @@ __all__ = [
     "InvalidReconciliationTransitionError",
     "ManualResolution",
     "ProviderDescriptor",
+    "ReconciliationAuditEnvelope",
     "ReconciliationAttemptContext",
     "ReconciliationAttemptOutcome",
     "ReconciliationConflictError",
@@ -2428,6 +3257,8 @@ __all__ = [
     "ReconciliationValidationError",
     "SQLiteReconciliationLedger",
     "UnknownAction",
+    "enqueue_reconciliation_audit_outbox",
     "idempotency_namespace_digest",
     "new_execution_record_id",
+    "tenant_partition_digest",
 ]

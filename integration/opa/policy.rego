@@ -11,3 +11,9 @@ allow if {
   input.risk_tier == "HIGH"
   input.permissions[_] == "admin"
 }
+
+allow if {
+  input.tool == "reconcile_unknown"
+  input.risk_tier == "HIGH"
+  input.permissions[_] == "admin"
+}

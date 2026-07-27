@@ -24,6 +24,12 @@ def test_runtime_limits_reject_invalid_values() -> None:
         RuntimeLimits(hook_timeout_seconds=0)
     with pytest.raises(ValueError):
         RuntimeLimits(idempotency_operation_timeout_seconds=0)
+    with pytest.raises(ValueError):
+        RuntimeLimits(reconciliation_finalization_timeout_seconds=0)
+    with pytest.raises(ValueError):
+        RuntimeLimits(reconciliation_audit_delivery_timeout_seconds=0)
+    with pytest.raises(ValueError):
+        RuntimeLimits(max_reconciliation_audit_delivery_in_flight=0)
 
 
 @pytest.mark.asyncio

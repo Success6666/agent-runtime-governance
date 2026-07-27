@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from datetime import datetime, timezone
+import subprocess
+import sys
+import textwrap
+import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from time import monotonic
 
 import pytest
 
@@ -14,18 +19,21 @@ from agent_runtime_governance import (
     ExecutionStatus,
     InMemoryAuditSink,
     InvocationOptions,
-    JSONLAuditSink,
     ProductionProfile,
     ProductionReadinessError,
     ProviderDescriptor,
     ReconciliationAttemptContext,
     ReconciliationAttemptOutcome,
+    ReconciliationAuditDeliveryPendingError,
+    ReconciliationConflictError,
     ReconciliationFinding,
     ReconciliationState,
     Runtime,
     RuntimeLimits,
+    SQLiteAuditSink,
     SQLiteIdempotencyStore,
     SQLiteReconciliationLedger,
+    StageTimeoutError,
     StaticIdentityProvider,
     ToolExecutionError,
     VerifiedPrincipal,
@@ -135,7 +143,7 @@ def _strict_control_plane_runtime(
     runtime = Runtime(
         [
             AuditMiddleware(
-                JSONLAuditSink(path.with_suffix(".audit.jsonl"), sign_key=b"a" * 32),
+                SQLiteAuditSink(path.with_suffix(".audit.db"), sign_key=b"a" * 32),
                 fail_closed=True,
             )
         ],
@@ -315,6 +323,43 @@ async def test_strict_manual_resolution_requires_resolve_permission(
         assert runtime.reconciliation_ledger is not None
         current = runtime.reconciliation_ledger.current(execution_record_id)
         assert (current.state, current.revision) == (manual.state, manual.revision)
+    finally:
+        await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_strict_global_audit_recovery_requires_its_own_permission(
+    tmp_path: Path,
+) -> None:
+    principals = {
+        "probe": VerifiedPrincipal(
+            issuer="gateway",
+            subject="probe-operator",
+            tenant="tenant-a",
+            permissions=frozenset({"reconciliation:probe"}),
+        ),
+        "audit-worker": VerifiedPrincipal(
+            issuer="gateway",
+            subject="audit-worker",
+            tenant="tenant-a",
+            permissions=frozenset({"reconciliation:audit:drain"}),
+        ),
+    }
+    runtime, _provider_calls = _strict_control_plane_runtime(
+        tmp_path / "strict-audit-drain.db", principals
+    )
+    try:
+        await _strict_unknown_execution(runtime, actor="probe")
+        with pytest.raises(PermissionError, match="authorization denied"):
+            await runtime.adrain_reconciliation_audit_outbox(
+                identity_claims={"actor": "probe"}
+            )
+        assert (
+            await runtime.adrain_reconciliation_audit_outbox(
+                identity_claims={"actor": "audit-worker"}
+            )
+            >= 0
+        )
     finally:
         await runtime.aclose()
 
@@ -577,6 +622,8 @@ async def test_reconciliation_audit_records_digests_without_raw_probe_evidence(
         events = [event for event in sink.events if event["stage"] == "reconciliation"]
         assert [event["event_type"] for event in events] == [
             "unknown_recorded",
+            "attempt_started",
+            "attempt_finished",
             "transition_recorded",
         ]
         transition = events[-1]
@@ -585,6 +632,180 @@ async def test_reconciliation_audit_records_digests_without_raw_probe_evidence(
         serialized = str(events)
         assert "customer-visible-key" not in serialized
         assert "sensitive-receipt-value" not in serialized
+    finally:
+        await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_terminal_reconciliation_audit_is_replayed_without_provider_rerun(
+    tmp_path: Path,
+) -> None:
+    class FailTransitionOnceSink:
+        def __init__(self) -> None:
+            self.events: list[dict[str, object]] = []
+            self.failed = False
+
+        def write(self, event: dict[str, object]) -> None:
+            if (
+                event.get("stage") == "reconciliation"
+                and event.get("event_type") == "transition_recorded"
+                and not self.failed
+            ):
+                self.failed = True
+                raise OSError("temporary audit sink outage")
+            self.events.append(dict(event))
+
+    path = tmp_path / "terminal-audit-replay.db"
+    sink = FailTransitionOnceSink()
+    provider_calls = 0
+
+    async def provider(
+        context: ReconciliationAttemptContext,
+    ) -> ReconciliationFinding:
+        nonlocal provider_calls
+        provider_calls += 1
+        return ReconciliationFinding(
+            proposed_state=ReconciliationState.CONFIRMED_SUCCEEDED,
+            evidence_kind="receipt",
+            evidence={"receipt_id": "receipt-1"},
+            observed_at=context.deadline,
+        )
+
+    runtime = Runtime(
+        [AuditMiddleware(sink, fail_closed=True)],  # type: ignore[arg-type]
+        idempotency_store=SQLiteIdempotencyStore(path),
+        reconciliation_ledger=SQLiteReconciliationLedger(path),
+    )
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        reconciliation_provider=ProviderDescriptor(
+            provider_id="payment-receipt",
+            protocol_version="1",
+            supported_evidence_kinds=("receipt",),
+            provider=provider,
+        ),
+    )
+    async def charge() -> None:
+        raise TimeoutError("payment outcome is uncertain")
+
+    try:
+        with pytest.raises(ToolExecutionError) as failed:
+            await runtime.arun(
+                "charge",
+                _governance=InvocationOptions(idempotency_key="request-1"),
+            )
+        execution_record_id = failed.value.execution_record_id
+        assert execution_record_id is not None
+        with pytest.raises(ReconciliationAuditDeliveryPendingError) as pending:
+            await runtime.areconcile(execution_record_id)
+        assert pending.value.execution_record_id == execution_record_id
+        assert provider_calls == 1
+        assert runtime.reconciliation_ledger is not None
+        assert (
+            runtime.reconciliation_ledger.current(execution_record_id).state
+            is ReconciliationState.CONFIRMED_SUCCEEDED
+        )
+        queued = runtime.reconciliation_ledger.pending_audit_events(
+            execution_record_id=execution_record_id
+        )
+        assert [item.event_type for item in queued] == ["transition_recorded"]
+
+        recovered = await runtime.areconcile(execution_record_id)
+        assert recovered.state is ReconciliationState.CONFIRMED_SUCCEEDED
+        assert provider_calls == 1
+        events = [
+            event
+            for event in sink.events
+            if event.get("stage") == "reconciliation"
+        ]
+        assert [event["event_type"] for event in events] == [
+            "unknown_recorded",
+            "attempt_started",
+            "attempt_finished",
+            "transition_recorded",
+        ]
+    finally:
+        await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_audit_source_id_prevents_duplicate_after_ack_failure(
+    tmp_path: Path,
+) -> None:
+    class FailTransitionAcknowledgementLedger(SQLiteReconciliationLedger):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self._failed = False
+
+        def mark_audit_event_delivered(self, outbox_id: str) -> None:
+            pending = self.pending_audit_events(limit=1_000)
+            event = next(item for item in pending if item.outbox_id == outbox_id)
+            if event.event_type == "transition_recorded" and not self._failed:
+                self._failed = True
+                raise sqlite3.OperationalError("simulated acknowledgement interruption")
+            super().mark_audit_event_delivered(outbox_id)
+
+    path = tmp_path / "sqlite-audit-retry.db"
+    ledger = FailTransitionAcknowledgementLedger(path)
+    sink = SQLiteAuditSink(tmp_path / "audit.db", sign_key=b"a" * 32)
+    provider_calls = 0
+
+    async def provider(
+        context: ReconciliationAttemptContext,
+    ) -> ReconciliationFinding:
+        nonlocal provider_calls
+        provider_calls += 1
+        return ReconciliationFinding(
+            proposed_state=ReconciliationState.CONFIRMED_SUCCEEDED,
+            evidence_kind="receipt",
+            evidence={"receipt_id": "receipt-1"},
+            observed_at=context.deadline,
+        )
+
+    runtime = Runtime(
+        [AuditMiddleware(sink, fail_closed=True)],
+        idempotency_store=SQLiteIdempotencyStore(path),
+        reconciliation_ledger=ledger,
+    )
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        reconciliation_provider=ProviderDescriptor(
+            provider_id="payment-receipt",
+            protocol_version="1",
+            supported_evidence_kinds=("receipt",),
+            provider=provider,
+        ),
+    )
+    async def charge() -> None:
+        raise TimeoutError("payment outcome is uncertain")
+
+    try:
+        with pytest.raises(ToolExecutionError) as failed:
+            await runtime.arun(
+                "charge",
+                _governance=InvocationOptions(idempotency_key="request-1"),
+            )
+        execution_record_id = failed.value.execution_record_id
+        assert execution_record_id is not None
+        with pytest.raises(ReconciliationAuditDeliveryPendingError):
+            await runtime.areconcile(execution_record_id)
+        recovered = await runtime.areconcile(execution_record_id)
+        assert recovered.state is ReconciliationState.CONFIRMED_SUCCEEDED
+        assert provider_calls == 1
+        events = [
+            event
+            for event in sink.read_verified()
+            if event.get("stage") == "reconciliation"
+        ]
+        assert [event["event_type"] for event in events] == [
+            "unknown_recorded",
+            "attempt_started",
+            "attempt_finished",
+            "transition_recorded",
+        ]
+        assert len({event["reconciliation_audit_id"] for event in events}) == 4
     finally:
         await runtime.aclose()
 
@@ -599,7 +820,7 @@ async def test_manual_reconciliation_requires_sealed_identity_and_audits_digest(
             return b"k" * 32
 
     path = tmp_path / "manual-reconciliation.db"
-    sink = JSONLAuditSink(tmp_path / "audit.jsonl", sign_key=b"a" * 32)
+    sink = SQLiteAuditSink(tmp_path / "audit.db", sign_key=b"a" * 32)
     profile = ProductionProfile(
         identity_digest_key_provider=KeyProvider(),
         identity_digest_key_version="key-v1",
@@ -700,3 +921,1089 @@ async def test_manual_reconciliation_requires_sealed_identity_and_audits_digest(
         assert "operator-secret-case" not in str(manual_event)
     finally:
         await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_caller_deadline_expiry_still_finishes_started_attempt(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "deadline-finalization.db"
+    runtime = _runtime(
+        path,
+        limits=RuntimeLimits(
+            reconciliation_provider_timeout_seconds=1.0,
+            reconciliation_finalization_timeout_seconds=0.1,
+        ),
+    )
+
+    async def provider(
+        context: ReconciliationAttemptContext,
+    ) -> ReconciliationFinding:
+        try:
+            await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            # Let the original request deadline elapse before the provider
+            # acknowledges cancellation. The persisted finish must still use
+            # its independent finalization budget.
+            await asyncio.sleep(0.05)
+            raise
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        reconciliation_provider=ProviderDescriptor(
+            provider_id="deadline-provider",
+            protocol_version="1",
+            supported_evidence_kinds=("receipt",),
+            provider=provider,
+        ),
+    )
+    async def charge() -> None:
+        raise TimeoutError("outcome is uncertain")
+
+    try:
+        with pytest.raises(ToolExecutionError) as failed:
+            await runtime.arun(
+                "charge", _governance=InvocationOptions(idempotency_key="request-1")
+            )
+        execution_record_id = failed.value.execution_record_id
+        assert execution_record_id is not None
+
+        with pytest.raises(StageTimeoutError):
+            await runtime.areconcile(
+                execution_record_id,
+                deadline=datetime.now(timezone.utc) + timedelta(milliseconds=30),
+            )
+
+        assert runtime.reconciliation_ledger is not None
+        attempts = runtime.reconciliation_ledger.attempts(execution_record_id)
+        assert len(attempts) == 2
+        assert attempts[0].payload["attempt_id"] == attempts[1].payload["attempt_id"]
+        assert (
+            attempts[1].payload["outcome"]
+            == ReconciliationAttemptOutcome.TIMEOUT.value
+        )
+    finally:
+        await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_finish_keeps_finalization_running(
+    tmp_path: Path,
+) -> None:
+    class BlockingFinishLedger(SQLiteReconciliationLedger):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.finished = threading.Event()
+
+        def finish_attempt(self, *args: object, **kwargs: object) -> object:
+            self.entered.set()
+            if not self.release.wait(timeout=2):
+                raise RuntimeError("test finalizer was not released")
+            result = super().finish_attempt(*args, **kwargs)
+            self.finished.set()
+            return result
+
+    path = tmp_path / "cancel-finalization.db"
+    ledger = BlockingFinishLedger(path)
+    runtime = Runtime(
+        idempotency_store=SQLiteIdempotencyStore(path),
+        reconciliation_ledger=ledger,
+        limits=RuntimeLimits(reconciliation_finalization_timeout_seconds=1.0),
+    )
+
+    async def provider(
+        context: ReconciliationAttemptContext,
+    ) -> ReconciliationFinding:
+        return ReconciliationFinding(
+            proposed_state=ReconciliationState.CONFIRMED_SUCCEEDED,
+            evidence_kind="receipt",
+            evidence={"receipt_id": "receipt-1"},
+            observed_at=context.deadline,
+        )
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        reconciliation_provider=ProviderDescriptor(
+            provider_id="cancel-provider",
+            protocol_version="1",
+            supported_evidence_kinds=("receipt",),
+            provider=provider,
+        ),
+    )
+    async def charge() -> None:
+        raise TimeoutError("outcome is uncertain")
+
+    try:
+        with pytest.raises(ToolExecutionError) as failed:
+            await runtime.arun(
+                "charge", _governance=InvocationOptions(idempotency_key="request-1")
+            )
+        execution_record_id = failed.value.execution_record_id
+        assert execution_record_id is not None
+
+        reconciliation = asyncio.create_task(runtime.areconcile(execution_record_id))
+        assert await asyncio.to_thread(ledger.entered.wait, 1.0)
+        reconciliation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await reconciliation
+
+        ledger.release.set()
+        assert await asyncio.to_thread(ledger.finished.wait, 1.0)
+        attempts = ledger.attempts(execution_record_id)
+        assert len(attempts) == 2
+        assert attempts[0].payload["attempt_id"] == attempts[1].payload["attempt_id"]
+        assert attempts[1].payload["outcome"] == ReconciliationAttemptOutcome.SUCCESS.value
+    finally:
+        ledger.release.set()
+        await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_finalization_timeout_poison_reconciliation_fail_closed(
+    tmp_path: Path,
+) -> None:
+    class BlockingFinishLedger(SQLiteReconciliationLedger):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.finished = threading.Event()
+
+        def finish_attempt(self, *args: object, **kwargs: object) -> object:
+            self.entered.set()
+            if not self.release.wait(timeout=2):
+                raise RuntimeError("test finalizer was not released")
+            result = super().finish_attempt(*args, **kwargs)
+            self.finished.set()
+            return result
+
+    path = tmp_path / "timed-out-finalization.db"
+    ledger = BlockingFinishLedger(path)
+    runtime = Runtime(
+        idempotency_store=SQLiteIdempotencyStore(path),
+        reconciliation_ledger=ledger,
+        limits=RuntimeLimits(
+            reconciliation_operation_timeout_seconds=0.2,
+            reconciliation_finalization_timeout_seconds=0.01,
+        ),
+    )
+
+    async def provider(
+        context: ReconciliationAttemptContext,
+    ) -> ReconciliationFinding:
+        return ReconciliationFinding(
+            proposed_state=ReconciliationState.CONFIRMED_SUCCEEDED,
+            evidence_kind="receipt",
+            evidence={"receipt_id": "receipt-1"},
+            observed_at=context.deadline,
+        )
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        reconciliation_provider=ProviderDescriptor(
+            provider_id="timeout-provider",
+            protocol_version="1",
+            supported_evidence_kinds=("receipt",),
+            provider=provider,
+        ),
+    )
+    async def charge() -> None:
+        raise TimeoutError("outcome is uncertain")
+
+    try:
+        with pytest.raises(ToolExecutionError) as failed:
+            await runtime.arun(
+                "charge", _governance=InvocationOptions(idempotency_key="request-1")
+            )
+        execution_record_id = failed.value.execution_record_id
+        assert execution_record_id is not None
+
+        with pytest.raises(StageTimeoutError, match="reconciliation finish attempt"):
+            await runtime.areconcile(execution_record_id)
+        assert ledger.entered.is_set()
+        assert len(ledger.attempts(execution_record_id)) == 1
+        with pytest.raises(ReconciliationConflictError, match="disabled"):
+            await runtime.areconcile(execution_record_id)
+
+        ledger.release.set()
+        assert await asyncio.to_thread(ledger.finished.wait, 1.0)
+    finally:
+        ledger.release.set()
+        await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_finalization_storage_failure_poison_reconciliation(
+    tmp_path: Path,
+) -> None:
+    class FailingFinishLedger(SQLiteReconciliationLedger):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.fail_once = True
+
+        def finish_attempt(self, *args: object, **kwargs: object) -> object:
+            if self.fail_once:
+                self.fail_once = False
+                raise sqlite3.OperationalError("simulated finalization storage failure")
+            return super().finish_attempt(*args, **kwargs)
+
+    path = tmp_path / "failing-finalization.db"
+    ledger = FailingFinishLedger(path)
+    runtime = Runtime(
+        idempotency_store=SQLiteIdempotencyStore(path),
+        reconciliation_ledger=ledger,
+    )
+
+    async def provider(
+        context: ReconciliationAttemptContext,
+    ) -> ReconciliationFinding:
+        return ReconciliationFinding(
+            proposed_state=ReconciliationState.CONFIRMED_SUCCEEDED,
+            evidence_kind="receipt",
+            evidence={"receipt_id": "receipt-1"},
+            observed_at=context.deadline,
+        )
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        reconciliation_provider=ProviderDescriptor(
+            provider_id="failing-finalizer-provider",
+            protocol_version="1",
+            supported_evidence_kinds=("receipt",),
+            provider=provider,
+        ),
+    )
+    async def charge() -> None:
+        raise TimeoutError("outcome is uncertain")
+
+    try:
+        with pytest.raises(ToolExecutionError) as failed:
+            await runtime.arun(
+                "charge", _governance=InvocationOptions(idempotency_key="request-1")
+            )
+        execution_record_id = failed.value.execution_record_id
+        assert execution_record_id is not None
+
+        with pytest.raises(sqlite3.OperationalError, match="simulated finalization"):
+            await runtime.areconcile(execution_record_id)
+        await asyncio.sleep(0)
+        with pytest.raises(ReconciliationConflictError, match="disabled"):
+            await runtime.areconcile(execution_record_id)
+    finally:
+        await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_finalization_conflict_without_durable_progress_poisons_reconciliation(
+    tmp_path: Path,
+) -> None:
+    class ConflictingFinishLedger(SQLiteReconciliationLedger):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.conflict_once = True
+
+        def finish_attempt(self, *args: object, **kwargs: object) -> object:
+            if self.conflict_once:
+                self.conflict_once = False
+                raise ReconciliationConflictError("simulated concurrent resolution")
+            return super().finish_attempt(*args, **kwargs)
+
+    path = tmp_path / "conflicting-finalization.db"
+    ledger = ConflictingFinishLedger(path)
+    runtime = Runtime(
+        idempotency_store=SQLiteIdempotencyStore(path),
+        reconciliation_ledger=ledger,
+    )
+
+    async def provider(
+        context: ReconciliationAttemptContext,
+    ) -> ReconciliationFinding:
+        return ReconciliationFinding(
+            proposed_state=ReconciliationState.CONFIRMED_SUCCEEDED,
+            evidence_kind="receipt",
+            evidence={"receipt_id": "receipt-1"},
+            observed_at=context.deadline,
+        )
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        reconciliation_provider=ProviderDescriptor(
+            provider_id="conflict-provider",
+            protocol_version="1",
+            supported_evidence_kinds=("receipt",),
+            provider=provider,
+        ),
+    )
+    async def charge() -> None:
+        raise TimeoutError("outcome is uncertain")
+
+    try:
+        with pytest.raises(ToolExecutionError) as failed:
+            await runtime.arun(
+                "charge", _governance=InvocationOptions(idempotency_key="request-1")
+            )
+        execution_record_id = failed.value.execution_record_id
+        assert execution_record_id is not None
+
+        with pytest.raises(ReconciliationConflictError, match="simulated concurrent"):
+            await runtime.areconcile(execution_record_id)
+        await asyncio.sleep(0)
+        assert len(ledger.attempts(execution_record_id)) == 1
+        with pytest.raises(ReconciliationConflictError, match="disabled"):
+            await runtime.areconcile(execution_record_id)
+    finally:
+        await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_restart_quarantines_an_expired_unfinished_provider_attempt(
+    tmp_path: Path,
+) -> None:
+    class FailingFinishLedger(SQLiteReconciliationLedger):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.fail_once = True
+
+        def finish_attempt(self, *args: object, **kwargs: object) -> object:
+            if self.fail_once:
+                self.fail_once = False
+                raise sqlite3.OperationalError("simulated finalization storage failure")
+            return super().finish_attempt(*args, **kwargs)
+
+    path = tmp_path / "restart-unfinished-attempt.db"
+    calls: list[str] = []
+    limits = RuntimeLimits(reconciliation_provider_timeout_seconds=0.02)
+    first = Runtime(
+        idempotency_store=SQLiteIdempotencyStore(path),
+        reconciliation_ledger=FailingFinishLedger(path),
+        limits=limits,
+    )
+
+    async def provider(
+        context: ReconciliationAttemptContext,
+    ) -> ReconciliationFinding:
+        calls.append(context.attempt_id)
+        return ReconciliationFinding(
+            proposed_state=ReconciliationState.CONFIRMED_SUCCEEDED,
+            evidence_kind="receipt",
+            evidence={"receipt_id": "receipt-1"},
+            observed_at=context.deadline,
+        )
+
+    descriptor = ProviderDescriptor(
+        provider_id="restart-recovery-provider",
+        protocol_version="1",
+        supported_evidence_kinds=("receipt",),
+        provider=provider,
+    )
+
+    @first.tool(
+        name="charge",
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        reconciliation_provider=descriptor,
+    )
+    async def charge_first() -> None:
+        raise TimeoutError("outcome is uncertain")
+
+    recovery: Runtime | None = None
+    try:
+        with pytest.raises(ToolExecutionError) as failed:
+            await first.arun(
+                "charge", _governance=InvocationOptions(idempotency_key="request-1")
+            )
+        execution_record_id = failed.value.execution_record_id
+        assert execution_record_id is not None
+        with pytest.raises(sqlite3.OperationalError, match="simulated finalization"):
+            await first.areconcile(execution_record_id)
+        assert len(calls) == 1
+    finally:
+        await first.aclose()
+
+    await asyncio.sleep(0.05)
+    recovery = Runtime(
+        idempotency_store=SQLiteIdempotencyStore(path),
+        reconciliation_ledger=SQLiteReconciliationLedger(path),
+        limits=limits,
+    )
+
+    @recovery.tool(
+        name="charge",
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        reconciliation_provider=descriptor,
+    )
+    async def charge_recovery() -> None:
+        raise TimeoutError("outcome is uncertain")
+
+    try:
+        head = await recovery.areconcile(execution_record_id)
+        assert head.state is ReconciliationState.MANUAL_REVIEW
+        assert len(calls) == 1
+        attempts = recovery.reconciliation_ledger.attempts(execution_record_id)  # type: ignore[union-attr]
+        assert [record.kind.value for record in attempts] == [
+            "ATTEMPT_STARTED",
+            "ATTEMPT_FINISHED",
+        ]
+        assert (
+            attempts[1].payload["outcome"]
+            == ReconciliationAttemptOutcome.RECOVERY_REQUIRED.value
+        )
+    finally:
+        await recovery.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_outbox_delivery_keeps_reconciliation_recoverable(
+    tmp_path: Path,
+) -> None:
+    class BlockingIdempotentSink:
+        reconciliation_delivery_idempotent = True
+
+        def __init__(self) -> None:
+            self.block = False
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.completed = threading.Event()
+            self.events: dict[str, dict[str, object]] = {}
+
+        def write_idempotent(self, source_event_id: str, event: object) -> None:
+            if self.block:
+                self.entered.set()
+                if not self.release.wait(timeout=2):
+                    raise RuntimeError("test audit delivery was not released")
+                self.completed.set()
+            assert isinstance(event, dict)
+            self.events.setdefault(source_event_id, dict(event))
+
+        def write(self, event: object) -> None:
+            self.write_idempotent("non-reconciliation", event)
+
+    path = tmp_path / "cancelled-outbox-delivery.db"
+    sink = BlockingIdempotentSink()
+    runtime = Runtime(
+        [AuditMiddleware(sink, fail_closed=True)],  # type: ignore[arg-type]
+        idempotency_store=SQLiteIdempotencyStore(path),
+        reconciliation_ledger=SQLiteReconciliationLedger(path),
+    )
+
+    async def provider(
+        context: ReconciliationAttemptContext,
+    ) -> ReconciliationFinding:
+        return ReconciliationFinding(
+            proposed_state=ReconciliationState.CONFIRMED_SUCCEEDED,
+            evidence_kind="receipt",
+            evidence={"receipt_id": "receipt-1"},
+            observed_at=context.deadline,
+        )
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        reconciliation_provider=ProviderDescriptor(
+            provider_id="audit-cancellation-provider",
+            protocol_version="1",
+            supported_evidence_kinds=("receipt",),
+            provider=provider,
+        ),
+    )
+    async def charge() -> None:
+        raise TimeoutError("outcome is uncertain")
+
+    try:
+        with pytest.raises(ToolExecutionError) as failed:
+            await runtime.arun(
+                "charge", _governance=InvocationOptions(idempotency_key="request-1")
+            )
+        execution_record_id = failed.value.execution_record_id
+        assert execution_record_id is not None
+
+        sink.completed.clear()
+        sink.block = True
+        reconciliation = asyncio.create_task(runtime.areconcile(execution_record_id))
+        assert await asyncio.to_thread(sink.entered.wait, 1.0)
+        reconciliation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await reconciliation
+
+        sink.block = False
+        sink.release.set()
+        assert await asyncio.to_thread(sink.completed.wait, 1.0)
+        await asyncio.sleep(0)
+
+        recovered = await runtime.areconcile(execution_record_id)
+        assert recovered.state is ReconciliationState.CONFIRMED_SUCCEEDED
+        assert runtime._reconciliation_poison is None
+    finally:
+        sink.block = False
+        sink.release.set()
+        await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_timed_out_outbox_delivery_recovers_without_poisoning_ledger(
+    tmp_path: Path,
+) -> None:
+    class BlockingIdempotentSink:
+        reconciliation_delivery_idempotent = True
+
+        def __init__(self) -> None:
+            self.block = False
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.completed = threading.Event()
+            self.events: dict[str, dict[str, object]] = {}
+
+        def write_idempotent(self, source_event_id: str, event: object) -> None:
+            if self.block:
+                self.entered.set()
+                if not self.release.wait(timeout=2):
+                    raise RuntimeError("test audit delivery was not released")
+            assert isinstance(event, dict)
+            self.events.setdefault(source_event_id, dict(event))
+            self.completed.set()
+
+        def write(self, event: object) -> None:
+            self.write_idempotent("non-reconciliation", event)
+
+    path = tmp_path / "timed-out-outbox-delivery.db"
+    sink = BlockingIdempotentSink()
+    provider_calls = 0
+    runtime = Runtime(
+        [AuditMiddleware(sink, fail_closed=True)],  # type: ignore[arg-type]
+        idempotency_store=SQLiteIdempotencyStore(path),
+        reconciliation_ledger=SQLiteReconciliationLedger(path),
+        limits=RuntimeLimits(
+            reconciliation_audit_delivery_timeout_seconds=0.01,
+            max_reconciliation_audit_delivery_in_flight=1,
+        ),
+    )
+
+    async def provider(
+        context: ReconciliationAttemptContext,
+    ) -> ReconciliationFinding:
+        nonlocal provider_calls
+        provider_calls += 1
+        return ReconciliationFinding(
+            proposed_state=ReconciliationState.CONFIRMED_SUCCEEDED,
+            evidence_kind="receipt",
+            evidence={"receipt_id": "receipt-1"},
+            observed_at=context.deadline,
+        )
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        reconciliation_provider=ProviderDescriptor(
+            provider_id="timed-out-audit-provider",
+            protocol_version="1",
+            supported_evidence_kinds=("receipt",),
+            provider=provider,
+        ),
+    )
+    async def charge() -> None:
+        raise TimeoutError("outcome is uncertain")
+
+    try:
+        with pytest.raises(ToolExecutionError) as failed:
+            await runtime.arun(
+                "charge", _governance=InvocationOptions(idempotency_key="request-1")
+            )
+        execution_record_id = failed.value.execution_record_id
+        assert execution_record_id is not None
+
+        sink.completed.clear()
+        sink.block = True
+        with pytest.raises(ReconciliationAuditDeliveryPendingError) as pending:
+            await runtime.areconcile(
+                execution_record_id,
+                deadline=datetime.now(timezone.utc) + timedelta(seconds=2),
+            )
+        assert pending.value.execution_record_id == execution_record_id
+        assert await asyncio.to_thread(sink.entered.wait, 1.0)
+        assert runtime._reconciliation_poison is None
+        assert provider_calls == 1
+
+        sink.block = False
+        sink.release.set()
+        assert await asyncio.to_thread(sink.completed.wait, 1.0)
+        delivered = await runtime.adrain_reconciliation_audit_outbox(limit=16)
+        assert delivered == 3
+        assert runtime._reconciliation_poison is None
+        assert provider_calls == 1
+        reconciliation_events = [
+            event
+            for event in sink.events.values()
+            if event.get("stage") == "reconciliation"
+        ]
+        assert len(reconciliation_events) == 4
+    finally:
+        sink.block = False
+        sink.release.set()
+        await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_aclose_does_not_wait_for_a_timed_out_audit_sink_thread(
+    tmp_path: Path,
+) -> None:
+    class BlockingIdempotentSink:
+        reconciliation_delivery_idempotent = True
+
+        def __init__(self) -> None:
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.completed = threading.Event()
+
+        def write_idempotent(self, _source_event_id: str, _event: object) -> None:
+            self.entered.set()
+            self.release.wait()
+            self.completed.set()
+
+        def write(self, event: object) -> None:
+            self.write_idempotent("non-reconciliation", event)
+
+    path = tmp_path / "aclose-timed-out-audit-sink.db"
+    producer = _runtime(path)
+
+    @producer.tool(execution_mode=ExecutionMode.IDEMPOTENT)
+    async def charge() -> None:
+        raise TimeoutError("outcome is uncertain")
+
+    try:
+        with pytest.raises(ToolExecutionError):
+            await producer.arun(
+                "charge", _governance=InvocationOptions(idempotency_key="request-1")
+            )
+    finally:
+        await producer.aclose()
+
+    sink = BlockingIdempotentSink()
+    runtime = Runtime(
+        [AuditMiddleware(sink, fail_closed=True)],
+        idempotency_store=SQLiteIdempotencyStore(path),
+        reconciliation_ledger=SQLiteReconciliationLedger(path),
+        limits=RuntimeLimits(reconciliation_audit_delivery_timeout_seconds=0.03),
+    )
+    close_task: asyncio.Task[None] | None = None
+    try:
+        with pytest.raises(ReconciliationAuditDeliveryPendingError):
+            await runtime.adrain_reconciliation_audit_outbox(limit=1)
+        assert await asyncio.to_thread(sink.entered.wait, 1.0)
+        assert not sink.completed.is_set()
+
+        close_task = asyncio.create_task(runtime.aclose())
+        await asyncio.wait_for(asyncio.shield(close_task), timeout=0.5)
+    finally:
+        sink.release.set()
+        assert await asyncio.to_thread(sink.completed.wait, 1.0)
+        if close_task is None:
+            await runtime.aclose()
+        else:
+            await asyncio.wait_for(close_task, timeout=2.0)
+
+
+def test_blocked_reconciliation_audit_sink_cannot_hold_python_process_open() -> None:
+    """A durable, idempotent outbox makes abandoned daemon delivery safe."""
+
+    script = textwrap.dedent(
+        """
+        import asyncio
+        import tempfile
+        import threading
+        from pathlib import Path
+
+        from agent_runtime_governance import (
+            AuditMiddleware,
+            ExecutionMode,
+            InvocationOptions,
+            ReconciliationAuditDeliveryPendingError,
+            Runtime,
+            RuntimeLimits,
+            SQLiteIdempotencyStore,
+            SQLiteReconciliationLedger,
+            ToolExecutionError,
+        )
+
+
+        class BlockingSink:
+            reconciliation_delivery_idempotent = True
+
+            def write_idempotent(self, _source_event_id, _event):
+                threading.Event().wait()
+
+            def write(self, event):
+                self.write_idempotent("non-reconciliation", event)
+
+
+        async def main():
+            with tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "runtime.db"
+                producer = Runtime(
+                    idempotency_store=SQLiteIdempotencyStore(path),
+                    reconciliation_ledger=SQLiteReconciliationLedger(path),
+                )
+
+                @producer.tool(execution_mode=ExecutionMode.IDEMPOTENT)
+                async def charge():
+                    raise TimeoutError("outcome is uncertain")
+
+                try:
+                    try:
+                        await producer.arun(
+                            "charge",
+                            _governance=InvocationOptions(idempotency_key="request-1"),
+                        )
+                    except ToolExecutionError:
+                        pass
+                finally:
+                    await producer.aclose()
+
+                runtime = Runtime(
+                    [AuditMiddleware(BlockingSink(), fail_closed=True)],
+                    idempotency_store=SQLiteIdempotencyStore(path),
+                    reconciliation_ledger=SQLiteReconciliationLedger(path),
+                    limits=RuntimeLimits(
+                        reconciliation_audit_delivery_timeout_seconds=0.03
+                    ),
+                )
+                try:
+                    try:
+                        await runtime.adrain_reconciliation_audit_outbox(limit=1)
+                    except ReconciliationAuditDeliveryPendingError:
+                        pass
+                finally:
+                    await runtime.aclose()
+
+
+        asyncio.run(main())
+        print("runtime-closed")
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=3,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "runtime-closed"
+
+
+@pytest.mark.asyncio
+async def test_global_audit_recovery_honors_its_caller_deadline(
+    tmp_path: Path,
+) -> None:
+    class BlockingIdempotentSink:
+        reconciliation_delivery_idempotent = True
+
+        def __init__(self) -> None:
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.completed = threading.Event()
+
+        def write_idempotent(self, _source_event_id: str, _event: object) -> None:
+            self.entered.set()
+            if not self.release.wait(timeout=0.5):
+                raise RuntimeError("test audit sink was not released")
+            self.completed.set()
+
+        def write(self, event: object) -> None:
+            self.write_idempotent("non-reconciliation", event)
+
+    path = tmp_path / "global-audit-recovery-deadline.db"
+    producer = _runtime(path)
+
+    @producer.tool(execution_mode=ExecutionMode.IDEMPOTENT)
+    async def charge() -> None:
+        raise TimeoutError("outcome is uncertain")
+
+    try:
+        with pytest.raises(ToolExecutionError):
+            await producer.arun(
+                "charge", _governance=InvocationOptions(idempotency_key="request-1")
+            )
+    finally:
+        await producer.aclose()
+
+    sink = BlockingIdempotentSink()
+    runtime = Runtime(
+        [AuditMiddleware(sink, fail_closed=True)],
+        idempotency_store=SQLiteIdempotencyStore(path),
+        reconciliation_ledger=SQLiteReconciliationLedger(path),
+        limits=RuntimeLimits(reconciliation_audit_delivery_timeout_seconds=1.0),
+    )
+    try:
+        started_at = monotonic()
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=0.04)
+        with pytest.raises(StageTimeoutError, match="reconciliation audit delivery"):
+            await runtime.adrain_reconciliation_audit_outbox(
+                limit=1, deadline=deadline
+            )
+        assert monotonic() - started_at < 0.25
+        assert await asyncio.to_thread(sink.entered.wait, 1.0)
+
+        sink.release.set()
+        assert await asyncio.to_thread(sink.completed.wait, 1.0)
+        assert await runtime.adrain_reconciliation_audit_outbox(limit=1) == 1
+    finally:
+        sink.release.set()
+        await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_public_reconciliation_deadline_rejects_naive_datetimes(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "naive-reconciliation-deadline.db"
+    producer = _runtime(path)
+
+    @producer.tool(execution_mode=ExecutionMode.IDEMPOTENT)
+    async def charge() -> None:
+        raise TimeoutError("outcome is uncertain")
+
+    try:
+        with pytest.raises(ToolExecutionError):
+            await producer.arun(
+                "charge", _governance=InvocationOptions(idempotency_key="request-1")
+            )
+    finally:
+        await producer.aclose()
+
+    runtime = Runtime(
+        [AuditMiddleware(InMemoryAuditSink())],
+        idempotency_store=SQLiteIdempotencyStore(path),
+        reconciliation_ledger=SQLiteReconciliationLedger(path),
+    )
+    try:
+        with pytest.raises(ValueError, match="deadline must be timezone-aware"):
+            await runtime.adrain_reconciliation_audit_outbox(
+                deadline=datetime.now()
+            )
+    finally:
+        await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_audit_delivery_honors_its_caller_deadline(
+    tmp_path: Path,
+) -> None:
+    class BlockingIdempotentSink:
+        reconciliation_delivery_idempotent = True
+
+        def __init__(self) -> None:
+            self.block = False
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.completed = threading.Event()
+            self.events: dict[str, dict[str, object]] = {}
+
+        def write_idempotent(self, source_event_id: str, event: object) -> None:
+            if self.block:
+                self.entered.set()
+                if not self.release.wait(timeout=0.5):
+                    raise RuntimeError("test audit sink was not released")
+                self.completed.set()
+            assert isinstance(event, dict)
+            self.events.setdefault(source_event_id, dict(event))
+
+        def write(self, event: object) -> None:
+            self.write_idempotent("non-reconciliation", event)
+
+    path = tmp_path / "reconciliation-audit-deadline.db"
+    sink = BlockingIdempotentSink()
+    runtime = Runtime(
+        [AuditMiddleware(sink, fail_closed=True)],
+        idempotency_store=SQLiteIdempotencyStore(path),
+        reconciliation_ledger=SQLiteReconciliationLedger(path),
+        limits=RuntimeLimits(reconciliation_audit_delivery_timeout_seconds=1.0),
+    )
+
+    async def provider(
+        context: ReconciliationAttemptContext,
+    ) -> ReconciliationFinding:
+        return ReconciliationFinding(
+            proposed_state=ReconciliationState.CONFIRMED_SUCCEEDED,
+            evidence_kind="receipt",
+            evidence={"receipt_id": "receipt-1"},
+            observed_at=context.deadline,
+        )
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        reconciliation_provider=ProviderDescriptor(
+            provider_id="audit-deadline-provider",
+            protocol_version="1",
+            supported_evidence_kinds=("receipt",),
+            provider=provider,
+        ),
+    )
+    async def charge() -> None:
+        raise TimeoutError("outcome is uncertain")
+
+    try:
+        with pytest.raises(ToolExecutionError) as failed:
+            await runtime.arun(
+                "charge", _governance=InvocationOptions(idempotency_key="request-1")
+            )
+        execution_record_id = failed.value.execution_record_id
+        assert execution_record_id is not None
+        sink.block = True
+
+        started_at = monotonic()
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=0.04)
+        with pytest.raises(StageTimeoutError, match="reconciliation audit delivery"):
+            await runtime.areconcile(execution_record_id, deadline=deadline)
+        assert monotonic() - started_at < 0.25
+        assert await asyncio.to_thread(sink.entered.wait, 1.0)
+
+        head = runtime.reconciliation_ledger.current(execution_record_id)  # type: ignore[union-attr]
+        assert head.state is ReconciliationState.CONFIRMED_SUCCEEDED
+        sink.block = False
+        sink.release.set()
+        assert await asyncio.to_thread(sink.completed.wait, 1.0)
+        assert await runtime.adrain_reconciliation_audit_outbox(limit=16) == 3
+    finally:
+        sink.block = False
+        sink.release.set()
+        await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_recovery_runtime_drains_persisted_outbox_after_restart(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "outbox-recovery-restart.db"
+    producer = _runtime(path)
+
+    async def provider(
+        context: ReconciliationAttemptContext,
+    ) -> ReconciliationFinding:
+        return ReconciliationFinding(
+            proposed_state=ReconciliationState.CONFIRMED_SUCCEEDED,
+            evidence_kind="receipt",
+            evidence={"receipt_id": "receipt-1"},
+            observed_at=context.deadline,
+        )
+
+    @producer.tool(
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        reconciliation_provider=ProviderDescriptor(
+            provider_id="restart-recovery-provider",
+            protocol_version="1",
+            supported_evidence_kinds=("receipt",),
+            provider=provider,
+        ),
+    )
+    async def charge() -> None:
+        raise TimeoutError("outcome is uncertain")
+
+    try:
+        with pytest.raises(ToolExecutionError) as failed:
+            await producer.arun(
+                "charge", _governance=InvocationOptions(idempotency_key="request-1")
+            )
+        execution_record_id = failed.value.execution_record_id
+        assert execution_record_id is not None
+        assert (
+            await producer.areconcile(execution_record_id)
+        ).state is ReconciliationState.CONFIRMED_SUCCEEDED
+    finally:
+        await producer.aclose()
+
+    sink = SQLiteAuditSink(tmp_path / "recovered-audit.db", sign_key=b"a" * 32)
+    recovery = Runtime(
+        [AuditMiddleware(sink, fail_closed=True)],
+        idempotency_store=SQLiteIdempotencyStore(path),
+        reconciliation_ledger=SQLiteReconciliationLedger(path),
+    )
+    try:
+        assert await recovery.adrain_reconciliation_audit_outbox(limit=2) == 2
+        assert await recovery.adrain_reconciliation_audit_outbox(limit=16) == 2
+        events = [
+            event
+            for event in sink.read_verified()
+            if event.get("stage") == "reconciliation"
+        ]
+        assert [event["event_type"] for event in events] == [
+            "unknown_recorded",
+            "attempt_started",
+            "attempt_finished",
+            "transition_recorded",
+        ]
+    finally:
+        await recovery.aclose()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_recovery_workers_deduplicate_outbox_delivery(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "outbox-concurrent-recovery.db"
+    producer = _runtime(path)
+
+    async def provider(
+        context: ReconciliationAttemptContext,
+    ) -> ReconciliationFinding:
+        return ReconciliationFinding(
+            proposed_state=ReconciliationState.CONFIRMED_SUCCEEDED,
+            evidence_kind="receipt",
+            evidence={"receipt_id": "receipt-1"},
+            observed_at=context.deadline,
+        )
+
+    @producer.tool(
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        reconciliation_provider=ProviderDescriptor(
+            provider_id="concurrent-recovery-provider",
+            protocol_version="1",
+            supported_evidence_kinds=("receipt",),
+            provider=provider,
+        ),
+    )
+    async def charge() -> None:
+        raise TimeoutError("outcome is uncertain")
+
+    try:
+        with pytest.raises(ToolExecutionError) as failed:
+            await producer.arun(
+                "charge", _governance=InvocationOptions(idempotency_key="request-1")
+            )
+        execution_record_id = failed.value.execution_record_id
+        assert execution_record_id is not None
+        await producer.areconcile(execution_record_id)
+    finally:
+        await producer.aclose()
+
+    audit_path = tmp_path / "concurrent-recovered-audit.db"
+    first = Runtime(
+        [AuditMiddleware(SQLiteAuditSink(audit_path, sign_key=b"a" * 32), fail_closed=True)],
+        idempotency_store=SQLiteIdempotencyStore(path),
+        reconciliation_ledger=SQLiteReconciliationLedger(path),
+    )
+    second = Runtime(
+        [AuditMiddleware(SQLiteAuditSink(audit_path, sign_key=b"a" * 32), fail_closed=True)],
+        idempotency_store=SQLiteIdempotencyStore(path),
+        reconciliation_ledger=SQLiteReconciliationLedger(path),
+    )
+    try:
+        await asyncio.gather(
+            first.adrain_reconciliation_audit_outbox(limit=16),
+            second.adrain_reconciliation_audit_outbox(limit=16),
+        )
+        sink = SQLiteAuditSink(audit_path, sign_key=b"a" * 32)
+        events = [
+            event
+            for event in sink.read_verified()
+            if event.get("stage") == "reconciliation"
+        ]
+        assert [event["event_type"] for event in events] == [
+            "unknown_recorded",
+            "attempt_started",
+            "attempt_finished",
+            "transition_recorded",
+        ]
+        assert len({event["reconciliation_audit_id"] for event in events}) == 4
+    finally:
+        await first.aclose()
+        await second.aclose()

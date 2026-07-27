@@ -38,6 +38,7 @@ from .errors import (
     GovernanceCancelledError,
     GovernanceDenied,
     GovernanceError,
+    ReconciliationAuditDeliveryPendingError,
     RegistryError,
     ToolExecutionError,
     get_cancellation_context,
@@ -115,6 +116,7 @@ from .reconciliation import (
     ProviderDescriptor,
     ReconciliationAttemptContext,
     ReconciliationAttemptOutcome,
+    ReconciliationAuditEnvelope,
     ReconciliationConflictError,
     ReconciliationDisposition,
     ReconciliationError,
@@ -168,7 +170,7 @@ from .telemetry import OpenTelemetryMiddleware
 from .visualization import trace_to_mermaid
 from .yaml_policy import PolicyDocument, PolicyValidationError, YAMLPolicyLoader
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 __all__ = [
     "ActionContract",
@@ -257,8 +259,10 @@ __all__ = [
     "PrometheusPlugin",
     "RegisteredPlugin",
     "RegistryError",
+    "ReconciliationAuditDeliveryPendingError",
     "ReconciliationAttemptContext",
     "ReconciliationAttemptOutcome",
+    "ReconciliationAuditEnvelope",
     "ReconciliationConflictError",
     "ReconciliationDisposition",
     "ReconciliationError",

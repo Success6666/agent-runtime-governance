@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from dataclasses import FrozenInstanceError
 from typing import Any, Mapping
 
@@ -16,7 +15,6 @@ from agent_runtime_governance import (
     GovernanceDenied,
     HumanDecisionProvider,
     InvocationOptions,
-    JSONLAuditSink,
     PolicyMiddleware,
     ProductionProfile,
     ProductionReadinessError,
@@ -26,6 +24,7 @@ from agent_runtime_governance import (
     RuntimeLimits,
     SimplePolicy,
     SQLiteApprovalStore,
+    SQLiteAuditSink,
     SQLiteIdempotencyStore,
     SQLiteReconciliationLedger,
     StaticIdentityProvider,
@@ -93,6 +92,10 @@ class RecordingIdempotencyStore(SQLiteIdempotencyStore):
     def acquire(self, namespace: str, key: str, fingerprint: str):
         self.acquisitions.append((namespace, key, fingerprint))
         return super().acquire(namespace, key, fingerprint)
+
+    def acquire_prepared(self, namespace: str, key: str, fingerprint: str, action):
+        self.acquisitions.append((namespace, key, fingerprint))
+        return super().acquire_prepared(namespace, key, fingerprint, action)
 
 
 def _principal() -> VerifiedPrincipal:
@@ -172,9 +175,9 @@ def _runtime(
     precondition_provider: MutablePreconditionProvider | None = None,
     middlewares=(),
     idempotency_store=None,
-) -> tuple[Runtime, JSONLAuditSink, RotatingKeyProvider]:
+) -> tuple[Runtime, SQLiteAuditSink, RotatingKeyProvider]:
     keys = key_provider or RotatingKeyProvider()
-    sink = JSONLAuditSink(tmp_path / "audit.jsonl", sign_key=b"a" * 32)
+    sink = SQLiteAuditSink(tmp_path / "audit.db", sign_key=b"a" * 32)
     store = idempotency_store or RecordingIdempotencyStore(
         tmp_path / "idempotency.db"
     )
@@ -786,7 +789,7 @@ async def test_v05_approval_fails_closed_for_contracted_tool(tmp_path) -> None:
 
 
 def test_audit_bound_action_never_duplicates_raw_parameters(tmp_path) -> None:
-    runtime, _, _ = _runtime(tmp_path)
+    runtime, sink, _ = _runtime(tmp_path)
 
     @runtime.tool(
         name="operate",
@@ -799,10 +802,7 @@ def test_audit_bound_action_never_duplicates_raw_parameters(tmp_path) -> None:
     runtime.seal_production()
     result = runtime.invoke("operate", "node-a")
     assert result is True
-    records = [
-        json.loads(line)
-        for line in (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()
-    ]
+    records = sink.read_verified()
     assert all(
         "parameters" not in record["context"]["bound_action"]
         for record in records

@@ -6,7 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from agent_runtime_governance import JSONLAuditSink
+from agent_runtime_governance import SQLiteAuditSink
 
 
 def test_strict_action_contract_example_runs_with_real_policy_artifact(
@@ -44,9 +44,7 @@ def test_strict_action_contract_example_runs_with_real_policy_artifact(
     assert first.stdout == second.stdout
     assert json.loads(first.stdout) == {"enabled": True, "service": "worker"}
     assert (tmp_path / "worker.state").read_text(encoding="utf-8") == "enabled"
-    events = JSONLAuditSink(
-        tmp_path / "audit.jsonl", sign_key=audit_key
-    ).read_verified()
+    events = SQLiteAuditSink(tmp_path / "audit.db", sign_key=audit_key).read_verified()
     assert events
     assert all(event["action_digest"] for event in events)
     assert {event["context"]["metadata"]["policy_version"] for event in events} == {
