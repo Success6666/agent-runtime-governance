@@ -1669,8 +1669,7 @@ class Runtime:
         to the trusted runtime worker.
         """
 
-        if self._closed:
-            raise RuntimeError("runtime is closed")
+        self._assert_accepting_work()
         if self.production_profile is not None and not self._production_sealed:
             raise ProductionReadinessError(self.production_readiness())
         if type(limit) is not int or not 1 <= limit <= 1_000:
@@ -1744,8 +1743,7 @@ class Runtime:
     ) -> ReconciliationHead:
         """Apply a verified operator decision to a MANUAL_REVIEW execution."""
 
-        if self._closed:
-            raise RuntimeError("runtime is closed")
+        self._assert_accepting_work()
         if self.production_profile is not None and not self._production_sealed:
             raise ProductionReadinessError(self.production_readiness())
         ledger = self.reconciliation_ledger
@@ -3124,6 +3122,8 @@ class Runtime:
             future.add_done_callback(lambda _completed: lease.release())
             task.add_done_callback(self._consume_background_result)
             raise error
+        except StageTimeoutError:
+            raise
         except BaseException:
             if task is not None and not task.done():
                 deferred_release = True
@@ -3168,6 +3168,8 @@ class Runtime:
             )
             task.add_done_callback(self._consume_background_result)
             raise error
+        except StageTimeoutError:
+            raise
         except BaseException:
             if task is not None and not task.done():
                 self._suspend_reconciliation()
