@@ -676,8 +676,8 @@ def test_colocated_ledger_rejects_mismatched_action_identity(tmp_path: Path) -> 
         ledger.create_unknown(wrong_digest)
 
     wrong_namespace_data = _unknown(claim.execution_record_id).to_dict()
-    wrong_namespace_data["idempotency_namespace_digest"] = (
-        idempotency_namespace_digest("another/namespace")
+    wrong_namespace_data["idempotency_namespace_digest"] = idempotency_namespace_digest(
+        "another/namespace"
     )
     wrong_namespace = UnknownAction.from_dict(wrong_namespace_data)
     with pytest.raises(ReconciliationValidationError, match="namespace"):
@@ -894,3 +894,154 @@ def test_explicit_wal_requirement_fails_closed_on_affected_runtime(
         pytest.skip("linked SQLite runtime contains the WAL-reset race fix")
     with pytest.raises(SQLiteJournalModeError):
         SQLiteReconciliationLedger(tmp_path / "unsafe-wal.db", journal_mode="wal")
+
+
+def test_unknown_action_validation_and_repr_fail_closed() -> None:
+    action = _unknown()
+    assert action.execution_record_id in repr(action)
+    for field, value, message in (
+        ("contract_version", 0, "positive integer"),
+        ("max_evidence_bytes", 0, "between"),
+        ("max_result_bytes", 1_048_577, "between"),
+    ):
+        payload = action.to_dict()
+        payload[field] = value
+        with pytest.raises(ReconciliationValidationError, match=message):
+            UnknownAction.from_dict(payload)
+    payload = action.to_dict()
+    payload["receipt_schema"] = {"type": "not-a-json-type"}
+    with pytest.raises(ReconciliationValidationError, match="invalid receipt_schema"):
+        UnknownAction.from_dict(payload)
+
+
+def test_finding_state_and_retry_assertions_fail_closed() -> None:
+    common = {
+        "evidence_kind": "probe",
+        "evidence": {"observed": True},
+        "observed_at": datetime.now(timezone.utc),
+    }
+    with pytest.raises(ReconciliationValidationError, match="inconclusive"):
+        ReconciliationFinding(
+            proposed_state=ReconciliationState.UNKNOWN,
+            **common,
+        )
+    with pytest.raises(ReconciliationValidationError, match="retry-safe"):
+        ReconciliationFinding(
+            proposed_state=ReconciliationState.CONFIRMED_NOT_APPLIED,
+            **common,
+        )
+    with pytest.raises(ReconciliationValidationError, match="valid only"):
+        ReconciliationFinding(
+            proposed_state=ReconciliationState.CONFIRMED_SUCCEEDED,
+            retry_safe=True,
+            **common,
+        )
+    with pytest.raises(ReconciliationValidationError, match="resolved_result"):
+        ReconciliationFinding(
+            proposed_state=ReconciliationState.MANUAL_REVIEW,
+            resolved_result_available=True,
+            **common,
+        )
+
+
+def test_provider_descriptor_rejects_ambiguous_capabilities() -> None:
+    with pytest.raises(TypeError, match="tuple or frozenset"):
+        ProviderDescriptor(
+            provider_id="provider",
+            protocol_version=1,
+            supported_evidence_kinds=["probe"],  # type: ignore[arg-type]
+            provider=_provider,
+        )
+    with pytest.raises(ReconciliationValidationError, match="cannot be empty"):
+        ProviderDescriptor(
+            provider_id="provider",
+            protocol_version=1,
+            supported_evidence_kinds=(),
+            provider=_provider,
+        )
+    with pytest.raises(ReconciliationValidationError, match="duplicates"):
+        ProviderDescriptor(
+            provider_id="provider",
+            protocol_version=1,
+            supported_evidence_kinds=("probe", "probe"),
+            provider=_provider,
+        )
+    with pytest.raises(TypeError, match="callable"):
+        ProviderDescriptor(
+            provider_id="provider",
+            protocol_version=1,
+            supported_evidence_kinds=("probe",),
+            provider=object(),  # type: ignore[arg-type]
+        )
+
+
+def test_attempt_finish_contract_rejects_malformed_lifecycle() -> None:
+    ledger = InMemoryReconciliationLedger()
+    action = _unknown()
+    context = _context(action)
+    provider = _descriptor()
+    ledger.create_unknown(action)
+    ledger.start_attempt(context, provider, 0)
+    with pytest.raises(ReconciliationValidationError, match="requires a finding"):
+        ledger.finish_attempt(
+            context,
+            provider,
+            ReconciliationAttemptOutcome.SUCCESS,
+            1,
+        )
+    with pytest.raises(ReconciliationValidationError, match="successful attempt"):
+        ledger.finish_attempt(
+            context,
+            provider,
+            ReconciliationAttemptOutcome.TIMEOUT,
+            1,
+            finding=_finding(),
+        )
+    finished = ledger.finish_attempt(
+        context,
+        provider,
+        ReconciliationAttemptOutcome.TIMEOUT,
+        1,
+        error="provider deadline elapsed",
+    )
+    assert finished.revision == 2
+    with pytest.raises(ReconciliationConflictError, match="unmatched"):
+        ledger.finish_attempt(
+            context,
+            provider,
+            ReconciliationAttemptOutcome.TIMEOUT,
+            2,
+        )
+    with pytest.raises(ReconciliationConflictError, match="already"):
+        ledger.start_attempt(context, provider, 2)
+
+
+def test_manual_resolution_round_trip_and_validation() -> None:
+    action = _unknown()
+    base = {
+        "execution_record_id": action.execution_record_id,
+        "operator_identity_digest": _OPERATOR_DIGEST,
+        "reason": "verified by operator",
+        "expected_state": ReconciliationState.MANUAL_REVIEW,
+        "expected_revision": 3,
+        "new_state": ReconciliationState.CONFIRMED_SUCCEEDED,
+        "resolved_at": datetime.now(timezone.utc),
+        "evidence_kind": "manual",
+        "evidence": {"ticket": "OPS-7"},
+        "resolved_result_available": True,
+        "resolved_result": None,
+    }
+    resolution = ManualResolution(**base)
+    assert ManualResolution.from_dict(resolution.to_dict()) == resolution
+    for field, value, message in (
+        ("expected_state", ReconciliationState.UNKNOWN, "MANUAL_REVIEW"),
+        ("expected_revision", -1, "non-negative"),
+        ("new_state", ReconciliationState.MANUAL_REVIEW, "terminal"),
+    ):
+        invalid = dict(base)
+        invalid[field] = value
+        with pytest.raises(
+            (ReconciliationValidationError, InvalidReconciliationTransitionError),
+            match=message,
+        ):
+            ManualResolution(**invalid)
