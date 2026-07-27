@@ -1,0 +1,2062 @@
+from __future__ import annotations
+
+import json
+import math
+import re
+import secrets
+import sqlite3
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
+from pathlib import Path
+from threading import Lock
+from typing import Any, Protocol
+
+import rfc8785
+
+from ._serialization import freeze_mapping, thaw
+from ._sqlite import (
+    connect_sqlite,
+    initialize_sqlite,
+    sqlite_journal_capabilities,
+)
+from .contracts import canonical_json_bytes, validate_instance, validate_schema
+from .errors import ContractValidationError, RegistryError
+
+_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}$")
+_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+_EXECUTION_RECORD_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_MAX_REASON_BYTES = 2048
+_MAX_ERROR_BYTES = 2048
+_MAX_METADATA_BYTES = 16_384
+_MAX_EVIDENCE_BYTES = 65_536
+_MAX_RESULT_BYTES = 1_048_576
+_MAX_SCHEMA_BYTES = 1_048_576
+_MAX_VALUE_DEPTH = 32
+_MAX_VALUE_NODES = 10_000
+_MAX_SAFE_INTEGER = (1 << 53) - 1
+_FORBIDDEN_EVIDENCE_KEYS = {
+    "api_key",
+    "access_token",
+    "authorization",
+    "cookie",
+    "credential",
+    "idempotency_key",
+    "identity",
+    "namespace",
+    "operator_identity_digest",
+    "password",
+    "principal",
+    "provider_id",
+    "raw_identity",
+    "raw_key",
+    "raw_principal",
+    "refresh_token",
+    "secret",
+    "subject",
+    "tenant",
+}
+
+
+class ReconciliationState(str, Enum):
+    UNKNOWN = "UNKNOWN"
+    CONFIRMED_SUCCEEDED = "CONFIRMED_SUCCEEDED"
+    CONFIRMED_NOT_APPLIED = "CONFIRMED_NOT_APPLIED"
+    MANUAL_REVIEW = "MANUAL_REVIEW"
+
+
+class ReconciliationEventKind(str, Enum):
+    ATTEMPT_STARTED = "ATTEMPT_STARTED"
+    ATTEMPT_FINISHED = "ATTEMPT_FINISHED"
+    STATE_TRANSITION = "STATE_TRANSITION"
+
+
+class ReconciliationAttemptOutcome(str, Enum):
+    SUCCESS = "success"
+    INCONCLUSIVE = "inconclusive"
+    UNAVAILABLE = "unavailable"
+    ERROR = "error"
+    TIMEOUT = "timeout"
+    CANCELLED = "cancelled"
+
+
+class ReconciliationDisposition(str, Enum):
+    BLOCKED_UNKNOWN = "blocked_unknown"
+    BLOCKED_MANUAL_REVIEW = "blocked_manual_review"
+    COMPLETED = "completed"
+    APPLIED_NO_RESULT = "applied_no_result"
+    RETRY_ALLOWED = "retry_allowed"
+
+
+class ReconciliationTransitionSource(str, Enum):
+    PROVIDER = "provider"
+    MANUAL = "manual"
+
+
+class ReconciliationError(RuntimeError):
+    """Base error for reconciliation protocol failures."""
+
+
+class ReconciliationConflictError(ReconciliationError):
+    """Raised when an append loses its expected-state or revision CAS."""
+
+
+class ReconciliationNotFoundError(ReconciliationError):
+    """Raised when an execution record has no reconciliation head."""
+
+
+class InvalidReconciliationTransitionError(ReconciliationError):
+    """Raised when a requested state transition is not legal."""
+
+
+class ReconciliationValidationError(ReconciliationError, ValueError):
+    """Raised when a bounded protocol value fails closed validation."""
+
+
+class ReconciliationProvider(Protocol):
+    """Read-only receipt/probe provider contract."""
+
+    def reconcile(
+        self, context: ReconciliationAttemptContext
+    ) -> Awaitable[ReconciliationFinding]: ...
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class UnknownAction:
+    execution_record_id: str
+    action_digest: str
+    tool_name: str
+    contract_id: str
+    contract_version: int
+    idempotency_namespace_digest: str
+    uncertainty_reason: str
+    attempted_at: datetime
+    receipt_schema: Mapping[str, Any] | None = field(default=None, repr=False)
+    probe_schema: Mapping[str, Any] | None = field(default=None, repr=False)
+    result_schema: Mapping[str, Any] | None = field(default=None, repr=False)
+    max_evidence_bytes: int = _MAX_EVIDENCE_BYTES
+    max_result_bytes: int = _MAX_RESULT_BYTES
+    metadata: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        _require_execution_record_id(self.execution_record_id)
+        _require_digest("action_digest", self.action_digest)
+        _require_identifier("tool_name", self.tool_name)
+        _require_identifier("contract_id", self.contract_id)
+        if type(self.contract_version) is not int or self.contract_version < 1:
+            raise ReconciliationValidationError(
+                "contract_version must be a positive integer"
+            )
+        _require_digest(
+            "idempotency_namespace_digest", self.idempotency_namespace_digest
+        )
+        _require_bounded_text(
+            "uncertainty_reason", self.uncertainty_reason, _MAX_REASON_BYTES
+        )
+        object.__setattr__(self, "attempted_at", _require_timestamp(self.attempted_at))
+        for name in ("max_evidence_bytes", "max_result_bytes"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1 or value > _MAX_RESULT_BYTES:
+                raise ReconciliationValidationError(
+                    f"{name} must be between 1 and {_MAX_RESULT_BYTES}"
+                )
+        for name in ("receipt_schema", "probe_schema", "result_schema"):
+            schema = getattr(self, name)
+            if schema is not None:
+                object.__setattr__(self, name, _bounded_schema(schema, label=name))
+        object.__setattr__(
+            self,
+            "metadata",
+            _bounded_mapping(
+                self.metadata,
+                label="unknown action metadata",
+                max_bytes=_MAX_METADATA_BYTES,
+                allow_empty=True,
+            ),
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"UnknownAction(execution_record_id={self.execution_record_id!r}, "
+            f"action_digest={self.action_digest!r}, tool_name={self.tool_name!r})"
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "execution_record_id": self.execution_record_id,
+            "action_digest": self.action_digest,
+            "tool_name": self.tool_name,
+            "contract_id": self.contract_id,
+            "contract_version": self.contract_version,
+            "idempotency_namespace_digest": self.idempotency_namespace_digest,
+            "uncertainty_reason": self.uncertainty_reason,
+            "attempted_at": _timestamp_text(self.attempted_at),
+            "receipt_schema": None
+            if self.receipt_schema is None
+            else thaw(self.receipt_schema),
+            "probe_schema": None
+            if self.probe_schema is None
+            else thaw(self.probe_schema),
+            "result_schema": None
+            if self.result_schema is None
+            else thaw(self.result_schema),
+            "max_evidence_bytes": self.max_evidence_bytes,
+            "max_result_bytes": self.max_result_bytes,
+            "metadata": thaw(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> UnknownAction:
+        data = dict(value)
+        data["attempted_at"] = _parse_timestamp(data["attempted_at"])
+        return cls(**data)
+
+
+@dataclass(frozen=True, slots=True)
+class ReconciliationAttemptContext:
+    attempt_id: str
+    deadline: datetime
+    protocol_version: str | int
+    action: UnknownAction
+
+    def __post_init__(self) -> None:
+        _require_identifier("attempt_id", self.attempt_id)
+        object.__setattr__(self, "deadline", _require_timestamp(self.deadline))
+        _require_protocol_version(self.protocol_version)
+        if not isinstance(self.action, UnknownAction):
+            raise TypeError("action must be an UnknownAction")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "attempt_id": self.attempt_id,
+            "deadline": _timestamp_text(self.deadline),
+            "protocol_version": self.protocol_version,
+            "action": self.action.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> ReconciliationAttemptContext:
+        data = dict(value)
+        data["deadline"] = _parse_timestamp(data["deadline"])
+        data["action"] = UnknownAction.from_dict(data["action"])
+        return cls(**data)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ReconciliationFinding:
+    proposed_state: ReconciliationState
+    evidence_kind: str
+    evidence: Mapping[str, Any]
+    observed_at: datetime
+    retry_safe: bool = False
+    resolved_result_available: bool = False
+    resolved_result: Any | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.proposed_state, ReconciliationState):
+            raise TypeError("proposed_state must be a ReconciliationState")
+        if self.proposed_state is ReconciliationState.UNKNOWN:
+            raise ReconciliationValidationError(
+                "an inconclusive finding is an attempt outcome, not a state transition"
+            )
+        _require_identifier("evidence_kind", self.evidence_kind)
+        object.__setattr__(
+            self,
+            "evidence",
+            _bounded_mapping(
+                self.evidence,
+                label="reconciliation evidence",
+                max_bytes=_MAX_EVIDENCE_BYTES,
+                allow_empty=False,
+            ),
+        )
+        object.__setattr__(self, "observed_at", _require_timestamp(self.observed_at))
+        if type(self.retry_safe) is not bool:
+            raise TypeError("retry_safe must be a bool")
+        if type(self.resolved_result_available) is not bool:
+            raise TypeError("resolved_result_available must be a bool")
+        if self.resolved_result is not None and not self.resolved_result_available:
+            object.__setattr__(self, "resolved_result_available", True)
+        if (
+            self.proposed_state is ReconciliationState.CONFIRMED_NOT_APPLIED
+            and not self.retry_safe
+        ):
+            raise ReconciliationValidationError(
+                "CONFIRMED_NOT_APPLIED requires an explicit retry-safe assertion"
+            )
+        if (
+            self.retry_safe
+            and self.proposed_state is not ReconciliationState.CONFIRMED_NOT_APPLIED
+        ):
+            raise ReconciliationValidationError(
+                "retry_safe is valid only for CONFIRMED_NOT_APPLIED"
+            )
+        if self.resolved_result_available:
+            if self.proposed_state is not ReconciliationState.CONFIRMED_SUCCEEDED:
+                raise ReconciliationValidationError(
+                    "resolved_result is valid only for CONFIRMED_SUCCEEDED"
+                )
+            object.__setattr__(
+                self,
+                "resolved_result",
+                _bounded_value(
+                    self.resolved_result,
+                    label="resolved result",
+                    max_bytes=_MAX_RESULT_BYTES,
+                ),
+            )
+
+    @property
+    def state(self) -> ReconciliationState:
+        return self.proposed_state
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "proposed_state": self.proposed_state.value,
+            "evidence_kind": self.evidence_kind,
+            "evidence": thaw(self.evidence),
+            "observed_at": _timestamp_text(self.observed_at),
+            "retry_safe": self.retry_safe,
+            "resolved_result_available": self.resolved_result_available,
+            "resolved_result": thaw(self.resolved_result),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> ReconciliationFinding:
+        data = dict(value)
+        data["proposed_state"] = ReconciliationState(data["proposed_state"])
+        data["observed_at"] = _parse_timestamp(data["observed_at"])
+        return cls(**data)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ProviderDescriptor:
+    provider_id: str
+    protocol_version: str | int
+    supported_evidence_kinds: tuple[str, ...] | frozenset[str]
+    provider: (
+        ReconciliationProvider
+        | Callable[[ReconciliationAttemptContext], Awaitable[ReconciliationFinding]]
+    ) = field(repr=False, compare=False, hash=False)
+
+    def __post_init__(self) -> None:
+        _require_identifier("provider_id", self.provider_id)
+        _require_protocol_version(self.protocol_version)
+        if not isinstance(self.supported_evidence_kinds, tuple | frozenset):
+            raise TypeError("supported_evidence_kinds must be a tuple or frozenset")
+        for kind in self.supported_evidence_kinds:
+            _require_identifier("supported evidence kind", kind)
+        if not self.supported_evidence_kinds:
+            raise ReconciliationValidationError(
+                "supported_evidence_kinds cannot be empty"
+            )
+        if len(set(self.supported_evidence_kinds)) != len(
+            self.supported_evidence_kinds
+        ):
+            raise ReconciliationValidationError(
+                "supported_evidence_kinds cannot contain duplicates"
+            )
+        object.__setattr__(
+            self,
+            "supported_evidence_kinds",
+            tuple(sorted(self.supported_evidence_kinds)),
+        )
+        if not callable(self.provider) and not callable(
+            getattr(self.provider, "reconcile", None)
+        ):
+            raise TypeError("provider must be callable or expose reconcile(context)")
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ManualResolution:
+    execution_record_id: str
+    operator_identity_digest: str
+    reason: str
+    expected_state: ReconciliationState
+    expected_revision: int
+    new_state: ReconciliationState
+    resolved_at: datetime
+    evidence_kind: str
+    evidence: Mapping[str, Any]
+    retry_safe: bool = False
+    resolved_result_available: bool = False
+    resolved_result: Any | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        _require_execution_record_id(self.execution_record_id)
+        _require_digest("operator_identity_digest", self.operator_identity_digest)
+        _require_bounded_text(
+            "manual resolution reason", self.reason, _MAX_REASON_BYTES
+        )
+        if self.expected_state is not ReconciliationState.MANUAL_REVIEW:
+            raise ReconciliationValidationError(
+                "manual resolution requires expected_state MANUAL_REVIEW"
+            )
+        if type(self.expected_revision) is not int or self.expected_revision < 0:
+            raise ReconciliationValidationError(
+                "expected_revision must be a non-negative integer"
+            )
+        if self.new_state not in {
+            ReconciliationState.CONFIRMED_SUCCEEDED,
+            ReconciliationState.CONFIRMED_NOT_APPLIED,
+        }:
+            raise InvalidReconciliationTransitionError(
+                "manual resolution must select a confirmed terminal state"
+            )
+        object.__setattr__(self, "resolved_at", _require_timestamp(self.resolved_at))
+        _require_identifier("evidence_kind", self.evidence_kind)
+        object.__setattr__(
+            self,
+            "evidence",
+            _bounded_mapping(
+                self.evidence,
+                label="manual resolution evidence",
+                max_bytes=_MAX_EVIDENCE_BYTES,
+                allow_empty=False,
+            ),
+        )
+        if type(self.retry_safe) is not bool:
+            raise TypeError("retry_safe must be a bool")
+        if type(self.resolved_result_available) is not bool:
+            raise TypeError("resolved_result_available must be a bool")
+        if self.resolved_result is not None and not self.resolved_result_available:
+            object.__setattr__(self, "resolved_result_available", True)
+        if (
+            self.new_state is ReconciliationState.CONFIRMED_NOT_APPLIED
+            and not self.retry_safe
+        ):
+            raise ReconciliationValidationError(
+                "CONFIRMED_NOT_APPLIED requires an explicit retry-safe assertion"
+            )
+        if (
+            self.retry_safe
+            and self.new_state is not ReconciliationState.CONFIRMED_NOT_APPLIED
+        ):
+            raise ReconciliationValidationError(
+                "retry_safe is valid only for CONFIRMED_NOT_APPLIED"
+            )
+        if self.resolved_result_available:
+            if self.new_state is not ReconciliationState.CONFIRMED_SUCCEEDED:
+                raise ReconciliationValidationError(
+                    "resolved_result is valid only for CONFIRMED_SUCCEEDED"
+                )
+            object.__setattr__(
+                self,
+                "resolved_result",
+                _bounded_value(
+                    self.resolved_result,
+                    label="resolved result",
+                    max_bytes=_MAX_RESULT_BYTES,
+                ),
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "execution_record_id": self.execution_record_id,
+            "operator_identity_digest": self.operator_identity_digest,
+            "reason": self.reason,
+            "expected_state": self.expected_state.value,
+            "expected_revision": self.expected_revision,
+            "new_state": self.new_state.value,
+            "resolved_at": _timestamp_text(self.resolved_at),
+            "evidence_kind": self.evidence_kind,
+            "evidence": thaw(self.evidence),
+            "retry_safe": self.retry_safe,
+            "resolved_result_available": self.resolved_result_available,
+            "resolved_result": thaw(self.resolved_result),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> ManualResolution:
+        data = dict(value)
+        data["expected_state"] = ReconciliationState(data["expected_state"])
+        data["new_state"] = ReconciliationState(data["new_state"])
+        data["resolved_at"] = _parse_timestamp(data["resolved_at"])
+        return cls(**data)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ReconciliationTransition:
+    execution_record_id: str
+    expected_state: ReconciliationState
+    expected_revision: int
+    new_state: ReconciliationState
+    source: ReconciliationTransitionSource
+    evidence_kind: str
+    evidence: Mapping[str, Any]
+    occurred_at: datetime
+    retry_safe: bool
+    resolved_result_available: bool
+    provider_id: str | None = None
+    attempt_id: str | None = None
+    operator_identity_digest: str | None = None
+    reason: str | None = None
+    resolved_result: Any | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        _require_execution_record_id(self.execution_record_id)
+        if not isinstance(self.expected_state, ReconciliationState):
+            raise TypeError("expected_state must be a ReconciliationState")
+        if not isinstance(self.new_state, ReconciliationState):
+            raise TypeError("new_state must be a ReconciliationState")
+        if not isinstance(self.source, ReconciliationTransitionSource):
+            raise TypeError("source must be a ReconciliationTransitionSource")
+        if type(self.expected_revision) is not int or self.expected_revision < 0:
+            raise ReconciliationValidationError(
+                "expected_revision must be a non-negative integer"
+            )
+        object.__setattr__(self, "occurred_at", _require_timestamp(self.occurred_at))
+        _require_identifier("evidence_kind", self.evidence_kind)
+        object.__setattr__(
+            self,
+            "evidence",
+            _bounded_mapping(
+                self.evidence,
+                label="transition evidence",
+                max_bytes=_MAX_EVIDENCE_BYTES,
+                allow_empty=False,
+            ),
+        )
+        if self.provider_id is not None:
+            _require_identifier("provider_id", self.provider_id)
+        if self.attempt_id is not None:
+            _require_identifier("attempt_id", self.attempt_id)
+        if self.operator_identity_digest is not None:
+            _require_digest("operator_identity_digest", self.operator_identity_digest)
+        if self.reason is not None:
+            _require_bounded_text("transition reason", self.reason, _MAX_REASON_BYTES)
+        if type(self.retry_safe) is not bool:
+            raise TypeError("retry_safe must be a bool")
+        if type(self.resolved_result_available) is not bool:
+            raise TypeError("resolved_result_available must be a bool")
+        if self.resolved_result is not None and not self.resolved_result_available:
+            raise ReconciliationValidationError(
+                "resolved_result requires resolved_result_available"
+            )
+        if self.resolved_result_available:
+            object.__setattr__(
+                self,
+                "resolved_result",
+                _bounded_value(
+                    self.resolved_result,
+                    label="resolved result",
+                    max_bytes=_MAX_RESULT_BYTES,
+                ),
+            )
+        if self.source is ReconciliationTransitionSource.PROVIDER:
+            if self.provider_id is None or self.attempt_id is None:
+                raise ReconciliationValidationError(
+                    "provider transition requires provider_id and attempt_id"
+                )
+            if self.operator_identity_digest is not None:
+                raise ReconciliationValidationError(
+                    "provider transition cannot carry operator identity"
+                )
+        elif self.operator_identity_digest is None or self.reason is None:
+            raise ReconciliationValidationError(
+                "manual transition requires operator identity and reason"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "execution_record_id": self.execution_record_id,
+            "expected_state": self.expected_state.value,
+            "expected_revision": self.expected_revision,
+            "new_state": self.new_state.value,
+            "source": self.source.value,
+            "evidence_kind": self.evidence_kind,
+            "evidence": thaw(self.evidence),
+            "occurred_at": _timestamp_text(self.occurred_at),
+            "retry_safe": self.retry_safe,
+            "resolved_result_available": self.resolved_result_available,
+            "provider_id": self.provider_id,
+            "attempt_id": self.attempt_id,
+            "operator_identity_digest": self.operator_identity_digest,
+            "reason": self.reason,
+            "resolved_result": thaw(self.resolved_result),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> ReconciliationTransition:
+        data = dict(value)
+        data["expected_state"] = ReconciliationState(data["expected_state"])
+        data["new_state"] = ReconciliationState(data["new_state"])
+        data["source"] = ReconciliationTransitionSource(data["source"])
+        data["occurred_at"] = _parse_timestamp(data["occurred_at"])
+        return cls(**data)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ReconciliationRecord:
+    event_id: str
+    execution_record_id: str
+    revision: int
+    kind: ReconciliationEventKind
+    state_before: ReconciliationState
+    state_after: ReconciliationState
+    occurred_at: datetime
+    payload: Mapping[str, Any] = field(repr=False)
+
+    def __post_init__(self) -> None:
+        _require_execution_record_id(self.event_id)
+        _require_execution_record_id(self.execution_record_id)
+        if not isinstance(self.kind, ReconciliationEventKind):
+            raise TypeError("kind must be a ReconciliationEventKind")
+        if not isinstance(self.state_before, ReconciliationState) or not isinstance(
+            self.state_after, ReconciliationState
+        ):
+            raise TypeError("record states must be ReconciliationState values")
+        if type(self.revision) is not int or self.revision < 1:
+            raise ReconciliationValidationError("record revision must be positive")
+        object.__setattr__(self, "occurred_at", _require_timestamp(self.occurred_at))
+        object.__setattr__(
+            self,
+            "payload",
+            _bounded_mapping(
+                self.payload,
+                label="reconciliation record payload",
+                max_bytes=_MAX_RESULT_BYTES,
+                allow_empty=True,
+                reject_sensitive_keys=False,
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "event_id": self.event_id,
+            "execution_record_id": self.execution_record_id,
+            "revision": self.revision,
+            "kind": self.kind.value,
+            "state_before": self.state_before.value,
+            "state_after": self.state_after.value,
+            "occurred_at": _timestamp_text(self.occurred_at),
+            "payload": thaw(self.payload),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> ReconciliationRecord:
+        data = dict(value)
+        data["kind"] = ReconciliationEventKind(data["kind"])
+        data["state_before"] = ReconciliationState(data["state_before"])
+        data["state_after"] = ReconciliationState(data["state_after"])
+        data["occurred_at"] = _parse_timestamp(data["occurred_at"])
+        return cls(**data)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ReconciliationHead:
+    action: UnknownAction
+    state: ReconciliationState
+    revision: int
+    disposition: ReconciliationDisposition
+    updated_at: datetime
+    resolved_result_available: bool = False
+    resolved_result: Any | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.action, UnknownAction):
+            raise TypeError("action must be an UnknownAction")
+        if not isinstance(self.state, ReconciliationState):
+            raise TypeError("state must be a ReconciliationState")
+        if type(self.revision) is not int or self.revision < 0:
+            raise ReconciliationValidationError(
+                "head revision must be a non-negative integer"
+            )
+        if not isinstance(self.disposition, ReconciliationDisposition):
+            raise TypeError("disposition must be a ReconciliationDisposition")
+        object.__setattr__(self, "updated_at", _require_timestamp(self.updated_at))
+        if type(self.resolved_result_available) is not bool:
+            raise TypeError("resolved_result_available must be a bool")
+        if self.resolved_result is not None and not self.resolved_result_available:
+            raise ReconciliationValidationError(
+                "resolved_result requires resolved_result_available"
+            )
+        if self.resolved_result_available:
+            object.__setattr__(
+                self,
+                "resolved_result",
+                _bounded_value(
+                    self.resolved_result,
+                    label="resolved result",
+                    max_bytes=self.action.max_result_bytes,
+                ),
+            )
+
+    @property
+    def execution_record_id(self) -> str:
+        return self.action.execution_record_id
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "action": self.action.to_dict(),
+            "state": self.state.value,
+            "revision": self.revision,
+            "disposition": self.disposition.value,
+            "updated_at": _timestamp_text(self.updated_at),
+            "resolved_result_available": self.resolved_result_available,
+            "resolved_result": thaw(self.resolved_result),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> ReconciliationHead:
+        data = dict(value)
+        data["action"] = UnknownAction.from_dict(data["action"])
+        data["state"] = ReconciliationState(data["state"])
+        data["disposition"] = ReconciliationDisposition(data["disposition"])
+        data["updated_at"] = _parse_timestamp(data["updated_at"])
+        return cls(**data)
+
+
+class ReconciliationLedger(Protocol):
+    def create_unknown(self, action: UnknownAction) -> ReconciliationHead: ...
+
+    def start_attempt(
+        self,
+        context: ReconciliationAttemptContext,
+        provider: ProviderDescriptor,
+        expected_revision: int,
+    ) -> ReconciliationRecord: ...
+
+    def finish_attempt(
+        self,
+        context: ReconciliationAttemptContext,
+        provider: ProviderDescriptor,
+        outcome: ReconciliationAttemptOutcome,
+        expected_revision: int,
+        *,
+        finding: ReconciliationFinding | None = None,
+        error: str | None = None,
+        finished_at: datetime | None = None,
+    ) -> ReconciliationRecord: ...
+
+    def compare_and_append_transition(
+        self,
+        execution_record_id: str,
+        expected_state: ReconciliationState,
+        expected_revision: int,
+        decision: ReconciliationFinding | ManualResolution,
+        *,
+        provider: ProviderDescriptor | None = None,
+        attempt_id: str | None = None,
+    ) -> ReconciliationHead: ...
+
+    def current(self, execution_record_id: str) -> ReconciliationHead: ...
+
+    def history(self, execution_record_id: str) -> tuple[ReconciliationRecord, ...]: ...
+
+    def attempts(
+        self, execution_record_id: str
+    ) -> tuple[ReconciliationRecord, ...]: ...
+
+
+class InMemoryReconciliationLedger:
+    production_durable = False
+
+    def __init__(self) -> None:
+        self._heads: dict[str, ReconciliationHead] = {}
+        self._events: dict[str, list[ReconciliationRecord]] = {}
+        self._lock = Lock()
+
+    def create_unknown(self, action: UnknownAction) -> ReconciliationHead:
+        if not isinstance(action, UnknownAction):
+            raise TypeError("action must be an UnknownAction")
+        with self._lock:
+            if action.execution_record_id in self._heads:
+                raise ReconciliationConflictError(
+                    "a reconciliation head already exists for this execution record"
+                )
+            head = ReconciliationHead(
+                action=action,
+                state=ReconciliationState.UNKNOWN,
+                revision=0,
+                disposition=ReconciliationDisposition.BLOCKED_UNKNOWN,
+                updated_at=action.attempted_at,
+            )
+            self._heads[action.execution_record_id] = head
+            self._events[action.execution_record_id] = []
+            return head
+
+    def start_attempt(
+        self,
+        context: ReconciliationAttemptContext,
+        provider: ProviderDescriptor,
+        expected_revision: int,
+    ) -> ReconciliationRecord:
+        _validate_attempt(context, provider)
+        payload = {
+            "attempt_id": context.attempt_id,
+            "deadline": _timestamp_text(context.deadline),
+            "protocol_version": context.protocol_version,
+            "provider_id": provider.provider_id,
+        }
+        with self._lock:
+            return self._append_attempt_locked(
+                context.action.execution_record_id,
+                context.action,
+                expected_revision,
+                ReconciliationEventKind.ATTEMPT_STARTED,
+                datetime.now(timezone.utc),
+                payload,
+            )
+
+    def finish_attempt(
+        self,
+        context: ReconciliationAttemptContext,
+        provider: ProviderDescriptor,
+        outcome: ReconciliationAttemptOutcome,
+        expected_revision: int,
+        *,
+        finding: ReconciliationFinding | None = None,
+        error: str | None = None,
+        finished_at: datetime | None = None,
+    ) -> ReconciliationRecord:
+        _validate_attempt(context, provider)
+        payload, occurred_at = _finish_payload(
+            context, provider, outcome, finding, error, finished_at
+        )
+        with self._lock:
+            return self._append_attempt_locked(
+                context.action.execution_record_id,
+                context.action,
+                expected_revision,
+                ReconciliationEventKind.ATTEMPT_FINISHED,
+                occurred_at,
+                payload,
+            )
+
+    def compare_and_append_transition(
+        self,
+        execution_record_id: str,
+        expected_state: ReconciliationState,
+        expected_revision: int,
+        decision: ReconciliationFinding | ManualResolution,
+        *,
+        provider: ProviderDescriptor | None = None,
+        attempt_id: str | None = None,
+    ) -> ReconciliationHead:
+        with self._lock:
+            head = self._head_locked(execution_record_id)
+            _require_cas(head, expected_state, expected_revision)
+            transition = _build_transition(
+                head, decision, provider=provider, attempt_id=attempt_id
+            )
+            if isinstance(decision, ReconciliationFinding):
+                _require_finished_attempt(
+                    self._events[execution_record_id],
+                    attempt_id,
+                    provider,
+                    decision,
+                )
+            _validate_transition_evidence(head.action, transition)
+            record, updated = _transition_record(head, transition)
+            self._events[execution_record_id].append(record)
+            self._heads[execution_record_id] = updated
+            return updated
+
+    def current(self, execution_record_id: str) -> ReconciliationHead:
+        with self._lock:
+            return self._head_locked(execution_record_id)
+
+    def history(self, execution_record_id: str) -> tuple[ReconciliationRecord, ...]:
+        with self._lock:
+            self._head_locked(execution_record_id)
+            return tuple(self._events[execution_record_id])
+
+    def attempts(self, execution_record_id: str) -> tuple[ReconciliationRecord, ...]:
+        return tuple(
+            record
+            for record in self.history(execution_record_id)
+            if record.kind
+            in {
+                ReconciliationEventKind.ATTEMPT_STARTED,
+                ReconciliationEventKind.ATTEMPT_FINISHED,
+            }
+        )
+
+    def _append_attempt_locked(
+        self,
+        execution_record_id: str,
+        action: UnknownAction,
+        expected_revision: int,
+        kind: ReconciliationEventKind,
+        occurred_at: datetime,
+        payload: Mapping[str, Any],
+    ) -> ReconciliationRecord:
+        head = self._head_locked(execution_record_id)
+        if head.action != action:
+            raise ReconciliationValidationError(
+                "attempt context action does not match the persisted unknown action"
+            )
+        if (
+            kind is ReconciliationEventKind.ATTEMPT_STARTED
+            and head.state is not ReconciliationState.UNKNOWN
+        ):
+            raise InvalidReconciliationTransitionError(
+                "provider attempts are valid only while state is UNKNOWN"
+            )
+        _require_cas(head, head.state, expected_revision)
+        _validate_attempt_append(self._events[execution_record_id], kind, payload)
+        record = ReconciliationRecord(
+            event_id=_new_id(),
+            execution_record_id=execution_record_id,
+            revision=head.revision + 1,
+            kind=kind,
+            state_before=head.state,
+            state_after=head.state,
+            occurred_at=occurred_at,
+            payload=payload,
+        )
+        self._events[execution_record_id].append(record)
+        self._heads[execution_record_id] = ReconciliationHead(
+            action=head.action,
+            state=head.state,
+            revision=record.revision,
+            disposition=head.disposition,
+            updated_at=record.occurred_at,
+            resolved_result_available=head.resolved_result_available,
+            resolved_result=head.resolved_result,
+        )
+        return record
+
+    def _head_locked(self, execution_record_id: str) -> ReconciliationHead:
+        _require_execution_record_id(execution_record_id)
+        try:
+            return self._heads[execution_record_id]
+        except KeyError as exc:
+            raise ReconciliationNotFoundError(
+                f"unknown execution record {execution_record_id!r}"
+            ) from exc
+
+
+class SQLiteReconciliationLedger:
+    production_durable = True
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        timeout_seconds: float = 30.0,
+        journal_mode: str = "auto",
+    ) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.timeout_seconds = timeout_seconds
+        self.journal_capabilities = sqlite_journal_capabilities(journal_mode)
+        self._journal_mode = journal_mode
+        self._migrate_legacy_idempotency_if_needed()
+        self._initialize()
+
+    @property
+    def journal_mode(self) -> str:
+        with self._connect() as connection:
+            return str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+
+    def create_unknown(self, action: UnknownAction) -> ReconciliationHead:
+        if not isinstance(action, UnknownAction):
+            raise TypeError("action must be an UnknownAction")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._validate_idempotency_link(connection, action)
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO reconciliation_heads(
+                        execution_record_id, action_json, state, revision,
+                        disposition, resolved_result_available,
+                        resolved_result_json, updated_at
+                    ) VALUES (?, ?, 'UNKNOWN', 0, 'blocked_unknown', 0, NULL, ?)
+                    """,
+                    (
+                        action.execution_record_id,
+                        _dump(action.to_dict()),
+                        _timestamp_text(action.attempted_at),
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ReconciliationConflictError(
+                    "a reconciliation head already exists for this execution record"
+                ) from exc
+            connection.commit()
+        return self.current(action.execution_record_id)
+
+    @staticmethod
+    def _validate_idempotency_link(
+        connection: sqlite3.Connection, action: UnknownAction
+    ) -> None:
+        table_exists = connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'idempotency_records'
+            """
+        ).fetchone()
+        if table_exists is None:
+            return
+        row = connection.execute(
+            """
+            SELECT namespace, fingerprint, state
+            FROM idempotency_records
+            WHERE execution_record_id = ?
+            """,
+            (action.execution_record_id,),
+        ).fetchone()
+        if row is None:
+            raise ReconciliationConflictError(
+                "execution record is absent from the colocated idempotency authority"
+            )
+        namespace, fingerprint, state = row
+        if fingerprint != action.action_digest:
+            raise ReconciliationValidationError(
+                "unknown action digest does not match the idempotency authority"
+            )
+        if (
+            idempotency_namespace_digest(namespace)
+            != action.idempotency_namespace_digest
+        ):
+            raise ReconciliationValidationError(
+                "unknown action namespace does not match the idempotency authority"
+            )
+        if state != "unknown":
+            raise ReconciliationConflictError(
+                "idempotency execution must be UNKNOWN before reconciliation starts"
+            )
+
+    def start_attempt(
+        self,
+        context: ReconciliationAttemptContext,
+        provider: ProviderDescriptor,
+        expected_revision: int,
+    ) -> ReconciliationRecord:
+        _validate_attempt(context, provider)
+        return self._append_attempt(
+            context.action.execution_record_id,
+            context.action,
+            expected_revision,
+            ReconciliationEventKind.ATTEMPT_STARTED,
+            datetime.now(timezone.utc),
+            {
+                "attempt_id": context.attempt_id,
+                "deadline": _timestamp_text(context.deadline),
+                "protocol_version": context.protocol_version,
+                "provider_id": provider.provider_id,
+            },
+        )
+
+    def finish_attempt(
+        self,
+        context: ReconciliationAttemptContext,
+        provider: ProviderDescriptor,
+        outcome: ReconciliationAttemptOutcome,
+        expected_revision: int,
+        *,
+        finding: ReconciliationFinding | None = None,
+        error: str | None = None,
+        finished_at: datetime | None = None,
+    ) -> ReconciliationRecord:
+        _validate_attempt(context, provider)
+        payload, occurred_at = _finish_payload(
+            context, provider, outcome, finding, error, finished_at
+        )
+        return self._append_attempt(
+            context.action.execution_record_id,
+            context.action,
+            expected_revision,
+            ReconciliationEventKind.ATTEMPT_FINISHED,
+            occurred_at,
+            payload,
+        )
+
+    def compare_and_append_transition(
+        self,
+        execution_record_id: str,
+        expected_state: ReconciliationState,
+        expected_revision: int,
+        decision: ReconciliationFinding | ManualResolution,
+        *,
+        provider: ProviderDescriptor | None = None,
+        attempt_id: str | None = None,
+    ) -> ReconciliationHead:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            head = self._current(connection, execution_record_id)
+            _require_cas(head, expected_state, expected_revision)
+            transition = _build_transition(
+                head, decision, provider=provider, attempt_id=attempt_id
+            )
+            if isinstance(decision, ReconciliationFinding):
+                _require_finished_attempt(
+                    self._attempt_records(connection, execution_record_id),
+                    attempt_id,
+                    provider,
+                    decision,
+                )
+            _validate_transition_evidence(head.action, transition)
+            record, updated = _transition_record(head, transition)
+            cursor = connection.execute(
+                """
+                UPDATE reconciliation_heads
+                SET state = ?, revision = ?, disposition = ?,
+                    resolved_result_available = ?, resolved_result_json = ?,
+                    updated_at = ?
+                WHERE execution_record_id = ? AND state = ? AND revision = ?
+                """,
+                (
+                    updated.state.value,
+                    updated.revision,
+                    updated.disposition.value,
+                    int(updated.resolved_result_available),
+                    _optional_dump(
+                        updated.resolved_result, updated.resolved_result_available
+                    ),
+                    _timestamp_text(updated.updated_at),
+                    execution_record_id,
+                    expected_state.value,
+                    expected_revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ReconciliationConflictError(
+                    "reconciliation state or revision changed before append"
+                )
+            self._insert_event(connection, record)
+            self._update_idempotency_disposition(connection, updated)
+            connection.commit()
+        return updated
+
+    def current(self, execution_record_id: str) -> ReconciliationHead:
+        with self._connect() as connection:
+            return self._current(connection, execution_record_id)
+
+    def history(self, execution_record_id: str) -> tuple[ReconciliationRecord, ...]:
+        with self._connect() as connection:
+            self._current(connection, execution_record_id)
+            rows = connection.execute(
+                """
+                SELECT event_id, execution_record_id, revision, kind, state_before,
+                       state_after, occurred_at, payload_json
+                FROM reconciliation_events
+                WHERE execution_record_id = ?
+                ORDER BY revision
+                """,
+                (execution_record_id,),
+            ).fetchall()
+        return tuple(_record_from_row(row) for row in rows)
+
+    def attempts(self, execution_record_id: str) -> tuple[ReconciliationRecord, ...]:
+        return tuple(
+            record
+            for record in self.history(execution_record_id)
+            if record.kind
+            in {
+                ReconciliationEventKind.ATTEMPT_STARTED,
+                ReconciliationEventKind.ATTEMPT_FINISHED,
+            }
+        )
+
+    def _append_attempt(
+        self,
+        execution_record_id: str,
+        action: UnknownAction,
+        expected_revision: int,
+        kind: ReconciliationEventKind,
+        occurred_at: datetime,
+        payload: Mapping[str, Any],
+    ) -> ReconciliationRecord:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            head = self._current(connection, execution_record_id)
+            if head.action != action:
+                raise ReconciliationValidationError(
+                    "attempt context action does not match the persisted unknown action"
+                )
+            if (
+                kind is ReconciliationEventKind.ATTEMPT_STARTED
+                and head.state is not ReconciliationState.UNKNOWN
+            ):
+                raise InvalidReconciliationTransitionError(
+                    "provider attempts are valid only while state is UNKNOWN"
+                )
+            _require_cas(head, head.state, expected_revision)
+            _validate_attempt_append(
+                self._attempt_records(connection, execution_record_id), kind, payload
+            )
+            record = ReconciliationRecord(
+                event_id=_new_id(),
+                execution_record_id=execution_record_id,
+                revision=head.revision + 1,
+                kind=kind,
+                state_before=head.state,
+                state_after=head.state,
+                occurred_at=occurred_at,
+                payload=payload,
+            )
+            cursor = connection.execute(
+                """
+                UPDATE reconciliation_heads
+                SET revision = ?, updated_at = ?
+                WHERE execution_record_id = ? AND state = ? AND revision = ?
+                """,
+                (
+                    record.revision,
+                    _timestamp_text(record.occurred_at),
+                    execution_record_id,
+                    head.state.value,
+                    expected_revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ReconciliationConflictError(
+                    "reconciliation revision changed before attempt append"
+                )
+            self._insert_event(connection, record)
+            connection.commit()
+            return record
+
+    @staticmethod
+    def _attempt_records(
+        connection: sqlite3.Connection, execution_record_id: str
+    ) -> tuple[ReconciliationRecord, ...]:
+        rows = connection.execute(
+            """
+            SELECT event_id, execution_record_id, revision, kind, state_before,
+                   state_after, occurred_at, payload_json
+            FROM reconciliation_events
+            WHERE execution_record_id = ?
+              AND kind IN ('ATTEMPT_STARTED', 'ATTEMPT_FINISHED')
+            ORDER BY revision
+            """,
+            (execution_record_id,),
+        ).fetchall()
+        return tuple(_record_from_row(row) for row in rows)
+
+    def _current(
+        self, connection: sqlite3.Connection, execution_record_id: str
+    ) -> ReconciliationHead:
+        _require_execution_record_id(execution_record_id)
+        row = connection.execute(
+            """
+            SELECT action_json, state, revision, disposition,
+                   resolved_result_available, resolved_result_json, updated_at
+            FROM reconciliation_heads WHERE execution_record_id = ?
+            """,
+            (execution_record_id,),
+        ).fetchone()
+        if row is None:
+            raise ReconciliationNotFoundError(
+                f"unknown execution record {execution_record_id!r}"
+            )
+        (
+            action_json,
+            state,
+            revision,
+            disposition,
+            result_available,
+            result_json,
+            updated_at,
+        ) = row
+        return ReconciliationHead(
+            action=UnknownAction.from_dict(json.loads(action_json)),
+            state=ReconciliationState(state),
+            revision=revision,
+            disposition=ReconciliationDisposition(disposition),
+            updated_at=_parse_timestamp(updated_at),
+            resolved_result_available=bool(result_available),
+            resolved_result=(None if not result_available else json.loads(result_json)),
+        )
+
+    @staticmethod
+    def _insert_event(
+        connection: sqlite3.Connection, record: ReconciliationRecord
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO reconciliation_events(
+                event_id, execution_record_id, revision, kind, state_before,
+                state_after, occurred_at, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.event_id,
+                record.execution_record_id,
+                record.revision,
+                record.kind.value,
+                record.state_before.value,
+                record.state_after.value,
+                _timestamp_text(record.occurred_at),
+                _dump(thaw(record.payload)),
+            ),
+        )
+
+    @staticmethod
+    def _update_idempotency_disposition(
+        connection: sqlite3.Connection, head: ReconciliationHead
+    ) -> None:
+        table_exists = connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'idempotency_records'
+            """
+        ).fetchone()
+        if table_exists is None:
+            return
+        state, result_json, error = _idempotency_disposition(head)
+        cursor = connection.execute(
+            """
+            UPDATE idempotency_records
+            SET state = ?, result_json = ?, error = ?, owner_token = NULL,
+                lease_expires_at = NULL, updated_at = ?
+            WHERE execution_record_id = ? AND state IN ('unknown', 'manual_review')
+            """,
+            (
+                state,
+                result_json,
+                error,
+                _timestamp_text(head.updated_at),
+                head.execution_record_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ReconciliationConflictError(
+                "idempotency authority did not match the reconciliation execution"
+            )
+
+    def _initialize(self) -> None:
+        with initialize_sqlite(
+            self.path,
+            self.timeout_seconds,
+            journal_mode=self._journal_mode,
+        ) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS reconciliation_schema (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    version INTEGER NOT NULL
+                )
+                """
+            )
+            version = connection.execute(
+                "SELECT version FROM reconciliation_schema WHERE singleton = 1"
+            ).fetchone()
+            if version is not None and version[0] != 1:
+                raise ReconciliationError(
+                    f"unsupported reconciliation schema version {version[0]}"
+                )
+            connection.execute(
+                "INSERT OR IGNORE INTO reconciliation_schema(singleton, version) VALUES (1, 1)"
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS reconciliation_heads (
+                    execution_record_id TEXT PRIMARY KEY NOT NULL,
+                    action_json TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN (
+                        'UNKNOWN', 'CONFIRMED_SUCCEEDED',
+                        'CONFIRMED_NOT_APPLIED', 'MANUAL_REVIEW'
+                    )),
+                    revision INTEGER NOT NULL CHECK(revision >= 0),
+                    disposition TEXT NOT NULL CHECK(disposition IN (
+                        'blocked_unknown', 'blocked_manual_review', 'completed',
+                        'applied_no_result', 'retry_allowed'
+                    )),
+                    resolved_result_available INTEGER NOT NULL
+                        CHECK(resolved_result_available IN (0, 1)),
+                    resolved_result_json TEXT,
+                    updated_at TEXT NOT NULL,
+                    CHECK(
+                        (resolved_result_available = 1 AND resolved_result_json IS NOT NULL)
+                        OR (resolved_result_available = 0 AND resolved_result_json IS NULL)
+                    )
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS reconciliation_events (
+                    event_id TEXT PRIMARY KEY NOT NULL,
+                    execution_record_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL CHECK(revision >= 1),
+                    kind TEXT NOT NULL CHECK(kind IN (
+                        'ATTEMPT_STARTED', 'ATTEMPT_FINISHED', 'STATE_TRANSITION'
+                    )),
+                    state_before TEXT NOT NULL,
+                    state_after TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    UNIQUE(execution_record_id, revision),
+                    FOREIGN KEY(execution_record_id)
+                        REFERENCES reconciliation_heads(execution_record_id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS reconciliation_events_no_update
+                BEFORE UPDATE ON reconciliation_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'reconciliation events are append-only');
+                END
+                """
+            )
+            connection.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS reconciliation_events_no_delete
+                BEFORE DELETE ON reconciliation_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'reconciliation events are append-only');
+                END
+                """
+            )
+            connection.commit()
+
+    def _migrate_legacy_idempotency_if_needed(self) -> None:
+        with self._connect() as connection:
+            table_exists = connection.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'idempotency_records'
+                """
+            ).fetchone()
+            if table_exists is None:
+                return
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(idempotency_records)")
+            }
+        if {"execution_record_id", "generation"}.issubset(columns):
+            return
+        from .registry import SQLiteIdempotencyStore
+
+        SQLiteIdempotencyStore(self.path, timeout_seconds=self.timeout_seconds)
+
+    def _connect(self) -> sqlite3.Connection:
+        return connect_sqlite(self.path, self.timeout_seconds)
+
+
+def idempotency_namespace_digest(namespace: str) -> str:
+    _require_identifier("idempotency namespace", namespace)
+    import hashlib
+
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "domain": "arg.idempotency-namespace",
+                "version": 1,
+                "namespace": namespace,
+            },
+            label="idempotency namespace",
+        )
+    ).hexdigest()
+
+
+def new_execution_record_id() -> str:
+    return _new_id()
+
+
+def _validate_attempt(
+    context: ReconciliationAttemptContext, provider: ProviderDescriptor
+) -> None:
+    if not isinstance(context, ReconciliationAttemptContext):
+        raise TypeError("context must be a ReconciliationAttemptContext")
+    if not isinstance(provider, ProviderDescriptor):
+        raise TypeError("provider must be a ProviderDescriptor")
+    if context.protocol_version != provider.protocol_version:
+        raise ReconciliationValidationError(
+            "provider and attempt protocol versions do not match"
+        )
+
+
+def _finish_payload(
+    context: ReconciliationAttemptContext,
+    provider: ProviderDescriptor,
+    outcome: ReconciliationAttemptOutcome,
+    finding: ReconciliationFinding | None,
+    error: str | None,
+    finished_at: datetime | None,
+) -> tuple[dict[str, Any], datetime]:
+    if not isinstance(outcome, ReconciliationAttemptOutcome):
+        raise TypeError("outcome must be a ReconciliationAttemptOutcome")
+    if finding is not None:
+        if not isinstance(finding, ReconciliationFinding):
+            raise TypeError("finding must be a ReconciliationFinding")
+        if finding.evidence_kind not in provider.supported_evidence_kinds:
+            raise ReconciliationValidationError(
+                "provider does not support the finding evidence kind"
+            )
+    if outcome is ReconciliationAttemptOutcome.SUCCESS and finding is None:
+        raise ReconciliationValidationError("successful attempt requires a finding")
+    if outcome is not ReconciliationAttemptOutcome.SUCCESS and finding is not None:
+        raise ReconciliationValidationError(
+            "only a successful attempt may carry a conclusive finding"
+        )
+    if error is not None:
+        _require_bounded_text("attempt error", error, _MAX_ERROR_BYTES)
+    occurred_at = _require_timestamp(finished_at or datetime.now(timezone.utc))
+    return (
+        {
+            "attempt_id": context.attempt_id,
+            "provider_id": provider.provider_id,
+            "outcome": outcome.value,
+            "finding": None if finding is None else finding.to_dict(),
+            "error": error,
+        },
+        occurred_at,
+    )
+
+
+def _validate_attempt_append(
+    records: list[ReconciliationRecord] | tuple[ReconciliationRecord, ...],
+    kind: ReconciliationEventKind,
+    payload: Mapping[str, Any],
+) -> None:
+    attempt_id = payload["attempt_id"]
+    matching = [
+        record for record in records if record.payload.get("attempt_id") == attempt_id
+    ]
+    if kind is ReconciliationEventKind.ATTEMPT_STARTED:
+        if matching:
+            raise ReconciliationConflictError("attempt_id has already been persisted")
+        return
+    starts = [
+        record
+        for record in matching
+        if record.kind is ReconciliationEventKind.ATTEMPT_STARTED
+    ]
+    finishes = [
+        record
+        for record in matching
+        if record.kind is ReconciliationEventKind.ATTEMPT_FINISHED
+    ]
+    if len(starts) != 1 or finishes:
+        raise ReconciliationConflictError(
+            "attempt finish requires one unmatched persisted start"
+        )
+    if starts[0].payload.get("provider_id") != payload.get("provider_id"):
+        raise ReconciliationValidationError(
+            "attempt finish provider does not match the persisted start"
+        )
+
+
+def _require_finished_attempt(
+    records: list[ReconciliationRecord] | tuple[ReconciliationRecord, ...],
+    attempt_id: str | None,
+    provider: ProviderDescriptor | None,
+    finding: ReconciliationFinding,
+) -> None:
+    if attempt_id is None or provider is None:
+        return
+    expected_finding = finding.to_dict()
+    for record in records:
+        if record.kind is not ReconciliationEventKind.ATTEMPT_FINISHED:
+            continue
+        if (
+            record.payload.get("attempt_id") == attempt_id
+            and record.payload.get("provider_id") == provider.provider_id
+            and record.payload.get("outcome")
+            == ReconciliationAttemptOutcome.SUCCESS.value
+            and thaw(record.payload.get("finding")) == expected_finding
+        ):
+            return
+    raise ReconciliationConflictError(
+        "provider transition has no matching successful attempt finish"
+    )
+
+
+def _build_transition(
+    head: ReconciliationHead,
+    decision: ReconciliationFinding | ManualResolution,
+    *,
+    provider: ProviderDescriptor | None,
+    attempt_id: str | None,
+) -> ReconciliationTransition:
+    if isinstance(decision, ReconciliationFinding):
+        if provider is None:
+            raise ReconciliationValidationError(
+                "provider findings require a trusted ProviderDescriptor"
+            )
+        if head.state is ReconciliationState.MANUAL_REVIEW:
+            raise InvalidReconciliationTransitionError(
+                "MANUAL_REVIEW can be resolved only by ManualResolution"
+            )
+        if decision.evidence_kind not in provider.supported_evidence_kinds:
+            raise ReconciliationValidationError(
+                "provider does not support the finding evidence kind"
+            )
+        if attempt_id is None:
+            raise ReconciliationValidationError(
+                "provider transition requires the persisted attempt_id"
+            )
+        return ReconciliationTransition(
+            execution_record_id=head.execution_record_id,
+            expected_state=head.state,
+            expected_revision=head.revision,
+            new_state=decision.proposed_state,
+            source=ReconciliationTransitionSource.PROVIDER,
+            evidence_kind=decision.evidence_kind,
+            evidence=decision.evidence,
+            occurred_at=decision.observed_at,
+            retry_safe=decision.retry_safe,
+            resolved_result_available=decision.resolved_result_available,
+            provider_id=provider.provider_id,
+            attempt_id=attempt_id,
+            resolved_result=decision.resolved_result,
+        )
+    if not isinstance(decision, ManualResolution):
+        raise TypeError("decision must be a ReconciliationFinding or ManualResolution")
+    if provider is not None or attempt_id is not None:
+        raise ReconciliationValidationError(
+            "manual resolution cannot carry provider attempt identity"
+        )
+    if decision.execution_record_id != head.execution_record_id:
+        raise ReconciliationValidationError(
+            "manual resolution targets a different execution record"
+        )
+    if (
+        decision.expected_state is not head.state
+        or decision.expected_revision != head.revision
+    ):
+        raise ReconciliationConflictError(
+            "manual resolution expected state or revision is stale"
+        )
+    return ReconciliationTransition(
+        execution_record_id=head.execution_record_id,
+        expected_state=head.state,
+        expected_revision=head.revision,
+        new_state=decision.new_state,
+        source=ReconciliationTransitionSource.MANUAL,
+        evidence_kind=decision.evidence_kind,
+        evidence=decision.evidence,
+        occurred_at=decision.resolved_at,
+        retry_safe=decision.retry_safe,
+        resolved_result_available=decision.resolved_result_available,
+        operator_identity_digest=decision.operator_identity_digest,
+        reason=decision.reason,
+        resolved_result=decision.resolved_result,
+    )
+
+
+def _validate_transition_evidence(
+    action: UnknownAction, transition: ReconciliationTransition
+) -> None:
+    evidence = thaw(transition.evidence)
+    encoded = _dump(evidence).encode("utf-8")
+    if len(encoded) > action.max_evidence_bytes:
+        raise ReconciliationValidationError(
+            f"reconciliation evidence exceeds {action.max_evidence_bytes} bytes"
+        )
+    schema: Mapping[str, Any] | None = None
+    if transition.evidence_kind == "receipt":
+        schema = action.receipt_schema
+    elif transition.evidence_kind == "probe":
+        schema = action.probe_schema
+    if schema is not None:
+        try:
+            validate_instance(evidence, schema, label="reconciliation evidence")
+        except ContractValidationError as exc:
+            raise ReconciliationValidationError(str(exc)) from exc
+    if transition.resolved_result_available:
+        result = thaw(transition.resolved_result)
+        encoded_result = _dump(result).encode("utf-8")
+        if len(encoded_result) > action.max_result_bytes:
+            raise ReconciliationValidationError(
+                f"resolved result exceeds {action.max_result_bytes} bytes"
+            )
+        if action.result_schema is not None:
+            try:
+                validate_instance(result, action.result_schema, label="resolved result")
+            except ContractValidationError as exc:
+                raise ReconciliationValidationError(str(exc)) from exc
+
+
+def _transition_record(
+    head: ReconciliationHead, transition: ReconciliationTransition
+) -> tuple[ReconciliationRecord, ReconciliationHead]:
+    _require_legal_transition(head.state, transition.new_state)
+    disposition = _disposition(
+        transition.new_state, transition.resolved_result_available
+    )
+    record = ReconciliationRecord(
+        event_id=_new_id(),
+        execution_record_id=head.execution_record_id,
+        revision=head.revision + 1,
+        kind=ReconciliationEventKind.STATE_TRANSITION,
+        state_before=head.state,
+        state_after=transition.new_state,
+        occurred_at=transition.occurred_at,
+        payload={"transition": transition.to_dict()},
+    )
+    updated = ReconciliationHead(
+        action=head.action,
+        state=transition.new_state,
+        revision=record.revision,
+        disposition=disposition,
+        updated_at=record.occurred_at,
+        resolved_result_available=transition.resolved_result_available,
+        resolved_result=transition.resolved_result,
+    )
+    return record, updated
+
+
+def _require_legal_transition(
+    current: ReconciliationState, new: ReconciliationState
+) -> None:
+    legal = {
+        ReconciliationState.UNKNOWN: {
+            ReconciliationState.CONFIRMED_SUCCEEDED,
+            ReconciliationState.CONFIRMED_NOT_APPLIED,
+            ReconciliationState.MANUAL_REVIEW,
+        },
+        ReconciliationState.MANUAL_REVIEW: {
+            ReconciliationState.CONFIRMED_SUCCEEDED,
+            ReconciliationState.CONFIRMED_NOT_APPLIED,
+        },
+    }
+    if new not in legal.get(current, set()):
+        raise InvalidReconciliationTransitionError(
+            f"illegal reconciliation transition {current.value} -> {new.value}"
+        )
+
+
+def _require_cas(
+    head: ReconciliationHead,
+    expected_state: ReconciliationState,
+    expected_revision: int,
+) -> None:
+    if not isinstance(expected_state, ReconciliationState):
+        raise TypeError("expected_state must be a ReconciliationState")
+    if type(expected_revision) is not int or expected_revision < 0:
+        raise ReconciliationValidationError(
+            "expected_revision must be a non-negative integer"
+        )
+    if head.state is not expected_state or head.revision != expected_revision:
+        raise ReconciliationConflictError(
+            "reconciliation state or revision does not match the expected CAS value"
+        )
+
+
+def _disposition(
+    state: ReconciliationState, resolved_result_available: bool
+) -> ReconciliationDisposition:
+    if state is ReconciliationState.UNKNOWN:
+        return ReconciliationDisposition.BLOCKED_UNKNOWN
+    if state is ReconciliationState.MANUAL_REVIEW:
+        return ReconciliationDisposition.BLOCKED_MANUAL_REVIEW
+    if state is ReconciliationState.CONFIRMED_NOT_APPLIED:
+        return ReconciliationDisposition.RETRY_ALLOWED
+    if not resolved_result_available:
+        return ReconciliationDisposition.APPLIED_NO_RESULT
+    return ReconciliationDisposition.COMPLETED
+
+
+def _idempotency_disposition(
+    head: ReconciliationHead,
+) -> tuple[str, str | None, str | None]:
+    if head.disposition is ReconciliationDisposition.BLOCKED_MANUAL_REVIEW:
+        return "manual_review", None, "manual reconciliation required"
+    if head.disposition is ReconciliationDisposition.RETRY_ALLOWED:
+        return "not_applied", None, "confirmed not applied"
+    if head.disposition is ReconciliationDisposition.APPLIED_NO_RESULT:
+        return (
+            "applied_no_result",
+            None,
+            "side effect applied but no result can be reconstructed",
+        )
+    if head.disposition is ReconciliationDisposition.COMPLETED:
+        return "completed", _dump(thaw(head.resolved_result)), None
+    return "unknown", None, "outcome is unknown"
+
+
+def _record_from_row(row: tuple[Any, ...]) -> ReconciliationRecord:
+    event_id, execution_id, revision, kind, before, after, occurred_at, payload = row
+    return ReconciliationRecord(
+        event_id=event_id,
+        execution_record_id=execution_id,
+        revision=revision,
+        kind=ReconciliationEventKind(kind),
+        state_before=ReconciliationState(before),
+        state_after=ReconciliationState(after),
+        occurred_at=_parse_timestamp(occurred_at),
+        payload=json.loads(payload),
+    )
+
+
+def _bounded_schema(value: Mapping[str, Any], *, label: str) -> Mapping[str, Any]:
+    plain = thaw(value)
+    try:
+        validate_schema(plain, label=label)
+    except RegistryError as exc:
+        raise ReconciliationValidationError(str(exc)) from exc
+    return _bounded_mapping(
+        plain,
+        label=label,
+        max_bytes=_MAX_SCHEMA_BYTES,
+        allow_empty=True,
+        reject_sensitive_keys=False,
+    )
+
+
+def _bounded_mapping(
+    value: Mapping[str, Any],
+    *,
+    label: str,
+    max_bytes: int,
+    allow_empty: bool,
+    reject_sensitive_keys: bool = True,
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ReconciliationValidationError(f"{label} must be an object")
+    normalized = _bounded_value(value, label=label, max_bytes=max_bytes)
+    if not isinstance(normalized, Mapping):
+        raise ReconciliationValidationError(f"{label} must be an object")
+    plain = thaw(normalized)
+    if not allow_empty and not plain:
+        raise ReconciliationValidationError(f"{label} cannot be empty")
+    if reject_sensitive_keys:
+        _reject_sensitive_keys(plain, label)
+    return freeze_mapping(plain)
+
+
+def _bounded_value(value: Any, *, label: str, max_bytes: int) -> Any:
+    try:
+        normalized = _normalize_reconciliation_json(
+            value,
+            path=label,
+            depth=0,
+            active=set(),
+            budget=[_MAX_VALUE_NODES],
+        )
+        encoded = rfc8785.dumps(normalized)
+    except (rfc8785.CanonicalizationError, UnicodeError) as exc:
+        raise ReconciliationValidationError(str(exc)) from exc
+    if len(encoded) > max_bytes:
+        raise ReconciliationValidationError(f"{label} exceeds {max_bytes} bytes")
+    if isinstance(normalized, Mapping):
+        return freeze_mapping(normalized)
+    if isinstance(normalized, list):
+        return tuple(_freeze_value(item) for item in normalized)
+    return normalized
+
+
+def _freeze_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return freeze_mapping(value)
+    if isinstance(value, list):
+        return tuple(_freeze_value(item) for item in value)
+    return value
+
+
+def _normalize_reconciliation_json(
+    value: Any,
+    *,
+    path: str,
+    depth: int,
+    active: set[int],
+    budget: list[int],
+) -> Any:
+    if depth > _MAX_VALUE_DEPTH:
+        raise ReconciliationValidationError(
+            f"{path} exceeds maximum depth {_MAX_VALUE_DEPTH}"
+        )
+    budget[0] -= 1
+    if budget[0] < 0:
+        raise ReconciliationValidationError(
+            f"{path} exceeds maximum node count {_MAX_VALUE_NODES}"
+        )
+    if value is None or type(value) is bool:
+        return value
+    if type(value) is str:
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ReconciliationValidationError(
+                f"{path} must contain valid Unicode scalar values"
+            ) from exc
+        return value
+    if type(value) is int:
+        if not -_MAX_SAFE_INTEGER <= value <= _MAX_SAFE_INTEGER:
+            raise ReconciliationValidationError(
+                f"{path} exceeds the interoperable integer range"
+            )
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ReconciliationValidationError(f"{path} contains a non-finite number")
+        if value == 0.0 and math.copysign(1.0, value) < 0:
+            raise ReconciliationValidationError(
+                f"{path} contains ambiguous negative zero"
+            )
+        return value
+    if isinstance(value, Mapping):
+        identity = id(value)
+        if identity in active:
+            raise ReconciliationValidationError(f"{path} contains a cyclic object")
+        active.add(identity)
+        try:
+            result: dict[str, Any] = {}
+            for key, item in value.items():
+                if type(key) is not str:
+                    raise ReconciliationValidationError(
+                        f"{path} object keys must be strings"
+                    )
+                result[key] = _normalize_reconciliation_json(
+                    item,
+                    path=f"{path}.{key}",
+                    depth=depth + 1,
+                    active=active,
+                    budget=budget,
+                )
+            return result
+        finally:
+            active.remove(identity)
+    if type(value) is list:
+        identity = id(value)
+        if identity in active:
+            raise ReconciliationValidationError(f"{path} contains a cyclic array")
+        active.add(identity)
+        try:
+            return [
+                _normalize_reconciliation_json(
+                    item,
+                    path=f"{path}[{index}]",
+                    depth=depth + 1,
+                    active=active,
+                    budget=budget,
+                )
+                for index, item in enumerate(value)
+            ]
+        finally:
+            active.remove(identity)
+    raise ReconciliationValidationError(
+        f"{path} contains unsupported type "
+        f"{type(value).__module__}.{type(value).__qualname__}"
+    )
+
+
+def _reject_sensitive_keys(value: Any, label: str) -> None:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if key.casefold() in _FORBIDDEN_EVIDENCE_KEYS:
+                raise ReconciliationValidationError(
+                    f"{label} contains forbidden sensitive field {key!r}"
+                )
+            _reject_sensitive_keys(item, label)
+    elif isinstance(value, tuple | list):
+        for item in value:
+            _reject_sensitive_keys(item, label)
+
+
+def _require_identifier(label: str, value: Any) -> None:
+    if type(value) is not str or not _IDENTIFIER.fullmatch(value):
+        raise ReconciliationValidationError(
+            f"{label} must be a stable 1-256 character identifier"
+        )
+
+
+def _require_protocol_version(value: Any) -> None:
+    if type(value) is int and value >= 1:
+        return
+    _require_identifier("protocol_version", value)
+
+
+def _require_execution_record_id(value: Any) -> None:
+    if type(value) is not str or not _EXECUTION_RECORD_ID.fullmatch(value):
+        raise ReconciliationValidationError(
+            "execution_record_id must be an opaque 1-256 character identifier"
+        )
+
+
+def _require_digest(label: str, value: Any) -> None:
+    if type(value) is not str or not _DIGEST.fullmatch(value):
+        raise ReconciliationValidationError(
+            f"{label} must be a lowercase SHA-256 hex digest"
+        )
+
+
+def _require_bounded_text(label: str, value: Any, max_bytes: int) -> None:
+    if type(value) is not str or not value:
+        raise ReconciliationValidationError(f"{label} must be a non-empty string")
+    try:
+        size = len(value.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise ReconciliationValidationError(
+            f"{label} must contain valid Unicode scalar values"
+        ) from exc
+    if size > max_bytes:
+        raise ReconciliationValidationError(
+            f"{label} must not exceed {max_bytes} UTF-8 bytes"
+        )
+
+
+def _require_timestamp(value: Any) -> datetime:
+    if (
+        not isinstance(value, datetime)
+        or value.tzinfo is None
+        or value.utcoffset() is None
+    ):
+        raise ReconciliationValidationError("timestamp must be timezone-aware")
+    return value.astimezone(timezone.utc)
+
+
+def _timestamp_text(value: datetime) -> str:
+    return _require_timestamp(value).isoformat()
+
+
+def _parse_timestamp(value: Any) -> datetime:
+    if type(value) is not str:
+        raise ReconciliationValidationError("stored timestamp must be a string")
+    try:
+        return _require_timestamp(datetime.fromisoformat(value))
+    except ValueError as exc:
+        raise ReconciliationValidationError("stored timestamp is invalid") from exc
+
+
+def _new_id() -> str:
+    return secrets.token_hex(32)
+
+
+def _dump(value: Any) -> str:
+    try:
+        normalized = _normalize_reconciliation_json(
+            value,
+            path="reconciliation storage",
+            depth=0,
+            active=set(),
+            budget=[_MAX_VALUE_NODES],
+        )
+        return rfc8785.dumps(normalized).decode("utf-8")
+    except (rfc8785.CanonicalizationError, UnicodeError) as exc:
+        raise ReconciliationValidationError(str(exc)) from exc
+
+
+def _optional_dump(value: Any | None, available: bool) -> str | None:
+    return _dump(thaw(value)) if available else None
+
+
+__all__ = [
+    "InMemoryReconciliationLedger",
+    "InvalidReconciliationTransitionError",
+    "ManualResolution",
+    "ProviderDescriptor",
+    "ReconciliationAttemptContext",
+    "ReconciliationAttemptOutcome",
+    "ReconciliationConflictError",
+    "ReconciliationDisposition",
+    "ReconciliationError",
+    "ReconciliationEventKind",
+    "ReconciliationFinding",
+    "ReconciliationHead",
+    "ReconciliationLedger",
+    "ReconciliationNotFoundError",
+    "ReconciliationProvider",
+    "ReconciliationRecord",
+    "ReconciliationState",
+    "ReconciliationTransition",
+    "ReconciliationTransitionSource",
+    "ReconciliationValidationError",
+    "SQLiteReconciliationLedger",
+    "UnknownAction",
+    "idempotency_namespace_digest",
+    "new_execution_record_id",
+]
