@@ -35,6 +35,7 @@ from .reconciliation import (
     ReconciliationHead,
     ReconciliationState,
     UnknownAction,
+    _create_reconciliation_trigger,
     _normalize_schema_sql,
     enqueue_reconciliation_audit_outbox,
     idempotency_namespace_digest,
@@ -1213,7 +1214,9 @@ class SQLiteIdempotencyStore:
                     f"index {index_name!r} does not match the supported contract"
                 )
 
-        foreign_key_violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        foreign_key_violations = connection.execute(
+            "PRAGMA foreign_key_check(idempotency_records)"
+        ).fetchall()
         if foreign_key_violations:
             raise RuntimeError(
                 "idempotency schema integrity failure: foreign-key check failed"
@@ -1269,7 +1272,9 @@ class SQLiteIdempotencyStore:
                     f"index {index_name!r} does not match the supported contract"
                 )
 
-        foreign_key_violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        foreign_key_violations = connection.execute(
+            "PRAGMA foreign_key_check(idempotency_records)"
+        ).fetchall()
         if foreign_key_violations:
             raise RuntimeError(
                 "legacy idempotency schema integrity failure: foreign-key check failed"
@@ -1355,27 +1360,9 @@ class SQLiteIdempotencyStore:
             "ALTER TABLE idempotency_records_v07 RENAME TO idempotency_records"
         )
         if has_reconciliation_guard_tables:
-            connection.execute(
-                """
-                CREATE TRIGGER reconciliation_prepared_actions_delete_guard
-                BEFORE DELETE ON reconciliation_prepared_actions
-                WHEN EXISTS (
-                    SELECT 1 FROM reconciliation_heads
-                    WHERE reconciliation_heads.execution_record_id =
-                          OLD.execution_record_id
-                ) OR EXISTS (
-                    SELECT 1 FROM idempotency_records
-                    WHERE idempotency_records.execution_record_id =
-                          OLD.execution_record_id
-                      AND idempotency_records.state != 'completed'
-                )
-                BEGIN
-                    SELECT RAISE(
-                        ABORT,
-                        'prepared reconciliation action cannot be deleted before retention is safe'
-                    );
-                END
-                """
+            _create_reconciliation_trigger(
+                connection,
+                "reconciliation_prepared_actions_delete_guard",
             )
 
     def _connect(self) -> sqlite3.Connection:

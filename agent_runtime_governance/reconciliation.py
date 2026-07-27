@@ -2161,10 +2161,19 @@ class SQLiteReconciliationLedger:
                     created_at=str(row[6]),
                     delivery_attempts=int(row[7]),
                 ):
-                    self._warn_if_audit_delivery_is_stalled(
-                        connection,
-                        str(row[1]),
-                    )
+                    try:
+                        self._warn_if_audit_delivery_is_stalled(
+                            connection,
+                            str(row[1]),
+                        )
+                    except sqlite3.DatabaseError:
+                        # The marker is best-effort observability. A competing
+                        # writer must not make durable outbox reads unavailable;
+                        # the next poll can claim and emit the warning instead.
+                        _LOGGER.warning(
+                            "reconciliation audit stall alert could not be recorded",
+                            exc_info=True,
+                        )
         return tuple(_audit_envelope_from_row(row) for row in rows)
 
     def mark_audit_event_delivered(self, outbox_id: str) -> None:
