@@ -28,6 +28,7 @@ from .action_contracts import ActionContract
 from .context import ExecutionMode, RiskTier
 from .contracts import canonical_json_bytes, validate_schema
 from .errors import ContractValidationError, RegistryError
+from .reconciliation import ProviderDescriptor
 
 if TYPE_CHECKING:
     from .runtime import Runtime
@@ -78,6 +79,8 @@ class ToolSpec(Generic[P, R]):
     max_parameters_bytes: int | None = None
     max_result_bytes: int | None = None
     action_contract: ActionContract | None = None
+    reconciliation_provider: ProviderDescriptor | None = None
+    reconciliation_probe_schema: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.:-]{0,127}", self.name):
@@ -88,6 +91,10 @@ class ToolSpec(Generic[P, R]):
             self.action_contract, ActionContract
         ):
             raise TypeError("action_contract must be an ActionContract")
+        if self.reconciliation_provider is not None and not isinstance(
+            self.reconciliation_provider, ProviderDescriptor
+        ):
+            raise TypeError("reconciliation_provider must be a ProviderDescriptor")
         for name, value in (
             ("max_parameters_bytes", self.max_parameters_bytes),
             ("max_result_bytes", self.max_result_bytes),
@@ -106,6 +113,13 @@ class ToolSpec(Generic[P, R]):
             object.__setattr__(
                 self, "result_schema", _freeze_schema(deepcopy(self.result_schema))
             )
+        if self.reconciliation_probe_schema is not None:
+            validate_schema(self.reconciliation_probe_schema, label="reconciliation probe")
+            object.__setattr__(
+                self,
+                "reconciliation_probe_schema",
+                _freeze_schema(deepcopy(self.reconciliation_probe_schema)),
+            )
 
 
 class IdempotencyConflictError(RuntimeError):
@@ -114,6 +128,15 @@ class IdempotencyConflictError(RuntimeError):
 
 class IdempotencyOutcomeUnknownError(RuntimeError):
     """Raised when the original execution may still have taken effect."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        execution_record_id: str | None = None,
+    ) -> None:
+        self.execution_record_id = execution_record_id
+        super().__init__(message)
 
 
 class IdempotencyAlreadyAppliedError(RuntimeError):
@@ -259,7 +282,11 @@ class InMemoryIdempotencyStore:
             return
         with self._lock:
             if not claim.future.done():
-                claim.future.set_exception(IdempotencyOutcomeUnknownError(str(error)))
+                claim.future.set_exception(
+                    IdempotencyOutcomeUnknownError(
+                        str(error), execution_record_id=claim.execution_record_id
+                    )
+                )
                 claim.future.exception()
             self._remember_completed((claim.namespace, claim.key), monotonic())
             self._evict_completed(monotonic())
@@ -389,7 +416,10 @@ class SQLiteIdempotencyStore:
                 future.set_result(json.loads(result_json))
             elif state in {"unknown", "manual_review"}:
                 future.set_exception(
-                    IdempotencyOutcomeUnknownError(error or "outcome is unknown")
+                    IdempotencyOutcomeUnknownError(
+                        error or "outcome is unknown",
+                        execution_record_id=execution_record_id,
+                    )
                 )
             elif state == "applied_no_result":
                 future.set_exception(
@@ -455,7 +485,11 @@ class SQLiteIdempotencyStore:
                         raise RuntimeError(
                             "idempotency lease changed before expiry recovery"
                         )
-                    future.set_exception(IdempotencyOutcomeUnknownError(message))
+                    future.set_exception(
+                        IdempotencyOutcomeUnknownError(
+                            message, execution_record_id=execution_record_id
+                        )
+                    )
                 else:
                     future.set_exception(
                         IdempotencyInProgressError(
@@ -519,7 +553,11 @@ class SQLiteIdempotencyStore:
             return
         self._transition(claim, "unknown", error=str(error)[:2048])
         if not claim.future.done():
-            claim.future.set_exception(IdempotencyOutcomeUnknownError(str(error)))
+            claim.future.set_exception(
+                IdempotencyOutcomeUnknownError(
+                    str(error), execution_record_id=claim.execution_record_id
+                )
+            )
             claim.future.exception()
 
     def renew(self, claim: IdempotencyClaim) -> None:

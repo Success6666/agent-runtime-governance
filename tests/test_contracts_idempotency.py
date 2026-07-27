@@ -165,6 +165,28 @@ def test_in_memory_idempotency_evicts_terminal_entries_after_idle_ttl(
     assert store.acquire("tenant/tool", "request", "a" * 64).owner is True
 
 
+@pytest.mark.parametrize("durable", [False, True])
+def test_unknown_outcome_exposes_stable_execution_record_id(
+    tmp_path, durable: bool
+) -> None:
+    path = tmp_path / "idempotency.db"
+    store = SQLiteIdempotencyStore(path) if durable else InMemoryIdempotencyStore()
+    claim = store.acquire("tenant/tool", "caller-visible-key", "a" * 64)
+    assert claim.execution_record_id is not None
+    store.mark_unknown(claim, RuntimeError("uncertain"))
+
+    with pytest.raises(IdempotencyOutcomeUnknownError) as first:
+        claim.future.result()
+    assert first.value.execution_record_id == claim.execution_record_id
+    assert "caller-visible-key" not in str(first.value)
+
+    restarted = SQLiteIdempotencyStore(path) if durable else store
+    repeated = restarted.acquire("tenant/tool", "caller-visible-key", "a" * 64)
+    with pytest.raises(IdempotencyOutcomeUnknownError) as second:
+        repeated.future.result()
+    assert second.value.execution_record_id == claim.execution_record_id
+
+
 def test_sqlite_idempotency_survives_restart(tmp_path) -> None:
     path = tmp_path / "idempotency.db"
     fingerprint = "a" * 64

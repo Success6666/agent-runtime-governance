@@ -14,6 +14,7 @@ from hypothesis import strategies as st
 
 from agent_runtime_governance import (
     IdempotencyAlreadyAppliedError,
+    IdempotencyOutcomeUnknownError,
     InMemoryIdempotencyStore,
     InMemoryReconciliationLedger,
     InvalidReconciliationTransitionError,
@@ -509,6 +510,50 @@ def test_sqlite_transition_updates_idempotency_authority_atomically(
             (claim.execution_record_id,),
         ).fetchone()
     assert (state, result_json) == ("completed", "null")
+
+
+def test_sqlite_record_unknown_commits_authority_and_head_together(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "atomic-unknown.db"
+    raw_key = "caller-visible-idempotency-key"
+    store = SQLiteIdempotencyStore(path)
+    claim = store.acquire("tenant/charge", raw_key, _ACTION_DIGEST)
+    assert claim.execution_record_id is not None
+    ledger = SQLiteReconciliationLedger(path)
+
+    head = ledger.record_unknown(
+        claim,
+        _unknown(claim.execution_record_id),
+        TimeoutError("external call outcome is uncertain"),
+    )
+
+    assert head.state is ReconciliationState.UNKNOWN
+    with closing(sqlite3.connect(path)) as connection:
+        state = connection.execute(
+            """
+            SELECT state FROM idempotency_records
+            WHERE execution_record_id = ?
+            """,
+            (claim.execution_record_id,),
+        ).fetchone()[0]
+        head_count = connection.execute(
+            """
+            SELECT COUNT(*) FROM reconciliation_heads
+            WHERE execution_record_id = ?
+            """,
+            (claim.execution_record_id,),
+        ).fetchone()[0]
+    assert state == "unknown"
+    assert head_count == 1
+
+    duplicate = SQLiteIdempotencyStore(path).acquire(
+        "tenant/charge", raw_key, _ACTION_DIGEST
+    )
+    with pytest.raises(IdempotencyOutcomeUnknownError) as blocked:
+        duplicate.future.result()
+    assert blocked.value.execution_record_id == claim.execution_record_id
+    assert raw_key not in str(blocked.value)
 
 
 def test_sqlite_transition_rolls_back_head_and_event_when_authority_is_stale(
