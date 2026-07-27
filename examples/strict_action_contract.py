@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 from agent_runtime_governance import (
@@ -14,9 +15,13 @@ from agent_runtime_governance import (
     JSONLAuditSink,
     PolicyMiddleware,
     ProductionProfile,
+    ProviderDescriptor,
+    ReconciliationFinding,
+    ReconciliationState,
     Runtime,
     SimplePolicy,
     SQLiteIdempotencyStore,
+    SQLiteReconciliationLedger,
     StaticIdentityProvider,
     VerifiedPrincipal,
 )
@@ -55,6 +60,17 @@ def _load_policy() -> tuple[SimplePolicy, str, str]:
     )
 
 
+async def _manual_review_probe(_context) -> ReconciliationFinding:
+    """Fail closed when this compact example has no external receipt service."""
+
+    return ReconciliationFinding(
+        proposed_state=ReconciliationState.MANUAL_REVIEW,
+        evidence_kind="probe",
+        evidence={"source": "example-local-state", "conclusion": "manual_review"},
+        observed_at=datetime.now(timezone.utc),
+    )
+
+
 def main() -> None:
     state_dir = Path(os.environ.get("ARG_STATE_DIR", ".arg-state")).resolve()
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -65,6 +81,7 @@ def main() -> None:
         policy_version=policy_version,
         policy_digest=policy_digest,
     )
+    idempotency_path = state_dir / "idempotency.db"
     runtime = Runtime(
         [
             PolicyMiddleware(
@@ -80,9 +97,8 @@ def main() -> None:
                 fail_closed=True,
             )
         ],
-        idempotency_store=SQLiteIdempotencyStore(
-            state_dir / "idempotency.db"
-        ),
+        idempotency_store=SQLiteIdempotencyStore(idempotency_path),
+        reconciliation_ledger=SQLiteReconciliationLedger(idempotency_path),
         identity_provider=StaticIdentityProvider(
             VerifiedPrincipal(
                 issuer="example-trusted-gateway",
@@ -128,6 +144,12 @@ def main() -> None:
         name="set_service_state",
         execution_mode=ExecutionMode.IDEMPOTENT,
         action_contract=contract,
+        reconciliation_provider=ProviderDescriptor(
+            provider_id="example.local-manual-review",
+            protocol_version="1",
+            supported_evidence_kinds=("probe",),
+            provider=_manual_review_probe,
+        ),
     )
     def set_service_state(service: str, enabled: bool) -> dict[str, object]:
         target = (state_dir / f"{service}.state").resolve()

@@ -24,6 +24,7 @@ from agent_runtime_governance import (
     ProductionReadinessError,
     ProductionReadinessReason,
     ProductionReadinessState,
+    ProviderDescriptor,
     RegistryError,
     RiskTier,
     Runtime,
@@ -32,6 +33,7 @@ from agent_runtime_governance import (
     SQLiteApprovalStore,
     SQLiteIdempotencyStore,
     SQLiteIdentityReplayStore,
+    SQLiteReconciliationLedger,
     StaticIdentityProvider,
     ToolCall,
     ToolSpec,
@@ -79,6 +81,19 @@ def strict_profile() -> ProductionProfile:
         identity_digest_key_version="2026-07",
         policy_version="policy-v1",
         policy_digest="a" * 64,
+    )
+
+
+async def _unused_reconciliation_provider(_context) -> object:
+    raise AssertionError("production readiness must not invoke reconciliation")
+
+
+def reconciliation_provider() -> ProviderDescriptor:
+    return ProviderDescriptor(
+        provider_id="tests.receipt-probe",
+        protocol_version="1",
+        supported_evidence_kinds=("receipt",),
+        provider=_unused_reconciliation_provider,
     )
 
 
@@ -149,6 +164,76 @@ def test_read_only_contract_exception_does_not_bypass_identity_or_audit() -> Non
         ProductionReadinessReason.VERIFIED_IDENTITY_REQUIRED,
         ProductionReadinessReason.AUDIT_MIDDLEWARE_REQUIRED,
     )
+
+
+def test_idempotent_production_requires_atomic_colocated_reconciliation(
+    tmp_path,
+) -> None:
+    idempotency_path = tmp_path / "idempotency.db"
+    runtime = Runtime(
+        [
+            AuditMiddleware(
+                JSONLAuditSink(tmp_path / "audit.jsonl", sign_key=b"a" * 32),
+                fail_closed=True,
+            )
+        ],
+        idempotency_store=SQLiteIdempotencyStore(idempotency_path),
+        identity_provider=StaticIdentityProvider(_principal()),
+        require_verified_identity=True,
+        production_profile=strict_profile(),
+    )
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        action_contract=contract(execution_mode=ExecutionMode.IDEMPOTENT),
+    )
+    def operate(target: str) -> bool:
+        return bool(target)
+
+    assert runtime.production_readiness().runtime_reasons == (
+        ProductionReadinessReason.RECONCILIATION_DURABLE_REQUIRED,
+        ProductionReadinessReason.RECONCILIATION_PROVIDER_REQUIRED,
+    )
+
+    runtime.reconciliation_ledger = SQLiteReconciliationLedger(
+        tmp_path / "other.db"
+    )
+    assert runtime.production_readiness().runtime_reasons == (
+        ProductionReadinessReason.RECONCILIATION_COLOCATED_REQUIRED,
+        ProductionReadinessReason.RECONCILIATION_PROVIDER_REQUIRED,
+    )
+
+    runtime.reconciliation_ledger = SQLiteReconciliationLedger(idempotency_path)
+    assert runtime.production_readiness().runtime_reasons == (
+        ProductionReadinessReason.RECONCILIATION_PROVIDER_REQUIRED,
+    )
+
+
+def test_idempotent_production_seals_with_colocated_provider(tmp_path) -> None:
+    path = tmp_path / "runtime.db"
+    runtime = Runtime(
+        [
+            AuditMiddleware(
+                JSONLAuditSink(tmp_path / "audit.jsonl", sign_key=b"a" * 32),
+                fail_closed=True,
+            )
+        ],
+        idempotency_store=SQLiteIdempotencyStore(path),
+        reconciliation_ledger=SQLiteReconciliationLedger(path),
+        identity_provider=StaticIdentityProvider(_principal()),
+        require_verified_identity=True,
+        production_profile=strict_profile(),
+    )
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        action_contract=contract(execution_mode=ExecutionMode.IDEMPOTENT),
+        reconciliation_provider=reconciliation_provider(),
+    )
+    def operate(target: str) -> bool:
+        return bool(target)
+
+    assert runtime.seal_production().ready is True
 
 
 def test_empty_registry_can_be_sealed_without_unused_components() -> None:

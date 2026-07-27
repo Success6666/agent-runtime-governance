@@ -485,6 +485,11 @@ class SQLiteIdempotencyStore:
                         raise RuntimeError(
                             "idempotency lease changed before expiry recovery"
                         )
+                    self._materialize_prepared_reconciliation_head(
+                        connection,
+                        execution_record_id=execution_record_id,
+                        recovered_at=now,
+                    )
                     future.set_exception(
                         IdempotencyOutcomeUnknownError(
                             message, execution_record_id=execution_record_id
@@ -603,6 +608,32 @@ class SQLiteIdempotencyStore:
                 ).fetchone()
                 is not None
             )
+            has_prepared_actions = (
+                connection.execute(
+                    """
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = 'reconciliation_prepared_actions'
+                    """
+                ).fetchone()
+                is not None
+            )
+            cutoff = older_than.astimezone(timezone.utc).isoformat()
+            if has_reconciliation_heads and has_prepared_actions:
+                connection.execute(
+                    """
+                    DELETE FROM reconciliation_prepared_actions
+                    WHERE execution_record_id IN (
+                        SELECT execution_record_id FROM idempotency_records
+                        WHERE state = 'completed' AND updated_at < ?
+                          AND NOT EXISTS (
+                              SELECT 1 FROM reconciliation_heads
+                              WHERE reconciliation_heads.execution_record_id =
+                                    idempotency_records.execution_record_id
+                          )
+                    )
+                    """,
+                    (cutoff,),
+                )
             cursor = connection.execute(
                 (
                     """
@@ -620,10 +651,68 @@ class SQLiteIdempotencyStore:
                     WHERE state = 'completed' AND updated_at < ?
                     """
                 ),
-                (older_than.astimezone(timezone.utc).isoformat(),),
+                (cutoff,),
             )
             connection.commit()
             return cursor.rowcount
+
+    @staticmethod
+    def _materialize_prepared_reconciliation_head(
+        connection: sqlite3.Connection,
+        *,
+        execution_record_id: str,
+        recovered_at: datetime,
+    ) -> None:
+        """Create the durable UNKNOWN head prepared before tool dispatch.
+
+        This runs in the same ``BEGIN IMMEDIATE`` transaction as lease-expiry
+        recovery.  The optional tables preserve compatibility with deployments
+        that use idempotency without the reconciliation subsystem; when the
+        v0.7 ledger is configured, a prepared action is always present before a
+        side-effecting tool body starts.
+        """
+
+        tables = {
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'table'
+                  AND name IN (
+                      'reconciliation_heads',
+                      'reconciliation_prepared_actions'
+                  )
+                """
+            )
+        }
+        if tables != {
+            "reconciliation_heads",
+            "reconciliation_prepared_actions",
+        }:
+            return
+        prepared = connection.execute(
+            """
+            SELECT action_json FROM reconciliation_prepared_actions
+            WHERE execution_record_id = ?
+            """,
+            (execution_record_id,),
+        ).fetchone()
+        if prepared is None:
+            return
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO reconciliation_heads(
+                execution_record_id, action_json, state, revision,
+                disposition, resolved_result_available, resolved_result_json,
+                updated_at
+            ) VALUES (?, ?, 'UNKNOWN', 0, 'blocked_unknown', 0, NULL, ?)
+            """,
+            (
+                execution_record_id,
+                prepared[0],
+                recovered_at.astimezone(timezone.utc).isoformat(),
+            ),
+        )
 
     def _transition(
         self,
@@ -718,6 +807,27 @@ class SQLiteIdempotencyStore:
 
     @staticmethod
     def _migrate_v06(connection: sqlite3.Connection, columns: set[str]) -> None:
+        reconciliation_tables = {
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'table'
+                  AND name IN (
+                      'reconciliation_heads',
+                      'reconciliation_prepared_actions'
+                  )
+                """
+            )
+        }
+        has_prepared_actions = "reconciliation_prepared_actions" in reconciliation_tables
+        if has_prepared_actions:
+            # SQLite validates trigger references while renaming the legacy
+            # authority table. Reinstall the same retention guard after the
+            # atomic table swap completes.
+            connection.execute(
+                "DROP TRIGGER IF EXISTS reconciliation_prepared_actions_delete_guard"
+            )
         selected = [
             "namespace",
             "key",
@@ -768,6 +878,32 @@ class SQLiteIdempotencyStore:
         connection.execute(
             "ALTER TABLE idempotency_records_v07 RENAME TO idempotency_records"
         )
+        if reconciliation_tables == {
+            "reconciliation_heads",
+            "reconciliation_prepared_actions",
+        }:
+            connection.execute(
+                """
+                CREATE TRIGGER reconciliation_prepared_actions_delete_guard
+                BEFORE DELETE ON reconciliation_prepared_actions
+                WHEN EXISTS (
+                    SELECT 1 FROM reconciliation_heads
+                    WHERE reconciliation_heads.execution_record_id =
+                          OLD.execution_record_id
+                ) OR EXISTS (
+                    SELECT 1 FROM idempotency_records
+                    WHERE idempotency_records.execution_record_id =
+                          OLD.execution_record_id
+                      AND idempotency_records.state != 'completed'
+                )
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'prepared reconciliation action cannot be deleted before retention is safe'
+                    );
+                END
+                """
+            )
 
     def _connect(self) -> sqlite3.Connection:
         return connect_sqlite(self.path, self.timeout_seconds)

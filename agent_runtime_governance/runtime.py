@@ -2,21 +2,24 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import inspect
 from concurrent.futures import Executor, ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from contextvars import copy_context
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from threading import Lock
 from time import perf_counter
 from typing import Any, Callable, Iterable, Mapping, ParamSpec, TypeVar
+from uuid import uuid4
 
 from ._context_boundaries import validate_middleware_transition
 from ._metadata import metadata_text as _metadata_text
 from ._serialization import thaw as _thaw
 from .action_contracts import ActionContract, BoundAction
+from .audit import reconciliation_event
 from .context import (
     ExecutionContext,
     ExecutionMode,
@@ -43,6 +46,7 @@ from .errors import (
 )
 from .hooks import CriticalHookError, HookCallback, HookPoint, HookRegistry
 from .identity import IdentityProvider, VerifiedPrincipal
+from .middleware.audit import AuditMiddleware
 from .middleware.base import (
     ExecutionCall,
     ExecutionMiddleware,
@@ -54,6 +58,21 @@ from .production import (
     ProductionProfile,
     ProductionReadinessError,
     ProductionReadinessReport,
+)
+from .reconciliation import (
+    ManualResolution,
+    ProviderDescriptor,
+    ReconciliationAttemptContext,
+    ReconciliationAttemptOutcome,
+    ReconciliationConflictError,
+    ReconciliationFinding,
+    ReconciliationHead,
+    ReconciliationLedger,
+    ReconciliationNotFoundError,
+    ReconciliationState,
+    SQLiteReconciliationLedger,
+    UnknownAction,
+    idempotency_namespace_digest,
 )
 from .registry import (
     GovernedTool,
@@ -125,11 +144,13 @@ class Runtime:
         *,
         hooks: HookRegistry | None = None,
         idempotency_store: IdempotencyStore | None = None,
+        reconciliation_ledger: ReconciliationLedger | None = None,
         identity_provider: IdentityProvider | None = None,
         require_verified_identity: bool = False,
         limits: RuntimeLimits | None = None,
         sync_executor: Executor | None = None,
         idempotency_executor: Executor | None = None,
+        reconciliation_executor: Executor | None = None,
         production_profile: ProductionProfile | None = None,
     ) -> None:
         self._pipeline = (
@@ -138,6 +159,7 @@ class Runtime:
         self._hooks = hooks or HookRegistry()
         self._registry = ToolRegistry()
         self._idempotency_store = idempotency_store or InMemoryIdempotencyStore()
+        self._reconciliation_ledger = reconciliation_ledger
         self._identity_provider = identity_provider
         self._require_verified_identity = require_verified_identity
         self._production_profile = production_profile
@@ -162,11 +184,30 @@ class Runtime:
         self._idempotency_poison_lock = Lock()
         self._idempotency_poison: BaseException | None = None
         self._idempotency_draining = 0
+        self._owns_reconciliation_executor = reconciliation_executor is None
+        self._reconciliation_executor = reconciliation_executor or ThreadPoolExecutor(
+            max_workers=min(4, self.limits.max_reconciliation_in_flight),
+            thread_name_prefix="arg-reconciliation",
+        )
+        self._reconciliation_bulkhead = RuntimeBulkhead(
+            self.limits.max_reconciliation_in_flight
+        )
+        self._reconciliation_poison_lock = Lock()
+        self._reconciliation_poison: BaseException | None = None
+        self._reconciliation_draining = 0
+        self._reconciliation_provider_lock = Lock()
+        self._reconciliation_provider_poison: dict[str, BaseException] = {}
+        self._reconciliation_provider_draining: set[str] = set()
+        self._reconciliation_tasks: set[asyncio.Task[Any]] = set()
         self._closed = False
 
     def close(self, *, wait: bool = True) -> None:
         """Stop accepting work and release the owned synchronous executor."""
         self._closed = True
+        for task in tuple(self._reconciliation_tasks):
+            task.cancel()
+        if self._owns_reconciliation_executor:
+            self._reconciliation_executor.shutdown(wait=wait, cancel_futures=True)
         if self._owns_idempotency_executor:
             self._idempotency_executor.shutdown(wait=wait, cancel_futures=True)
         if self._owns_sync_executor:
@@ -186,6 +227,12 @@ class Runtime:
         """Return the executor isolated for idempotency-store operations."""
 
         return self._idempotency_executor
+
+    @property
+    def reconciliation_executor(self) -> Executor:
+        """Return the executor isolated for reconciliation-ledger operations."""
+
+        return self._reconciliation_executor
 
     def __enter__(self) -> "Runtime":
         return self
@@ -264,6 +311,16 @@ class Runtime:
             self._idempotency_store = value
 
     @property
+    def reconciliation_ledger(self) -> ReconciliationLedger | None:
+        return self._reconciliation_ledger
+
+    @reconciliation_ledger.setter
+    def reconciliation_ledger(self, value: ReconciliationLedger | None) -> None:
+        with self._production_seal_lock:
+            self._guard_sealed_mutation("reconciliation_ledger")
+            self._reconciliation_ledger = value
+
+    @property
     def identity_provider(self) -> IdentityProvider | None:
         return self._identity_provider
 
@@ -303,6 +360,7 @@ class Runtime:
             self.registry.list(),
             pipeline=self.pipeline,
             idempotency_store=self.idempotency_store,
+            reconciliation_ledger=self.reconciliation_ledger,
             identity_provider=self.identity_provider,
             require_verified_identity=self.require_verified_identity,
         )
@@ -321,6 +379,7 @@ class Runtime:
                     tools,
                     pipeline=self.pipeline,
                     idempotency_store=self.idempotency_store,
+                    reconciliation_ledger=self.reconciliation_ledger,
                     identity_provider=self.identity_provider,
                     require_verified_identity=self.require_verified_identity,
                 )
@@ -370,6 +429,8 @@ class Runtime:
         max_parameters_bytes: int | None = None,
         max_result_bytes: int | None = None,
         action_contract: ActionContract | None = None,
+        reconciliation_provider: ProviderDescriptor | None = None,
+        reconciliation_probe_schema: dict[str, Any] | None = None,
     ) -> Callable[[Callable[P, R]], GovernedTool[P, R]]:
         def decorator(function: Callable[P, R]) -> GovernedTool[P, R]:
             spec = ToolSpec(
@@ -384,6 +445,8 @@ class Runtime:
                 max_parameters_bytes=max_parameters_bytes,
                 max_result_bytes=max_result_bytes,
                 action_contract=action_contract,
+                reconciliation_provider=reconciliation_provider,
+                reconciliation_probe_schema=reconciliation_probe_schema,
             )
             self.registry.register(spec)
             return GovernedTool(self, spec)
@@ -581,14 +644,32 @@ class Runtime:
                     )
                     context = await self._run_observers(context, post=True)
                     return RunResult(value=value, context=context)
+                if claim.execution_record_id is not None:
+                    context = context.evolve(
+                        metadata={
+                            **context.metadata,
+                            "execution_record_id": claim.execution_record_id,
+                        }
+                    )
                 context = await self._commit_approvals(context)
                 context = self._enforce_required_approval(context)
                 if context.denied:
                     denial = GovernanceDenied(context)
-                    await self._finish_idempotency(claim, context, denial)
+                    await self._finish_idempotency(
+                        claim, context, denial, spec=spec
+                    )
                     claim = None
                     context = await self._run_observers(context, post=True)
                     raise denial
+                if isinstance(self.reconciliation_ledger, SQLiteReconciliationLedger):
+                    prepared_action = self._unknown_action(spec, context, claim)
+                    await self._run_reconciliation_operation(
+                        self.reconciliation_ledger.prepare_action,
+                        claim,
+                        prepared_action,
+                        deadline=context.deadline,
+                        stage="reconciliation prepare action",
+                    )
                 heartbeat_task = self._start_idempotency_heartbeat(claim)
             else:
                 context = await self._commit_approvals(context)
@@ -685,7 +766,7 @@ class Runtime:
                 heartbeat_task, raise_on_failure=True
             )
             heartbeat_task = None
-            await self._finish_idempotency(claim, context, None, value)
+            await self._finish_idempotency(claim, context, None, value, spec=spec)
             claim = None
         except ExecutionControlError as exc:
             await self._stop_idempotency_heartbeat(
@@ -706,7 +787,9 @@ class Runtime:
                     and context.execution_mode is ExecutionMode.MUTATING
                 ),
             )
-            context = await self._settle_idempotency(claim, context, cause)
+            context = await self._settle_idempotency(
+                claim, context, cause, spec=spec
+            )
             context = await self._emit_hook(
                 HookPoint.ON_ERROR, context, allow_critical=False
             )
@@ -716,7 +799,9 @@ class Runtime:
             await self._stop_idempotency_heartbeat(
                 heartbeat_task, raise_on_failure=False
             )
-            context = await self._settle_idempotency(claim, exc.context, exc)
+            context = await self._settle_idempotency(
+                claim, exc.context, exc, spec=spec
+            )
             claim = None
             context = await self._run_observers(context, post=True)
             raise GovernanceDenied(context) from exc
@@ -729,6 +814,7 @@ class Runtime:
                 started,
                 uncertain=execution_started,
                 claim=claim,
+                spec=spec,
             )
             raise GovernanceCancelledError(context) from exc
         except Exception as exc:
@@ -750,7 +836,9 @@ class Runtime:
                     and context.execution_mode is ExecutionMode.MUTATING
                 ),
             )
-            context = await self._settle_idempotency(claim, context, exc)
+            context = await self._settle_idempotency(
+                claim, context, exc, spec=spec
+            )
             context = await self._emit_hook(
                 HookPoint.ON_ERROR, context, allow_critical=False
             )
@@ -874,6 +962,455 @@ class Runtime:
             return clean
         replayed = await self._run_pre_pipeline(clean, replayable_only=True)
         return self._enforce_required_approval(replayed)
+
+    async def areconcile(
+        self,
+        execution_record_id: str,
+        *,
+        deadline: datetime | None = None,
+    ) -> ReconciliationHead:
+        """Run one explicit, read-only reconciliation attempt for UNKNOWN work."""
+
+        if self._closed:
+            raise RuntimeError("runtime is closed")
+        if self.production_profile is not None and not self._production_sealed:
+            raise ProductionReadinessError(self.production_readiness())
+        ledger = self.reconciliation_ledger
+        if ledger is None:
+            raise ReconciliationNotFoundError("reconciliation ledger is not configured")
+
+        async def read_head_with_audit(
+            *,
+            event_type: str,
+            provider: ProviderDescriptor | None = None,
+            attempt_id: str | None = None,
+            outcome: ReconciliationAttemptOutcome | None = None,
+            finding: ReconciliationFinding | None = None,
+        ) -> ReconciliationHead:
+            current = await self._run_reconciliation_operation(
+                ledger.current,
+                execution_record_id,
+                deadline=deadline,
+                stage="reconciliation read head",
+            )
+            await self._write_reconciliation_audit(
+                current,
+                event_type=event_type,
+                provider=provider,
+                attempt_id=attempt_id,
+                outcome=outcome,
+                finding=finding,
+            )
+            return current
+
+        head = await self._run_reconciliation_operation(
+            ledger.current,
+            execution_record_id,
+            deadline=deadline,
+            stage="reconciliation read head",
+        )
+        if head.state is not ReconciliationState.UNKNOWN:
+            return head
+        spec = self.registry.get(head.action.tool_name)
+        provider = spec.reconciliation_provider
+        attempt_timeout = self._bounded_timeout(
+            deadline,
+            self.limits.reconciliation_provider_timeout_seconds,
+            "reconciliation provider",
+        )
+        attempt = ReconciliationAttemptContext(
+            attempt_id=uuid4().hex,
+            deadline=datetime.now(timezone.utc) + timedelta(seconds=attempt_timeout),
+            protocol_version=("1" if provider is None else provider.protocol_version),
+            action=head.action,
+        )
+        descriptor = provider or self._unavailable_provider_descriptor()
+        started = await self._run_reconciliation_operation(
+            ledger.start_attempt,
+            attempt,
+            descriptor,
+            head.revision,
+            deadline=deadline,
+            stage="reconciliation start attempt",
+        )
+        if provider is None:
+            await self._finish_reconciliation_attempt(
+                ledger,
+                attempt,
+                descriptor,
+                ReconciliationAttemptOutcome.UNAVAILABLE,
+                started.revision,
+                error="no trusted reconciliation provider is registered for this tool",
+                deadline=deadline,
+            )
+            return await read_head_with_audit(
+                event_type="attempt_finished",
+                provider=descriptor,
+                attempt_id=attempt.attempt_id,
+                outcome=ReconciliationAttemptOutcome.UNAVAILABLE,
+            )
+
+        try:
+            finding = await self._invoke_reconciliation_provider(provider, attempt)
+            if not isinstance(finding, ReconciliationFinding):
+                raise TypeError("reconciliation provider must return ReconciliationFinding")
+        except asyncio.CancelledError:
+            await asyncio.shield(
+                self._finish_reconciliation_attempt(
+                    ledger,
+                    attempt,
+                    provider,
+                    ReconciliationAttemptOutcome.CANCELLED,
+                    started.revision,
+                    error="reconciliation caller cancelled the provider attempt",
+                    deadline=None,
+                )
+            )
+            raise
+        except StageTimeoutError as exc:
+            await self._finish_reconciliation_attempt(
+                ledger,
+                attempt,
+                provider,
+                ReconciliationAttemptOutcome.TIMEOUT,
+                started.revision,
+                error=f"{type(exc).__name__}: provider deadline elapsed",
+                deadline=deadline,
+            )
+            return await read_head_with_audit(
+                event_type="attempt_finished",
+                provider=provider,
+                attempt_id=attempt.attempt_id,
+                outcome=ReconciliationAttemptOutcome.TIMEOUT,
+            )
+        except ReconciliationConflictError as exc:
+            await self._finish_reconciliation_attempt(
+                ledger,
+                attempt,
+                provider,
+                ReconciliationAttemptOutcome.UNAVAILABLE,
+                started.revision,
+                error=f"{type(exc).__name__}: provider is unavailable",
+                deadline=deadline,
+            )
+            return await read_head_with_audit(
+                event_type="attempt_finished",
+                provider=provider,
+                attempt_id=attempt.attempt_id,
+                outcome=ReconciliationAttemptOutcome.UNAVAILABLE,
+            )
+        except Exception as exc:
+            await self._finish_reconciliation_attempt(
+                ledger,
+                attempt,
+                provider,
+                ReconciliationAttemptOutcome.ERROR,
+                started.revision,
+                error=f"{type(exc).__name__}: provider did not return a conclusion",
+                deadline=deadline,
+            )
+            return await read_head_with_audit(
+                event_type="attempt_finished",
+                provider=provider,
+                attempt_id=attempt.attempt_id,
+                outcome=ReconciliationAttemptOutcome.ERROR,
+            )
+
+        finished = await self._finish_reconciliation_attempt(
+            ledger,
+            attempt,
+            provider,
+            ReconciliationAttemptOutcome.SUCCESS,
+            started.revision,
+            finding=finding,
+            deadline=deadline,
+        )
+        if finished is None:
+            return await read_head_with_audit(
+                event_type="attempt_conflicted",
+                provider=provider,
+                attempt_id=attempt.attempt_id,
+                outcome=ReconciliationAttemptOutcome.SUCCESS,
+                finding=finding,
+            )
+        try:
+            transitioned = await self._run_reconciliation_operation(
+                ledger.compare_and_append_transition,
+                execution_record_id,
+                ReconciliationState.UNKNOWN,
+                finished.revision,
+                finding,
+                provider=provider,
+                attempt_id=attempt.attempt_id,
+                deadline=deadline,
+                stage="reconciliation append transition",
+            )
+            await self._write_reconciliation_audit(
+                transitioned,
+                event_type="transition_recorded",
+                provider=provider,
+                attempt_id=attempt.attempt_id,
+                outcome=ReconciliationAttemptOutcome.SUCCESS,
+                finding=finding,
+            )
+            return transitioned
+        except ReconciliationConflictError:
+            return await read_head_with_audit(
+                event_type="transition_conflicted",
+                provider=provider,
+                attempt_id=attempt.attempt_id,
+                outcome=ReconciliationAttemptOutcome.SUCCESS,
+                finding=finding,
+            )
+
+    async def aresolve_reconciliation(
+        self,
+        execution_record_id: str,
+        *,
+        expected_state: ReconciliationState,
+        expected_revision: int,
+        new_state: ReconciliationState,
+        reason: str,
+        evidence_kind: str,
+        evidence: Mapping[str, Any],
+        identity_claims: Mapping[str, Any] | None = None,
+        retry_safe: bool = False,
+        resolved_result_available: bool = False,
+        resolved_result: Any = None,
+        deadline: datetime | None = None,
+    ) -> ReconciliationHead:
+        """Apply a verified operator decision to a MANUAL_REVIEW execution."""
+
+        if self._closed:
+            raise RuntimeError("runtime is closed")
+        if self.production_profile is not None and not self._production_sealed:
+            raise ProductionReadinessError(self.production_readiness())
+        ledger = self.reconciliation_ledger
+        if ledger is None:
+            raise ReconciliationNotFoundError("reconciliation ledger is not configured")
+        if self.identity_provider is None:
+            raise PermissionError("manual reconciliation requires a trusted identity provider")
+        profile = self.production_profile
+        if (
+            profile is None
+            or profile.identity_digest_key_provider is None
+            or profile.identity_digest_key_version is None
+        ):
+            raise PermissionError(
+                "manual reconciliation requires a production identity digest key"
+            )
+        principal = await self._invoke_identity_provider(identity_claims, deadline)
+        if not isinstance(principal, VerifiedPrincipal):
+            raise PermissionError("identity provider returned an invalid principal")
+        key = await self._call_binding_provider(
+            profile.identity_digest_key_provider.get_key,
+            stage="manual reconciliation identity digest key",
+            deadline=deadline,
+            tenant=principal.tenant,
+            version=profile.identity_digest_key_version,
+        )
+        if not isinstance(key, bytes):
+            raise PermissionError("identity digest key provider returned invalid key data")
+        operator_digest = hmac.new(
+            key,
+            canonical_json_bytes(
+                {
+                    "domain": "arg.reconciliation-operator",
+                    "version": 1,
+                    "issuer": principal.issuer,
+                    "subject": principal.subject,
+                    "tenant": principal.tenant,
+                },
+                label="manual reconciliation operator",
+            ),
+            hashlib.sha256,
+        ).hexdigest()
+        resolution = ManualResolution(
+            execution_record_id=execution_record_id,
+            operator_identity_digest=operator_digest,
+            reason=reason,
+            expected_state=expected_state,
+            expected_revision=expected_revision,
+            new_state=new_state,
+            resolved_at=datetime.now(timezone.utc),
+            evidence_kind=evidence_kind,
+            evidence=evidence,
+            retry_safe=retry_safe,
+            resolved_result_available=resolved_result_available,
+            resolved_result=resolved_result,
+        )
+        head = await self._run_reconciliation_operation(
+            ledger.compare_and_append_transition,
+            execution_record_id,
+            expected_state,
+            expected_revision,
+            resolution,
+            deadline=deadline,
+            stage="reconciliation manual resolution",
+        )
+        await self._write_reconciliation_audit(
+            head,
+            event_type="manual_transition_recorded",
+            evidence_kind=resolution.evidence_kind,
+            evidence=resolution.evidence,
+            operator_identity_digest=operator_digest,
+        )
+        return head
+
+    @staticmethod
+    def _unavailable_provider_descriptor() -> ProviderDescriptor:
+        async def unavailable(
+            _context: ReconciliationAttemptContext,
+        ) -> ReconciliationFinding:
+            raise RuntimeError("unavailable provider sentinel must not be called")
+
+        return ProviderDescriptor(
+            provider_id="runtime.unavailable",
+            protocol_version="1",
+            supported_evidence_kinds=("runtime",),
+            provider=unavailable,
+        )
+
+    async def _write_reconciliation_audit(
+        self,
+        head: ReconciliationHead,
+        *,
+        event_type: str,
+        provider: ProviderDescriptor | None = None,
+        attempt_id: str | None = None,
+        outcome: ReconciliationAttemptOutcome | None = None,
+        finding: ReconciliationFinding | None = None,
+        evidence_kind: str | None = None,
+        evidence: Mapping[str, Any] | None = None,
+        operator_identity_digest: str | None = None,
+    ) -> None:
+        middleware = next(
+            (
+                item
+                for item in self.pipeline
+                if isinstance(item, AuditMiddleware)
+            ),
+            None,
+        )
+        if middleware is None:
+            return
+        event = reconciliation_event(
+            head,
+            event_type=event_type,
+            provider=provider,
+            attempt_id=attempt_id,
+            outcome=None if outcome is None else outcome.value,
+            evidence_kind=(
+                finding.evidence_kind if finding is not None else evidence_kind
+            ),
+            evidence=finding.evidence if finding is not None else evidence,
+            operator_identity_digest=operator_identity_digest,
+        )
+        try:
+            await asyncio.to_thread(middleware.sink.write, event)
+        except Exception:
+            if middleware.fail_closed:
+                raise
+
+    async def _finish_reconciliation_attempt(
+        self,
+        ledger: ReconciliationLedger,
+        attempt: ReconciliationAttemptContext,
+        provider: ProviderDescriptor,
+        outcome: ReconciliationAttemptOutcome,
+        expected_revision: int,
+        *,
+        finding: ReconciliationFinding | None = None,
+        error: str | None = None,
+        deadline: datetime | None,
+    ) -> Any | None:
+        try:
+            return await self._run_reconciliation_operation(
+                ledger.finish_attempt,
+                attempt,
+                provider,
+                outcome,
+                expected_revision,
+                finding=finding,
+                error=error,
+                deadline=deadline,
+                stage="reconciliation finish attempt",
+            )
+        except ReconciliationConflictError:
+            # A concurrent manual resolution or another provider attempt won
+            # the ledger CAS. The late worker must not create a new transition.
+            return None
+
+    async def _invoke_reconciliation_provider(
+        self,
+        provider: ProviderDescriptor,
+        attempt: ReconciliationAttemptContext,
+    ) -> ReconciliationFinding:
+        self._raise_if_reconciliation_provider_available(provider.provider_id)
+        callback = getattr(provider.provider, "reconcile", provider.provider)
+        candidate = callback(attempt)
+        if not inspect.isawaitable(candidate):
+            raise TypeError("reconciliation provider must return an awaitable")
+        task = asyncio.create_task(
+            candidate,
+            name=(
+                f"reconciliation-provider:{provider.provider_id}:{attempt.attempt_id}"
+            ),
+        )
+        self._reconciliation_tasks.add(task)
+        task.add_done_callback(self._forget_reconciliation_task)
+        timeout = self._bounded_timeout(
+            attempt.deadline,
+            self.limits.reconciliation_provider_timeout_seconds,
+            "reconciliation provider",
+        )
+        try:
+            done, _ = await asyncio.wait({task}, timeout=timeout)
+            if task in done:
+                return task.result()
+            timeout_error = StageTimeoutError("reconciliation provider", timeout)
+            task.cancel()
+            done, _ = await asyncio.wait(
+                {task}, timeout=self.limits.cancellation_grace_seconds
+            )
+            if task not in done:
+                self._poison_reconciliation_provider(provider.provider_id, timeout_error)
+            raise timeout_error
+        except asyncio.CancelledError:
+            if not task.done():
+                task.cancel()
+                done, _ = await asyncio.wait(
+                    {task}, timeout=self.limits.cancellation_grace_seconds
+                )
+                if task not in done:
+                    self._poison_reconciliation_provider(
+                        provider.provider_id,
+                        RuntimeError("reconciliation provider ignored cancellation"),
+                    )
+            raise
+
+    def _forget_reconciliation_task(self, task: asyncio.Task[Any]) -> None:
+        self._reconciliation_tasks.discard(task)
+        self._consume_background_result(task)
+
+    def _raise_if_reconciliation_provider_available(self, provider_id: str) -> None:
+        with self._reconciliation_provider_lock:
+            cause = self._reconciliation_provider_poison.get(provider_id)
+            draining = provider_id in self._reconciliation_provider_draining
+        if cause is not None:
+            raise ReconciliationConflictError(
+                "reconciliation provider is disabled after a hard deadline breach"
+            ) from cause
+        if draining:
+            raise ReconciliationConflictError(
+                "reconciliation provider has a detached task still draining"
+            )
+
+    def _poison_reconciliation_provider(
+        self, provider_id: str, cause: BaseException
+    ) -> None:
+        with self._reconciliation_provider_lock:
+            self._reconciliation_provider_poison.setdefault(provider_id, cause)
 
     async def _create_context(
         self,
@@ -1585,15 +2122,113 @@ class Runtime:
             if not deferred_release:
                 lease.release()
 
+    async def _run_reconciliation_operation(
+        self,
+        function: Callable[..., Any],
+        *args: Any,
+        deadline: datetime | None = None,
+        stage: str = "reconciliation ledger operation",
+        **kwargs: Any,
+    ) -> Any:
+        self._raise_if_reconciliation_poisoned()
+        timeout = self._bounded_timeout(
+            deadline,
+            self.limits.reconciliation_operation_timeout_seconds,
+            stage,
+        )
+        lease = await self._reconciliation_bulkhead.acquire(timeout)
+        task: asyncio.Future[Any] | None = None
+        deferred_release = False
+        try:
+            loop = asyncio.get_running_loop()
+            future = self._reconciliation_executor.submit(
+                partial(function, *args, **kwargs)
+            )
+            task = asyncio.wrap_future(future, loop=loop)
+            done, _ = await asyncio.wait({task}, timeout=timeout)
+            if task in done:
+                return task.result()
+            error = StageTimeoutError(stage, timeout)
+            self._poison_reconciliation(error)
+            deferred_release = True
+            future.add_done_callback(
+                lambda _completed: self._finish_detached_reconciliation(lease)
+            )
+            task.add_done_callback(self._consume_background_result)
+            raise error
+        except asyncio.CancelledError:
+            if task is not None and not task.done():
+                self._suspend_reconciliation()
+                deferred_release = True
+                task.add_done_callback(
+                    lambda _completed: self._finish_detached_reconciliation(
+                        lease, resume=True
+                    )
+                )
+                task.add_done_callback(self._consume_background_result)
+            raise
+        except BaseException:
+            if task is not None and not task.done():
+                self._suspend_reconciliation()
+                deferred_release = True
+                task.add_done_callback(
+                    lambda _completed: self._finish_detached_reconciliation(
+                        lease, resume=True
+                    )
+                )
+                task.add_done_callback(self._consume_background_result)
+            raise
+        finally:
+            if not deferred_release:
+                lease.release()
+
+    def _finish_detached_reconciliation(
+        self, lease: Any, *, resume: bool = False
+    ) -> None:
+        lease.release()
+        if resume:
+            self._resume_reconciliation()
+
+    def _raise_if_reconciliation_poisoned(self) -> None:
+        with self._reconciliation_poison_lock:
+            cause = self._reconciliation_poison
+            draining = self._reconciliation_draining
+        if cause is not None:
+            raise ReconciliationConflictError(
+                "reconciliation ledger was disabled after an operation exceeded "
+                "its bounded execution contract"
+            ) from cause
+        if draining:
+            raise ReconciliationConflictError(
+                "reconciliation ledger has a detached operation still draining"
+            )
+
+    def _poison_reconciliation(self, cause: BaseException) -> None:
+        with self._reconciliation_poison_lock:
+            if self._reconciliation_poison is None:
+                self._reconciliation_poison = cause
+
+    def _suspend_reconciliation(self) -> None:
+        with self._reconciliation_poison_lock:
+            if self._reconciliation_poison is None:
+                self._reconciliation_draining += 1
+
+    def _resume_reconciliation(self) -> None:
+        with self._reconciliation_poison_lock:
+            if self._reconciliation_draining > 0:
+                self._reconciliation_draining -= 1
+
     async def _finish_idempotency(
         self,
         claim: IdempotencyClaim | None,
         context: ExecutionContext,
         error: BaseException | None,
         value: Any = None,
-    ) -> None:
+        *,
+        spec: ToolSpec[Any, Any] | None = None,
+    ) -> ReconciliationHead | None:
         if claim is None:
-            return
+            return None
         if error is None:
             await self._run_critical_store_operation(
                 self.idempotency_store.complete,
@@ -1602,7 +2237,12 @@ class Runtime:
                 deadline=context.deadline,
                 stage="idempotency complete",
             )
-        elif context.status is ExecutionStatus.UNKNOWN:
+            return None
+        if context.status is ExecutionStatus.UNKNOWN:
+            if spec is not None and self.reconciliation_ledger is not None:
+                return await self._record_unknown_reconciliation(
+                    claim, spec, context, error
+                )
             await self._run_critical_store_operation(
                 self.idempotency_store.mark_unknown,
                 claim,
@@ -1610,14 +2250,96 @@ class Runtime:
                 deadline=context.deadline,
                 stage="idempotency mark unknown",
             )
+            return None
+        await self._run_critical_store_operation(
+            self.idempotency_store.fail,
+            claim,
+            error,
+            deadline=context.deadline,
+            stage="idempotency fail",
+        )
+        return None
+
+    async def _record_unknown_reconciliation(
+        self,
+        claim: IdempotencyClaim,
+        spec: ToolSpec[Any, Any],
+        context: ExecutionContext,
+        error: BaseException,
+    ) -> ReconciliationHead:
+        ledger = self.reconciliation_ledger
+        assert ledger is not None
+        action = self._unknown_action(spec, context, claim, error)
+        if isinstance(ledger, SQLiteReconciliationLedger):
+            head = await self._run_reconciliation_operation(
+                ledger.record_unknown,
+                claim,
+                action,
+                error,
+                deadline=context.deadline,
+                stage="reconciliation record unknown",
+            )
         else:
+            # Process-local adapters are intentionally not promoted as a
+            # durable atomic boundary. They retain compatibility for local
+            # development, while production sealing rejects them.
             await self._run_critical_store_operation(
-                self.idempotency_store.fail,
+                self.idempotency_store.mark_unknown,
                 claim,
                 error,
                 deadline=context.deadline,
-                stage="idempotency fail",
+                stage="idempotency mark unknown",
             )
+            head = await self._run_reconciliation_operation(
+                ledger.create_unknown,
+                action,
+                deadline=context.deadline,
+                stage="reconciliation create unknown",
+            )
+        await self._write_reconciliation_audit(
+            head,
+            event_type="unknown_recorded",
+        )
+        return head
+
+    @staticmethod
+    def _unknown_action(
+        spec: ToolSpec[Any, Any],
+        context: ExecutionContext,
+        claim: IdempotencyClaim,
+        error: BaseException | None = None,
+    ) -> UnknownAction:
+        if claim.execution_record_id is None:
+            raise ReconciliationConflictError(
+                "idempotency claim has no execution record identifier"
+            )
+        bound_action = context.bound_action
+        contract = None if bound_action is None else bound_action.contract
+        return UnknownAction(
+            execution_record_id=claim.execution_record_id,
+            action_digest=claim.fingerprint,
+            tool_name=spec.name,
+            contract_id=(
+                contract.contract_id if contract is not None else f"runtime.{spec.name}"
+            ),
+            contract_version=(contract.contract_version if contract is not None else 1),
+            idempotency_namespace_digest=idempotency_namespace_digest(claim.namespace),
+            uncertainty_reason=(
+                "execution outcome may require explicit reconciliation"
+                if error is None
+                else f"{type(error).__name__}: execution outcome is unknown"
+            ),
+            attempted_at=datetime.now(timezone.utc),
+            receipt_schema=(None if contract is None else contract.receipt_schema),
+            probe_schema=spec.reconciliation_probe_schema,
+            result_schema=(
+                spec.result_schema
+                if spec.result_schema is not None
+                else (None if contract is None else contract.receipt_schema)
+            ),
+            max_result_bytes=spec.max_result_bytes or 1_048_576,
+            metadata={"trace_id": context.trace_id, "request_id": context.request_id},
+        )
 
     def _start_idempotency_heartbeat(
         self, claim: IdempotencyClaim
@@ -1667,9 +2389,13 @@ class Runtime:
         context: ExecutionContext,
         error: BaseException | None,
         value: Any = None,
+        *,
+        spec: ToolSpec[Any, Any] | None = None,
     ) -> ExecutionContext:
         try:
-            await self._finish_idempotency(claim, context, error, value)
+            head = await self._finish_idempotency(
+                claim, context, error, value, spec=spec
+            )
         except Exception as settlement_error:
             changes: dict[str, Any] = {
                 "error": (
@@ -1684,6 +2410,20 @@ class Runtime:
                     "idempotency",
                     "unknown",
                     f"ledger settlement failed: {settlement_error}",
+                )
+            )
+        if head is not None:
+            context = context.evolve(
+                metadata={
+                    **context.metadata,
+                    "execution_record_id": head.execution_record_id,
+                }
+            ).append_history(
+                HistoryEntry(
+                    "reconciliation",
+                    "recorded",
+                    "UNKNOWN outcome was recorded for explicit reconciliation",
+                    data={"execution_record_id": head.execution_record_id},
                 )
             )
         return context
@@ -1981,6 +2721,7 @@ class Runtime:
         *,
         uncertain: bool,
         claim: IdempotencyClaim | None = None,
+        spec: ToolSpec[Any, Any] | None = None,
     ) -> ExecutionContext:
         if not context.denied:
             context = context.evolve(
@@ -2009,7 +2750,7 @@ class Runtime:
             )
         )
         context = await self._settle_idempotency(
-            claim, context, asyncio.CancelledError()
+            claim, context, asyncio.CancelledError(), spec=spec
         )
         context = await self._abort_observers(context)
         try:

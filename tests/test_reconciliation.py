@@ -556,6 +556,89 @@ def test_sqlite_record_unknown_commits_authority_and_head_together(
     assert raw_key not in str(blocked.value)
 
 
+def test_expired_prepared_lease_materializes_reconciliation_head(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "expired-prepared.db"
+    raw_key = "caller-visible-idempotency-key"
+    store = SQLiteIdempotencyStore(path, lease_seconds=60)
+    claim = store.acquire("tenant/charge", raw_key, _ACTION_DIGEST)
+    assert claim.execution_record_id is not None
+    ledger = SQLiteReconciliationLedger(path)
+    action = _unknown(claim.execution_record_id)
+    ledger.prepare_action(claim, action)
+
+    expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute(
+                """
+                UPDATE idempotency_records SET lease_expires_at = ?
+                WHERE execution_record_id = ?
+                """,
+                (expired, claim.execution_record_id),
+            )
+
+    duplicate = SQLiteIdempotencyStore(path).acquire(
+        "tenant/charge", raw_key, _ACTION_DIGEST
+    )
+    with pytest.raises(IdempotencyOutcomeUnknownError) as blocked:
+        duplicate.future.result()
+    assert blocked.value.execution_record_id == claim.execution_record_id
+    head = ledger.current(claim.execution_record_id)
+    assert head.state is ReconciliationState.UNKNOWN
+    assert head.action.to_dict() == action.to_dict()
+    with closing(sqlite3.connect(path)) as connection:
+        prepared = connection.execute(
+            """
+            SELECT action_json FROM reconciliation_prepared_actions
+            WHERE execution_record_id = ?
+            """,
+            (claim.execution_record_id,),
+        ).fetchone()[0]
+    assert raw_key not in prepared
+
+
+def test_sqlite_prepared_actions_are_database_enforced_immutable(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "prepared-immutable.db"
+    store = SQLiteIdempotencyStore(path)
+    claim = store.acquire("tenant/charge", "request-1", _ACTION_DIGEST)
+    assert claim.execution_record_id is not None
+    ledger = SQLiteReconciliationLedger(path)
+    ledger.prepare_action(claim, _unknown(claim.execution_record_id))
+
+    with closing(sqlite3.connect(path)) as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            connection.execute(
+                "UPDATE reconciliation_prepared_actions SET prepared_at = 'x'"
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="cannot be deleted"):
+            connection.execute("DELETE FROM reconciliation_prepared_actions")
+
+
+def test_prune_completed_removes_only_safe_prepared_actions(tmp_path: Path) -> None:
+    path = tmp_path / "prepared-retention.db"
+    store = SQLiteIdempotencyStore(path)
+    claim = store.acquire("tenant/charge", "request-1", _ACTION_DIGEST)
+    assert claim.execution_record_id is not None
+    ledger = SQLiteReconciliationLedger(path)
+    ledger.prepare_action(claim, _unknown(claim.execution_record_id))
+    store.complete(claim, {"ok": True})
+
+    assert store.prune_completed(
+        older_than=datetime.now(timezone.utc) + timedelta(seconds=1)
+    ) == 1
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM reconciliation_prepared_actions"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM idempotency_records"
+        ).fetchone()[0] == 0
+
+
 def test_sqlite_transition_rolls_back_head_and_event_when_authority_is_stale(
     tmp_path: Path,
 ) -> None:

@@ -712,6 +712,10 @@ class ReconciliationHead:
 
 
 class ReconciliationLedger(Protocol):
+    def prepare_action(
+        self, claim: "IdempotencyClaim", action: UnknownAction
+    ) -> None: ...
+
     def create_unknown(self, action: UnknownAction) -> ReconciliationHead: ...
 
     def start_attempt(
@@ -759,7 +763,29 @@ class InMemoryReconciliationLedger:
     def __init__(self) -> None:
         self._heads: dict[str, ReconciliationHead] = {}
         self._events: dict[str, list[ReconciliationRecord]] = {}
+        self._prepared_actions: dict[str, UnknownAction] = {}
         self._lock = Lock()
+
+    def prepare_action(
+        self, claim: "IdempotencyClaim", action: UnknownAction
+    ) -> None:
+        if not isinstance(action, UnknownAction):
+            raise TypeError("action must be an UnknownAction")
+        if not getattr(claim, "owner", False):
+            raise ReconciliationConflictError(
+                "only the current idempotency owner can prepare reconciliation"
+            )
+        if claim.execution_record_id != action.execution_record_id:
+            raise ReconciliationValidationError(
+                "prepared action execution record does not match the idempotency claim"
+            )
+        with self._lock:
+            existing = self._prepared_actions.get(action.execution_record_id)
+            if existing is not None and existing != action:
+                raise ReconciliationConflictError(
+                    "a different reconciliation action is already prepared"
+                )
+            self._prepared_actions[action.execution_record_id] = action
 
     def create_unknown(self, action: UnknownAction) -> ReconciliationHead:
         if not isinstance(action, UnknownAction):
@@ -985,6 +1011,63 @@ class SQLiteReconciliationLedger:
             connection.commit()
         return self.current(action.execution_record_id)
 
+    def prepare_action(
+        self, claim: "IdempotencyClaim", action: UnknownAction
+    ) -> None:
+        """Durably bind a pending idempotency execution to a safe probe descriptor.
+
+        The action is persisted before the tool body can start.  A subsequent
+        process crash can therefore turn an expired lease into an explicit
+        UNKNOWN reconciliation record without retaining a caller idempotency key
+        or any raw identity material.
+        """
+
+        self._validate_prepared_claim(claim, action)
+        encoded = _dump(action.to_dict())
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT action_json FROM reconciliation_prepared_actions
+                WHERE execution_record_id = ?
+                """,
+                (claim.execution_record_id,),
+            ).fetchone()
+            if row is None:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO reconciliation_prepared_actions(
+                        execution_record_id, action_json, prepared_at
+                    )
+                    SELECT ?, ?, ?
+                    WHERE EXISTS (
+                        SELECT 1 FROM idempotency_records
+                        WHERE execution_record_id = ?
+                          AND namespace = ? AND key = ? AND fingerprint = ?
+                          AND owner_token = ? AND state = 'pending'
+                    )
+                    """,
+                    (
+                        claim.execution_record_id,
+                        encoded,
+                        _timestamp_text(action.attempted_at),
+                        claim.execution_record_id,
+                        claim.namespace,
+                        claim.key,
+                        claim.fingerprint,
+                        claim.owner_token,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ReconciliationConflictError(
+                        "idempotency ownership was lost before reconciliation preparation"
+                    )
+            elif row[0] != encoded:
+                raise ReconciliationConflictError(
+                    "a different reconciliation action is already prepared"
+                )
+            connection.commit()
+
     def record_unknown(
         self,
         claim: "IdempotencyClaim",
@@ -1025,6 +1108,17 @@ class SQLiteReconciliationLedger:
         stored_error = f"{type(error).__name__}: execution outcome is unknown"
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            prepared = connection.execute(
+                """
+                SELECT action_json FROM reconciliation_prepared_actions
+                WHERE execution_record_id = ?
+                """,
+                (claim.execution_record_id,),
+            ).fetchone()
+            if prepared is not None:
+                persisted_action = UnknownAction.from_dict(json.loads(prepared[0]))
+                self._validate_prepared_action_identity(persisted_action, action)
+                action = persisted_action
             cursor = connection.execute(
                 """
                 UPDATE idempotency_records
@@ -1079,6 +1173,50 @@ class SQLiteReconciliationLedger:
             )
             claim.future.exception()
         return self.current(action.execution_record_id)
+
+    @staticmethod
+    def _validate_prepared_claim(
+        claim: "IdempotencyClaim", action: UnknownAction
+    ) -> None:
+        if not isinstance(action, UnknownAction):
+            raise TypeError("action must be an UnknownAction")
+        if not getattr(claim, "owner", False):
+            raise ReconciliationConflictError(
+                "only the current idempotency owner can prepare reconciliation"
+            )
+        if claim.execution_record_id != action.execution_record_id:
+            raise ReconciliationValidationError(
+                "prepared action execution record does not match the idempotency claim"
+            )
+        if claim.fingerprint != action.action_digest:
+            raise ReconciliationValidationError(
+                "prepared action digest does not match the idempotency claim"
+            )
+        if idempotency_namespace_digest(claim.namespace) != action.idempotency_namespace_digest:
+            raise ReconciliationValidationError(
+                "prepared action namespace does not match the idempotency claim"
+            )
+        if not claim.owner_token:
+            raise ReconciliationValidationError(
+                "durable idempotency claim must include an owner token"
+            )
+
+    @staticmethod
+    def _validate_prepared_action_identity(
+        prepared: UnknownAction, supplied: UnknownAction
+    ) -> None:
+        if (
+            prepared.execution_record_id != supplied.execution_record_id
+            or prepared.action_digest != supplied.action_digest
+            or prepared.tool_name != supplied.tool_name
+            or prepared.contract_id != supplied.contract_id
+            or prepared.contract_version != supplied.contract_version
+            or prepared.idempotency_namespace_digest
+            != supplied.idempotency_namespace_digest
+        ):
+            raise ReconciliationValidationError(
+                "prepared action identity does not match the UNKNOWN transition"
+            )
 
     @staticmethod
     def _validate_idempotency_link(
@@ -1437,16 +1575,14 @@ class SQLiteReconciliationLedger:
                 )
                 """
             )
-            version = connection.execute(
+            version_row = connection.execute(
                 "SELECT version FROM reconciliation_schema WHERE singleton = 1"
             ).fetchone()
-            if version is not None and version[0] != 1:
+            version = 0 if version_row is None else version_row[0]
+            if version not in {0, 1, 2}:
                 raise ReconciliationError(
-                    f"unsupported reconciliation schema version {version[0]}"
+                    f"unsupported reconciliation schema version {version}"
                 )
-            connection.execute(
-                "INSERT OR IGNORE INTO reconciliation_schema(singleton, version) VALUES (1, 1)"
-            )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS reconciliation_heads (
@@ -1493,6 +1629,15 @@ class SQLiteReconciliationLedger:
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS reconciliation_prepared_actions (
+                    execution_record_id TEXT PRIMARY KEY NOT NULL,
+                    action_json TEXT NOT NULL,
+                    prepared_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
                 CREATE TRIGGER IF NOT EXISTS reconciliation_events_no_update
                 BEFORE UPDATE ON reconciliation_events
                 BEGIN
@@ -1507,6 +1652,48 @@ class SQLiteReconciliationLedger:
                 BEGIN
                     SELECT RAISE(ABORT, 'reconciliation events are append-only');
                 END
+                """
+            )
+            connection.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS reconciliation_prepared_actions_no_update
+                BEFORE UPDATE ON reconciliation_prepared_actions
+                BEGIN
+                    SELECT RAISE(ABORT, 'prepared reconciliation actions are immutable');
+                END
+                """
+            )
+            connection.execute(
+                """
+                DROP TRIGGER IF EXISTS reconciliation_prepared_actions_no_delete
+                """
+            )
+            connection.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS reconciliation_prepared_actions_delete_guard
+                BEFORE DELETE ON reconciliation_prepared_actions
+                WHEN EXISTS (
+                    SELECT 1 FROM reconciliation_heads
+                    WHERE reconciliation_heads.execution_record_id =
+                          OLD.execution_record_id
+                ) OR EXISTS (
+                    SELECT 1 FROM idempotency_records
+                    WHERE idempotency_records.execution_record_id =
+                          OLD.execution_record_id
+                      AND idempotency_records.state != 'completed'
+                )
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'prepared reconciliation action cannot be deleted before retention is safe'
+                    );
+                END
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO reconciliation_schema(singleton, version) VALUES (1, 2)
+                ON CONFLICT(singleton) DO UPDATE SET version = excluded.version
                 """
             )
             connection.commit()

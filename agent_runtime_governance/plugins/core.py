@@ -14,6 +14,7 @@ from ..identity import IdentityProvider
 from ..middleware.base import Middleware
 from ..pipeline import Pipeline
 from ..production import ProductionProfile
+from ..reconciliation import ReconciliationLedger
 from ..registry import IdempotencyStore
 from ..resilience import RuntimeLimits
 from ..runtime import Runtime
@@ -40,11 +41,13 @@ class RuntimeBuilder:
         self,
         *,
         idempotency_store: IdempotencyStore | None = None,
+        reconciliation_ledger: ReconciliationLedger | None = None,
         identity_provider: IdentityProvider | None = None,
         require_verified_identity: bool = False,
         limits: RuntimeLimits | None = None,
         sync_executor: Executor | None = None,
         idempotency_executor: Executor | None = None,
+        reconciliation_executor: Executor | None = None,
         production_profile: ProductionProfile | None = None,
     ) -> None:
         self._middlewares: list[Middleware] = []
@@ -54,11 +57,13 @@ class RuntimeBuilder:
         self._services: dict[str, Any] = {}
         self._runtime_options: dict[str, Any] = {
             "idempotency_store": idempotency_store,
+            "reconciliation_ledger": reconciliation_ledger,
             "identity_provider": identity_provider,
             "require_verified_identity": require_verified_identity,
             "limits": limits,
             "sync_executor": sync_executor,
             "idempotency_executor": idempotency_executor,
+            "reconciliation_executor": reconciliation_executor,
             "production_profile": production_profile,
         }
 
@@ -76,6 +81,12 @@ class RuntimeBuilder:
         self._runtime_options["idempotency_store"] = store
         return self
 
+    def with_reconciliation_ledger(
+        self, ledger: ReconciliationLedger
+    ) -> "RuntimeBuilder":
+        self._runtime_options["reconciliation_ledger"] = ledger
+        return self
+
     def with_limits(self, limits: RuntimeLimits) -> "RuntimeBuilder":
         self._runtime_options["limits"] = limits
         return self
@@ -86,6 +97,10 @@ class RuntimeBuilder:
 
     def with_idempotency_executor(self, executor: Executor) -> "RuntimeBuilder":
         self._runtime_options["idempotency_executor"] = executor
+        return self
+
+    def with_reconciliation_executor(self, executor: Executor) -> "RuntimeBuilder":
+        self._runtime_options["reconciliation_executor"] = executor
         return self
 
     def with_production_profile(self, profile: ProductionProfile) -> "RuntimeBuilder":

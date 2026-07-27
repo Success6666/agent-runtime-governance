@@ -15,18 +15,19 @@ from agent_runtime_governance import (
     ExecutionMode,
     GovernanceDenied,
     HumanDecisionProvider,
-    InMemoryIdempotencyStore,
     InvocationOptions,
     JSONLAuditSink,
     PolicyMiddleware,
     ProductionProfile,
     ProductionReadinessError,
+    ProviderDescriptor,
     RiskTier,
     Runtime,
     RuntimeLimits,
     SimplePolicy,
     SQLiteApprovalStore,
     SQLiteIdempotencyStore,
+    SQLiteReconciliationLedger,
     StaticIdentityProvider,
     VerifiedPrincipal,
     get_cancellation_context,
@@ -84,11 +85,9 @@ class MutablePreconditionProvider:
         return self.digest
 
 
-class RecordingIdempotencyStore(InMemoryIdempotencyStore):
-    production_durable = True
-
-    def __init__(self) -> None:
-        super().__init__()
+class RecordingIdempotencyStore(SQLiteIdempotencyStore):
+    def __init__(self, path) -> None:
+        super().__init__(path)
         self.acquisitions: list[tuple[str, str, str]] = []
 
     def acquire(self, namespace: str, key: str, fingerprint: str):
@@ -153,6 +152,19 @@ def _profile(
     )
 
 
+async def _unused_reconciliation_provider(_context) -> object:
+    raise AssertionError("reconciliation must remain explicit")
+
+
+def _reconciliation_provider() -> ProviderDescriptor:
+    return ProviderDescriptor(
+        provider_id="tests.receipt-probe",
+        protocol_version="1",
+        supported_evidence_kinds=("receipt",),
+        provider=_unused_reconciliation_provider,
+    )
+
+
 def _runtime(
     tmp_path,
     *,
@@ -163,9 +175,17 @@ def _runtime(
 ) -> tuple[Runtime, JSONLAuditSink, RotatingKeyProvider]:
     keys = key_provider or RotatingKeyProvider()
     sink = JSONLAuditSink(tmp_path / "audit.jsonl", sign_key=b"a" * 32)
+    store = idempotency_store or RecordingIdempotencyStore(
+        tmp_path / "idempotency.db"
+    )
     runtime = Runtime(
         [*middlewares, AuditMiddleware(sink, fail_closed=True)],
-        idempotency_store=idempotency_store or RecordingIdempotencyStore(),
+        idempotency_store=store,
+        reconciliation_ledger=(
+            SQLiteReconciliationLedger(store.path)
+            if isinstance(store, SQLiteIdempotencyStore)
+            else None
+        ),
         identity_provider=StaticIdentityProvider(_principal()),
         require_verified_identity=True,
         production_profile=_profile(
@@ -361,13 +381,14 @@ async def test_policy_identity_mismatch_fails_closed(tmp_path) -> None:
 
 @pytest.mark.asyncio
 async def test_contracted_idempotency_uses_versioned_action_identity(tmp_path) -> None:
-    store = RecordingIdempotencyStore()
+    store = RecordingIdempotencyStore(tmp_path / "idempotency.db")
     runtime, _, _ = _runtime(tmp_path, idempotency_store=store)
 
     @runtime.tool(
         name="operate",
         execution_mode=ExecutionMode.IDEMPOTENT,
         action_contract=_contract(execution_mode=ExecutionMode.IDEMPOTENT),
+        reconciliation_provider=_reconciliation_provider(),
     )
     def operate(target: str) -> str:
         return target
@@ -392,7 +413,7 @@ async def test_contracted_idempotency_uses_versioned_action_identity(tmp_path) -
 
 @pytest.mark.asyncio
 async def test_identity_key_rotation_cannot_bypass_idempotency_record(tmp_path) -> None:
-    store = RecordingIdempotencyStore()
+    store = RecordingIdempotencyStore(tmp_path / "idempotency.db")
     keys = RotatingKeyProvider()
     runtime, _, _ = _runtime(
         tmp_path,
@@ -405,6 +426,7 @@ async def test_identity_key_rotation_cannot_bypass_idempotency_record(tmp_path) 
         name="operate",
         execution_mode=ExecutionMode.IDEMPOTENT,
         action_contract=_contract(execution_mode=ExecutionMode.IDEMPOTENT),
+        reconciliation_provider=_reconciliation_provider(),
     )
     def operate(target: str) -> str:
         calls.append(target)
@@ -430,7 +452,7 @@ async def test_identity_key_rotation_cannot_bypass_idempotency_record(tmp_path) 
 
 @pytest.mark.asyncio
 async def test_legacy_idempotency_namespace_cannot_satisfy_action_claim(tmp_path) -> None:
-    store = RecordingIdempotencyStore()
+    store = RecordingIdempotencyStore(tmp_path / "idempotency.db")
     legacy = store.acquire("tenant-a:operate", "request-1", "f" * 64)
     store.complete(legacy, "legacy-result")
     calls: list[str] = []
@@ -440,6 +462,7 @@ async def test_legacy_idempotency_namespace_cannot_satisfy_action_claim(tmp_path
         name="operate",
         execution_mode=ExecutionMode.IDEMPOTENT,
         action_contract=_contract(execution_mode=ExecutionMode.IDEMPOTENT),
+        reconciliation_provider=_reconciliation_provider(),
     )
     def operate(target: str) -> str:
         calls.append(target)
@@ -473,6 +496,7 @@ async def test_legal_contract_id_fits_sqlite_idempotency_namespace(
             contract_id=contract_id,
             execution_mode=ExecutionMode.IDEMPOTENT,
         ),
+        reconciliation_provider=_reconciliation_provider(),
     )
     def operate(target: str) -> str:
         return target

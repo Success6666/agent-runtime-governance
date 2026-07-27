@@ -62,6 +62,12 @@ class ToolExecutionError(GovernanceError):
     def __init__(self, context: "ExecutionContext", cause: BaseException) -> None:
         self.context = context
         self.cause = cause
+        execution_record_id = getattr(cause, "execution_record_id", None)
+        if execution_record_id is None:
+            execution_record_id = context.metadata.get("execution_record_id")
+        self.execution_record_id = (
+            execution_record_id if isinstance(execution_record_id, str) else None
+        )
         super().__init__(f"tool {context.tool_call.name!r} failed: {cause}")
 
 
