@@ -946,8 +946,8 @@ class SQLiteReconciliationLedger:
         self.timeout_seconds = timeout_seconds
         self.journal_capabilities = sqlite_journal_capabilities(journal_mode)
         self._journal_mode = journal_mode
-        self._migrate_legacy_idempotency_if_needed()
         self._initialize()
+        self._migrate_legacy_idempotency_if_needed()
 
     @property
     def journal_mode(self) -> str:
@@ -1131,6 +1131,7 @@ class SQLiteReconciliationLedger:
 
     def history(self, execution_record_id: str) -> tuple[ReconciliationRecord, ...]:
         with self._connect() as connection:
+            connection.execute("BEGIN DEFERRED")
             self._current(connection, execution_record_id)
             rows = connection.execute(
                 """
@@ -1142,6 +1143,7 @@ class SQLiteReconciliationLedger:
                 """,
                 (execution_record_id,),
             ).fetchall()
+            connection.commit()
         return tuple(_record_from_row(row) for row in rows)
 
     def attempts(self, execution_record_id: str) -> tuple[ReconciliationRecord, ...]:
@@ -1429,7 +1431,11 @@ class SQLiteReconciliationLedger:
             return
         from .registry import SQLiteIdempotencyStore
 
-        SQLiteIdempotencyStore(self.path, timeout_seconds=self.timeout_seconds)
+        SQLiteIdempotencyStore(
+            self.path,
+            timeout_seconds=self.timeout_seconds,
+            journal_mode=self._journal_mode,
+        )
 
     def _connect(self) -> sqlite3.Connection:
         return connect_sqlite(self.path, self.timeout_seconds)

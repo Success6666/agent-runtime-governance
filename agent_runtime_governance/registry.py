@@ -27,7 +27,7 @@ from ._sqlite import connect_sqlite, initialize_sqlite
 from .action_contracts import ActionContract
 from .context import ExecutionMode, RiskTier
 from .contracts import canonical_json_bytes, validate_schema
-from .errors import RegistryError
+from .errors import ContractValidationError, RegistryError
 
 if TYPE_CHECKING:
     from .runtime import Runtime
@@ -173,6 +173,10 @@ class InMemoryIdempotencyStore:
     Completed and unknown outcomes are retained with idle-TTL and LRU bounds.
     In-flight claims are never evicted. Use :class:`SQLiteIdempotencyStore` when
     outcomes must survive process restarts or cache eviction.
+
+    This non-durable adapter models only the first process-local generation and
+    therefore reports ``generation=1`` for every claim. Generation advancement
+    after reconciliation is intentionally exclusive to durable stores.
     """
 
     production_durable = False
@@ -301,6 +305,7 @@ class SQLiteIdempotencyStore:
         *,
         lease_seconds: float = 300.0,
         timeout_seconds: float = 30.0,
+        journal_mode: str = "auto",
     ) -> None:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
@@ -310,6 +315,7 @@ class SQLiteIdempotencyStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lease_seconds = lease_seconds
         self.timeout_seconds = timeout_seconds
+        self.journal_mode = journal_mode
         self._initialize()
 
     def acquire(self, namespace: str, key: str, fingerprint: str) -> IdempotencyClaim:
@@ -617,7 +623,11 @@ class SQLiteIdempotencyStore:
             connection.commit()
 
     def _initialize(self) -> None:
-        with initialize_sqlite(self.path, self.timeout_seconds) as connection:
+        with initialize_sqlite(
+            self.path,
+            self.timeout_seconds,
+            journal_mode=self.journal_mode,
+        ) as connection:
             connection.execute("BEGIN IMMEDIATE")
             table_exists = connection.execute(
                 """
@@ -662,12 +672,6 @@ class SQLiteIdempotencyStore:
             )
             connection.execute(
                 """
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_idempotency_execution_record
-                ON idempotency_records(execution_record_id)
-                """
-            )
-            connection.execute(
-                """
                 CREATE INDEX IF NOT EXISTS idx_idempotency_key_generation
                 ON idempotency_records(namespace, key, generation DESC)
                 """
@@ -689,9 +693,6 @@ class SQLiteIdempotencyStore:
         ]
         if "execution_record_id" in columns:
             selected.append("execution_record_id")
-        rows = connection.execute(
-            f"SELECT {', '.join(selected)} FROM idempotency_records"
-        ).fetchall()
         connection.execute(
             _IDEMPOTENCY_SCHEMA.replace(
                 "CREATE TABLE idempotency_records",
@@ -699,12 +700,17 @@ class SQLiteIdempotencyStore:
                 1,
             )
         )
+        rows = connection.execute(
+            f"SELECT {', '.join(selected)} FROM idempotency_records"
+        )
+        insert_cursor = connection.cursor()
         for row in rows:
             namespace, key, fingerprint, *remaining = row[:9]
             migrated_id = (
                 row[9] if len(row) == 10 and row[9] else _new_execution_record_id()
             )
-            connection.execute(
+            normalized = _normalize_legacy_idempotency_row(remaining)
+            insert_cursor.execute(
                 """
                 INSERT INTO idempotency_records_v07(
                     execution_record_id, namespace, key, generation, fingerprint,
@@ -717,7 +723,7 @@ class SQLiteIdempotencyStore:
                     namespace,
                     key,
                     fingerprint,
-                    *remaining,
+                    *normalized,
                 ),
             )
         connection.execute("DROP TABLE idempotency_records")
@@ -746,6 +752,70 @@ def _new_execution_record_id() -> str:
     import secrets
 
     return secrets.token_hex(32)
+
+
+def _normalize_legacy_idempotency_row(
+    values: list[Any],
+) -> tuple[str, str | None, str | None, str | None, str | None, str]:
+    state, result_json, error, owner_token, lease_expires_at, updated_at = values
+    allowed = {
+        "pending",
+        "completed",
+        "unknown",
+        "manual_review",
+        "applied_no_result",
+        "not_applied",
+    }
+    if state not in allowed:
+        error = error or f"unrecognized legacy idempotency state {state!r}"
+        state = "unknown"
+
+    if state == "pending":
+        lease_valid = False
+        if owner_token is not None and lease_expires_at is not None:
+            try:
+                lease_deadline = datetime.fromisoformat(lease_expires_at)
+                lease_valid = (
+                    lease_deadline.tzinfo is not None
+                    and lease_deadline.utcoffset() is not None
+                )
+            except (TypeError, ValueError):
+                lease_valid = False
+        if not lease_valid or result_json is not None or error is not None:
+            error = error or "legacy pending row has no trustworthy active lease"
+            state = "unknown"
+
+    if state != "pending":
+        owner_token = None
+        lease_expires_at = None
+
+    if state == "completed":
+        if result_json is None:
+            state = "applied_no_result"
+            error = error or "legacy completed row had no stored result"
+        else:
+            try:
+                result_json = canonical_json_bytes(
+                    json.loads(result_json), label="legacy idempotency result"
+                ).decode("utf-8")
+            except (TypeError, ValueError, ContractValidationError):
+                state = "applied_no_result"
+                result_json = None
+                error = error or "legacy completed row had an invalid stored result"
+
+    if state != "completed":
+        result_json = None
+    else:
+        error = None
+
+    return (
+        state,
+        result_json,
+        None if error is None else str(error)[:2048],
+        owner_token,
+        lease_expires_at,
+        updated_at,
+    )
 
 
 def _clone_json(value: Any) -> Any:
