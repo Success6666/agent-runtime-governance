@@ -106,6 +106,16 @@ All notable changes are documented here.
 - A transient Docker build failure retries a cache-busting Docker build; a
   failed build is never treated as a successful integration check. Artifact
   hash pinning is not claimed without a hash-locked dependency input.
+- Reconciliation operation and audit-delivery timeouts now register exactly one
+  deferred cleanup path, preventing duplicate capacity release or an incorrect
+  drain-state decrement after a non-cooperative operation completes.
+- Best-effort reconciliation-audit stall marking can no longer make pending
+  outbox reads fail during a competing SQLite write. Idempotency startup checks
+  now validate only the idempotency authority's foreign keys, leaving the
+  reconciliation ledger responsible for its own integrity boundary.
+- Docker build contexts now exclude SQLite database files, sidecars, and
+  `.env`-style environment files; hardened smoke coverage includes exhausted
+  and timed-out image-build retries.
 
 ## [0.6.0] - 2026-07-27
 
