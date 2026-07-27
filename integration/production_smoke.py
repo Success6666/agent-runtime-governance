@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import contextlib
 import hashlib
 import json
@@ -20,16 +21,22 @@ from agent_runtime_governance import (
     ExecutionMode,
     GovernanceDenied,
     InvocationOptions,
-    JSONLAuditSink,
     OPAClient,
     OPAMiddleware,
     OpenTelemetryMiddleware,
     ProductionProfile,
     PrometheusMiddleware,
+    ProviderDescriptor,
+    ReconciliationAttemptContext,
+    ReconciliationFinding,
+    ReconciliationState,
     RiskTier,
     Runtime,
+    SQLiteAuditSink,
     SQLiteIdempotencyStore,
+    SQLiteReconciliationLedger,
     StaticIdentityProvider,
+    ToolExecutionError,
     VerifiedPrincipal,
 )
 
@@ -73,7 +80,7 @@ def main() -> None:
 
 
 def run_opa_smoke(keep_containers: bool) -> None:
-    name = "arg-v05-opa"
+    name = "arg-v07-opa"
     cleanup_container(name)
     pull_image(OPA_IMAGE)
     policy_dir = ROOT / "integration" / "opa"
@@ -108,7 +115,7 @@ def run_opa_smoke(keep_containers: bool) -> None:
         policy_digest = hashlib.sha256(
             (policy_dir / "policy.rego").read_bytes()
         ).hexdigest()
-        with TemporaryDirectory(prefix="arg-v06-opa-") as temporary:
+        with TemporaryDirectory(prefix="arg-v07-opa-") as temporary:
             state = Path(temporary)
             with contextlib.ExitStack() as stack:
                 allowed, sink = _strict_opa_runtime(
@@ -134,6 +141,23 @@ def run_opa_smoke(keep_containers: bool) -> None:
                 assert event["contract_id"] == "smoke.delete-file"
                 assert event["action_digest"]
                 try:
+                    allowed.invoke(
+                        "reconcile_unknown",
+                        _governance=InvocationOptions(
+                            idempotency_key="opa-smoke-unknown-1"
+                        ),
+                    )
+                except ToolExecutionError as error:
+                    execution_record_id = error.execution_record_id
+                    if execution_record_id is None:
+                        raise AssertionError(
+                            "UNKNOWN smoke action did not expose an execution record"
+                        ) from error
+                else:
+                    raise AssertionError("UNKNOWN smoke action unexpectedly completed")
+                head = asyncio.run(allowed.areconcile(execution_record_id))
+                assert head.state is ReconciliationState.CONFIRMED_SUCCEEDED
+                try:
                     denied.invoke(
                         "delete_file",
                         _governance=InvocationOptions(
@@ -156,10 +180,11 @@ def _strict_opa_runtime(
     *,
     permissions: frozenset[str],
     policy_digest: str,
-) -> tuple[Runtime, JSONLAuditSink]:
+) -> tuple[Runtime, SQLiteAuditSink]:
     state.mkdir(parents=True, exist_ok=True)
     policy_version = "production-smoke-policy-v1"
-    sink = JSONLAuditSink(state / "audit.jsonl", sign_key=b"a" * 32)
+    state_path = state / "runtime.db"
+    sink = SQLiteAuditSink(state / "audit.db", sign_key=b"a" * 32)
     runtime = Runtime(
         [
             OPAMiddleware(
@@ -170,7 +195,8 @@ def _strict_opa_runtime(
             ),
             AuditMiddleware(sink, fail_closed=True),
         ],
-        idempotency_store=SQLiteIdempotencyStore(state / "idempotency.db"),
+        idempotency_store=SQLiteIdempotencyStore(state_path),
+        reconciliation_ledger=SQLiteReconciliationLedger(state_path),
         identity_provider=StaticIdentityProvider(
             VerifiedPrincipal(
                 issuer="production-smoke",
@@ -201,14 +227,55 @@ def _strict_opa_runtime(
         effect_class="filesystem.delete",
     )
 
+    reconciliation_contract = ActionContract(
+        contract_id="smoke.reconcile-unknown",
+        contract_version=1,
+        tool_name="reconcile_unknown",
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        parameters_schema={
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+        effect_class="smoke.unknown-reconciliation",
+    )
+
+    async def reconcile_unknown_provider(
+        context: ReconciliationAttemptContext,
+    ) -> ReconciliationFinding:
+        return ReconciliationFinding(
+            proposed_state=ReconciliationState.CONFIRMED_SUCCEEDED,
+            evidence_kind="smoke-receipt",
+            evidence={"reconciled": True},
+            observed_at=context.deadline,
+        )
+
+    provider = ProviderDescriptor(
+        provider_id="production-smoke-reconciliation",
+        protocol_version="1",
+        supported_evidence_kinds=("smoke-receipt",),
+        provider=reconcile_unknown_provider,
+    )
+
     @runtime.tool(
         name="delete_file",
         risk=RiskTier.HIGH,
         execution_mode=ExecutionMode.IDEMPOTENT,
         action_contract=contract,
+        reconciliation_provider=provider,
     )
     def delete_file() -> bool:
         return True
+
+    @runtime.tool(
+        name="reconcile_unknown",
+        risk=RiskTier.HIGH,
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        action_contract=reconciliation_contract,
+        reconciliation_provider=provider,
+    )
+    def reconcile_unknown() -> None:
+        raise TimeoutError("production smoke simulates an uncertain side effect")
 
     runtime.seal_production()
     return runtime, sink
@@ -224,7 +291,7 @@ def run_otel_smoke(keep_containers: bool) -> None:
     except ImportError as exc:
         raise SystemExit("Install the otel extra before running this smoke check") from exc
 
-    name = "arg-v05-otel"
+    name = "arg-v07-otel"
     cleanup_container(name)
     pull_image(OTEL_IMAGE)
     config = ROOT / "integration" / "otel" / "collector-config.yaml"
@@ -324,7 +391,7 @@ def run_prometheus_smoke() -> None:
 def run_kind_smoke() -> None:
     if shutil.which("kind") is None or shutil.which("kubectl") is None:
         raise SystemExit("kind and kubectl are required for the Kubernetes smoke check")
-    cluster = "arg-v05-smoke"
+    cluster = "arg-v07-smoke"
     run(["kind", "delete", "cluster", "--name", cluster], check=False)
     try:
         pull_image(KIND_NODE_IMAGE)

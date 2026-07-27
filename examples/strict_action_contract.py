@@ -12,7 +12,6 @@ from agent_runtime_governance import (
     AuditMiddleware,
     ExecutionMode,
     InvocationOptions,
-    JSONLAuditSink,
     PolicyMiddleware,
     ProductionProfile,
     ProviderDescriptor,
@@ -20,6 +19,7 @@ from agent_runtime_governance import (
     ReconciliationState,
     Runtime,
     SimplePolicy,
+    SQLiteAuditSink,
     SQLiteIdempotencyStore,
     SQLiteReconciliationLedger,
     StaticIdentityProvider,
@@ -90,8 +90,8 @@ def main() -> None:
                 digest=policy_digest,
             ),
             AuditMiddleware(
-                JSONLAuditSink(
-                    state_dir / "audit.jsonl",
+                SQLiteAuditSink(
+                    state_dir / "audit.db",
                     sign_key=_secret("ARG_AUDIT_HMAC_KEY"),
                 ),
                 fail_closed=True,

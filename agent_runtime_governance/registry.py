@@ -30,7 +30,11 @@ from .contracts import canonical_json_bytes, validate_schema
 from .errors import ContractValidationError, RegistryError
 from .reconciliation import (
     ProviderDescriptor,
+    ReconciliationDisposition,
+    ReconciliationHead,
+    ReconciliationState,
     UnknownAction,
+    enqueue_reconciliation_audit_outbox,
     idempotency_namespace_digest,
 )
 
@@ -771,15 +775,15 @@ class SQLiteIdempotencyStore:
                 WHERE type = 'table'
                   AND name IN (
                       'reconciliation_heads',
-                      'reconciliation_prepared_actions'
+                      'reconciliation_prepared_actions',
+                      'reconciliation_audit_outbox'
                   )
                 """
             )
         }
-        if tables != {
-            "reconciliation_heads",
-            "reconciliation_prepared_actions",
-        }:
+        if not {"reconciliation_heads", "reconciliation_prepared_actions"}.issubset(
+            tables
+        ):
             return
         prepared = connection.execute(
             """
@@ -790,7 +794,7 @@ class SQLiteIdempotencyStore:
         ).fetchone()
         if prepared is None:
             return
-        connection.execute(
+        cursor = connection.execute(
             """
             INSERT OR IGNORE INTO reconciliation_heads(
                 execution_record_id, action_json, state, revision,
@@ -804,6 +808,19 @@ class SQLiteIdempotencyStore:
                 recovered_at.astimezone(timezone.utc).isoformat(),
             ),
         )
+        if cursor.rowcount == 1 and "reconciliation_audit_outbox" in tables:
+            action = UnknownAction.from_dict(json.loads(prepared[0]))
+            enqueue_reconciliation_audit_outbox(
+                connection,
+                ReconciliationHead(
+                    action=action,
+                    state=ReconciliationState.UNKNOWN,
+                    revision=0,
+                    disposition=ReconciliationDisposition.BLOCKED_UNKNOWN,
+                    updated_at=recovered_at,
+                ),
+                event_type="unknown_recorded",
+            )
 
     def _transition(
         self,

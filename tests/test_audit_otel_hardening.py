@@ -294,6 +294,43 @@ def test_sqlite_audit_sink_is_transactional_and_verifiable(tmp_path) -> None:
         sink.read_verified()
 
 
+def test_sqlite_audit_sink_migrates_legacy_schema_for_source_idempotency(tmp_path) -> None:
+    path = tmp_path / "legacy-audit.db"
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.executescript(
+                """
+                CREATE TABLE audit_events (
+                    sequence INTEGER PRIMARY KEY,
+                    event_json TEXT NOT NULL,
+                    event_hash TEXT NOT NULL UNIQUE
+                );
+                CREATE TABLE audit_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    last_sequence INTEGER NOT NULL,
+                    last_hash TEXT NOT NULL
+                );
+                INSERT INTO audit_state(id, last_sequence, last_hash)
+                VALUES (1, -1, '0000000000000000000000000000000000000000000000000000000000000000');
+                """
+            )
+
+    sink = SQLiteAuditSink(path, sign_key="k")
+    sink.write_idempotent("outbox-1", {"stage": "reconciliation", "event": 1})
+    sink.write_idempotent("outbox-1", {"stage": "reconciliation", "event": 1})
+    with pytest.raises(AuditIntegrityError, match="different content"):
+        sink.write_idempotent("outbox-1", {"stage": "reconciliation", "event": 2})
+
+    with closing(sqlite3.connect(path)) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(audit_events)")
+        }
+        count = connection.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0]
+    assert {"source_event_id", "source_payload_digest"} <= columns
+    assert count == 1
+    assert [event["event"] for event in sink.read_verified()] == [1]
+
+
 def test_jsonl_snapshot_store_allocates_sequence_across_instances(tmp_path) -> None:
     path = tmp_path / "snapshots.jsonl"
     first = JSONLSnapshotStore(path)

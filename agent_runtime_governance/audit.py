@@ -46,6 +46,7 @@ DEFAULT_SENSITIVE_PATHS = frozenset(
 )
 _REDACTED = "[REDACTED]"
 _GENESIS_HASH = "0" * 64
+_SOURCE_EVENT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 
 
 class AuditSink(Protocol):
@@ -534,6 +535,7 @@ class SQLiteAuditSink:
     """Transactional audit sink for multi-process production runtimes."""
 
     production_durable = True
+    reconciliation_delivery_idempotent = True
 
     def __init__(
         self,
@@ -565,8 +567,46 @@ class SQLiteAuditSink:
         return self._codec.key is not None and len(self._codec.key) >= 32
 
     def write(self, event: Mapping[str, Any]) -> None:
+        self._write(event)
+
+    def write_idempotent(
+        self, source_event_id: str, event: Mapping[str, Any]
+    ) -> None:
+        """Append a source-stable event exactly once, or verify a safe retry."""
+
+        if not _SOURCE_EVENT_ID.fullmatch(source_event_id):
+            raise ValueError("source_event_id must be a stable identifier")
+        self._write(event, source_event_id=source_event_id)
+
+    def _write(
+        self,
+        event: Mapping[str, Any],
+        *,
+        source_event_id: str | None = None,
+    ) -> None:
+        source_payload_digest = None
+        if source_event_id is not None:
+            source_payload_digest = _source_payload_digest(self._codec, event)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if source_event_id is not None:
+                existing = connection.execute(
+                    """
+                    SELECT source_payload_digest FROM audit_events
+                    WHERE source_event_id = ?
+                    """,
+                    (source_event_id,),
+                ).fetchone()
+                if existing is not None:
+                    existing_digest = existing[0]
+                    if not isinstance(existing_digest, str) or not hmac.compare_digest(
+                        existing_digest, source_payload_digest
+                    ):
+                        raise AuditIntegrityError(
+                            "audit source event was retried with different content"
+                        )
+                    connection.commit()
+                    return
             row = connection.execute(
                 "SELECT last_sequence, last_hash FROM audit_state WHERE id = 1"
             ).fetchone()
@@ -577,8 +617,19 @@ class SQLiteAuditSink:
                 event, sequence=sequence, prev_hash=str(row[1])
             )
             connection.execute(
-                "INSERT INTO audit_events(sequence, event_json, event_hash) VALUES (?, ?, ?)",
-                (sequence, _canonical_json(payload), payload["event_hash"]),
+                """
+                INSERT INTO audit_events(
+                    sequence, event_json, event_hash, source_event_id,
+                    source_payload_digest
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    sequence,
+                    _canonical_json(payload),
+                    payload["event_hash"],
+                    source_event_id,
+                    source_payload_digest,
+                ),
             )
             connection.execute(
                 "UPDATE audit_state SET last_sequence = ?, last_hash = ? WHERE id = 1",
@@ -636,13 +687,33 @@ class SQLiteAuditSink:
                 CREATE TABLE IF NOT EXISTS audit_events (
                     sequence INTEGER PRIMARY KEY,
                     event_json TEXT NOT NULL,
-                    event_hash TEXT NOT NULL UNIQUE
+                    event_hash TEXT NOT NULL UNIQUE,
+                    source_event_id TEXT,
+                    source_payload_digest TEXT
                 );
                 CREATE TABLE IF NOT EXISTS audit_state (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     last_sequence INTEGER NOT NULL,
                     last_hash TEXT NOT NULL
                 );
+                """
+            )
+            columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(audit_events)")
+            }
+            if "source_event_id" not in columns:
+                connection.execute(
+                    "ALTER TABLE audit_events ADD COLUMN source_event_id TEXT"
+                )
+            if "source_payload_digest" not in columns:
+                connection.execute(
+                    "ALTER TABLE audit_events ADD COLUMN source_payload_digest TEXT"
+                )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_events_source_event_id
+                ON audit_events(source_event_id)
+                WHERE source_event_id IS NOT NULL
                 """
             )
             connection.execute(
@@ -751,6 +822,19 @@ def sign_event(event: Mapping[str, Any], key: bytes) -> str:
 def _event_hash(event: Mapping[str, Any]) -> str:
     payload = {key: value for key, value in event.items() if key not in {"event_hash", "signature"}}
     return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def _source_payload_digest(codec: _AuditCodec, event: Mapping[str, Any]) -> str:
+    """Digest the same redacted source payload used for an idempotent retry."""
+
+    redacted = redact_sensitive_data(
+        dict(event),
+        sensitive_keys=codec.sensitive_keys,
+        sensitive_paths=codec.sensitive_paths,
+        value_patterns=codec.value_patterns,
+        allow_paths=codec.allow_paths,
+    )
+    return hashlib.sha256(_canonical_json(redacted).encode("utf-8")).hexdigest()
 
 
 def _canonical_json(value: Mapping[str, Any]) -> str:

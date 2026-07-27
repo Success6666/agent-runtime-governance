@@ -75,6 +75,9 @@ class ProductionReadinessReason(str, Enum):
     AUDIT_SINK_DURABLE_REQUIRED = "audit.durable_sink_required"
     AUDIT_INTEGRITY_REQUIRED = "audit.integrity_protection_required"
     AUDIT_FAIL_CLOSED_REQUIRED = "audit.fail_closed_required"
+    AUDIT_RECONCILIATION_DELIVERY_IDEMPOTENCY_REQUIRED = (
+        "audit.reconciliation_delivery_idempotency_required"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +138,7 @@ class ProductionProfile:
     )
     reconciliation_probe_permission: str = "reconciliation:probe"
     reconciliation_resolve_permission: str = "reconciliation:resolve"
+    reconciliation_audit_drain_permission: str = "reconciliation:audit:drain"
     version: int = 1
 
     def __post_init__(self) -> None:
@@ -174,6 +178,10 @@ class ProductionProfile:
         for label, permission in (
             ("reconciliation_probe_permission", self.reconciliation_probe_permission),
             ("reconciliation_resolve_permission", self.reconciliation_resolve_permission),
+            (
+                "reconciliation_audit_drain_permission",
+                self.reconciliation_audit_drain_permission,
+            ),
         ):
             if type(permission) is not str or not _POLICY_VERSION.fullmatch(permission):
                 raise ValueError(f"{label} is invalid")
@@ -238,9 +246,16 @@ class ProductionProfile:
                 reconciliation_ledger,
                 reasons,
             )
-            self._audit_reasons(pipeline, reasons)
             if any(tool.contract_id is not None for tool in entries):
                 self._policy_reasons(pipeline, reasons)
+
+        if entries or reconciliation_ledger is not None:
+            self._audit_reasons(
+                pipeline,
+                idempotent_tools,
+                reconciliation_ledger,
+                reasons,
+            )
 
         if approval_required:
             self._approval_reasons(pipeline, reasons)
@@ -406,7 +421,10 @@ class ProductionProfile:
 
     @staticmethod
     def _audit_reasons(
-        pipeline: Pipeline, reasons: list[ProductionReadinessReason]
+        pipeline: Pipeline,
+        idempotent_tools: tuple[ToolSpec[Any, Any], ...],
+        reconciliation_ledger: Any,
+        reasons: list[ProductionReadinessReason],
     ) -> None:
         middleware = next(
             (item for item in pipeline if isinstance(item, AuditMiddleware)), None
@@ -422,6 +440,16 @@ class ProductionProfile:
             reasons.append(ProductionReadinessReason.AUDIT_INTEGRITY_REQUIRED)
         if not middleware.fail_closed:
             reasons.append(ProductionReadinessReason.AUDIT_FAIL_CLOSED_REQUIRED)
+        if (
+            idempotent_tools
+            or _capability(reconciliation_ledger, "production_durable")
+        ) and not (
+            _capability(middleware.sink, "reconciliation_delivery_idempotent")
+            and callable(getattr(middleware.sink, "write_idempotent", None))
+        ):
+            reasons.append(
+                ProductionReadinessReason.AUDIT_RECONCILIATION_DELIVERY_IDEMPOTENCY_REQUIRED
+            )
 
 
 class ProductionReadinessError(RuntimeError):

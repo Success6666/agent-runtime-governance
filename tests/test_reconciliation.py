@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -24,6 +25,7 @@ from agent_runtime_governance import (
     ReconciliationAttemptOutcome,
     ReconciliationConflictError,
     ReconciliationDisposition,
+    ReconciliationError,
     ReconciliationEventKind,
     ReconciliationFinding,
     ReconciliationHead,
@@ -224,6 +226,80 @@ def test_stale_attempt_and_transition_cas_fail_closed() -> None:
             ReconciliationAttemptOutcome.TIMEOUT,
             0,
         )
+
+
+@pytest.mark.parametrize(
+    "ledger_factory",
+    [
+        lambda _: InMemoryReconciliationLedger(),
+        lambda path: SQLiteReconciliationLedger(path),
+    ],
+)
+def test_expired_unfinished_attempt_is_closed_before_manual_quarantine(
+    tmp_path: Path, ledger_factory
+) -> None:
+    now = datetime.now(timezone.utc)
+    ledger = ledger_factory(tmp_path / "expired-attempt-recovery.db")
+    action = _unknown()
+    provider = _descriptor()
+    expired = ReconciliationAttemptContext(
+        attempt_id="expired-attempt",
+        deadline=now - timedelta(seconds=1),
+        protocol_version="1",
+        action=action,
+    )
+
+    ledger.create_unknown(action)
+    ledger.start_attempt(expired, provider, 0)
+    with pytest.raises(ReconciliationConflictError, match="unfinished"):
+        ledger.start_attempt(_context(action, "second-attempt"), provider, 1)
+
+    recovered = ledger.recover_unfinished_attempts(action.execution_record_id, now=now)
+    assert recovered is not None
+    assert recovered.state is ReconciliationState.MANUAL_REVIEW
+    assert recovered.disposition is ReconciliationDisposition.BLOCKED_MANUAL_REVIEW
+    records = ledger.history(action.execution_record_id)
+    assert [record.kind for record in records] == [
+        ReconciliationEventKind.ATTEMPT_STARTED,
+        ReconciliationEventKind.ATTEMPT_FINISHED,
+        ReconciliationEventKind.STATE_TRANSITION,
+    ]
+    assert records[1].payload["attempt_id"] == expired.attempt_id
+    assert (
+        records[1].payload["outcome"]
+        == ReconciliationAttemptOutcome.RECOVERY_REQUIRED.value
+    )
+    assert records[2].payload["transition"]["source"] == "recovery"
+
+
+@pytest.mark.parametrize(
+    "ledger_factory",
+    [
+        lambda _: InMemoryReconciliationLedger(),
+        lambda path: SQLiteReconciliationLedger(path),
+    ],
+)
+def test_unexpired_unfinished_attempt_blocks_a_competing_probe(
+    tmp_path: Path, ledger_factory
+) -> None:
+    now = datetime.now(timezone.utc)
+    ledger = ledger_factory(tmp_path / "unexpired-attempt-lease.db")
+    action = _unknown()
+    context = ReconciliationAttemptContext(
+        attempt_id="active-attempt",
+        deadline=now + timedelta(seconds=30),
+        protocol_version="1",
+        action=action,
+    )
+
+    ledger.create_unknown(action)
+    ledger.start_attempt(context, _descriptor(), 0)
+
+    observed = ledger.recover_unfinished_attempts(action.execution_record_id, now=now)
+    assert observed is not None
+    assert observed.state is ReconciliationState.UNKNOWN
+    assert observed.revision == 1
+    assert len(ledger.history(action.execution_record_id)) == 1
 
 
 def test_manual_review_can_only_be_resolved_by_verified_manual_value() -> None:
@@ -654,6 +730,161 @@ def test_expired_atomically_prepared_lease_materializes_reconciliation_head(
         duplicate.future.result()
     assert blocked.value.execution_record_id == action.execution_record_id
     assert ledger.current(action.execution_record_id).action.to_dict() == action.to_dict()
+
+
+def test_legacy_lease_recovery_backfills_audit_snapshot_during_v4_migration(
+    tmp_path: Path,
+) -> None:
+    """A recovery performed before the outbox migration must remain auditable."""
+
+    path = tmp_path / "legacy-recovery-audit-migration.db"
+    raw_key = "caller-visible-idempotency-key"
+    store = SQLiteIdempotencyStore(path, lease_seconds=60)
+    # Materialize the v0.6 ledger tables, then remove the v0.7 outbox to
+    # reproduce a process that recovers an expired lease before this migration
+    # has been initialized.
+    SQLiteReconciliationLedger(path)
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute(
+                "DROP TRIGGER IF EXISTS reconciliation_audit_outbox_immutable"
+            )
+            connection.execute(
+                "DROP TRIGGER IF EXISTS reconciliation_audit_outbox_no_delete"
+            )
+            connection.execute("DROP TABLE reconciliation_audit_outbox")
+            connection.execute(
+                "UPDATE reconciliation_schema SET version = 3 WHERE singleton = 1"
+            )
+
+    claim = store.acquire("tenant/charge", raw_key, _ACTION_DIGEST)
+    assert claim.execution_record_id is not None
+    action = _unknown(claim.execution_record_id)
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO reconciliation_prepared_actions(
+                    execution_record_id, action_json, prepared_at
+                ) VALUES (?, ?, ?)
+                """,
+                (
+                    claim.execution_record_id,
+                    json.dumps(action.to_dict(), sort_keys=True),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE idempotency_records SET lease_expires_at = ?
+                WHERE execution_record_id = ?
+                """,
+                (
+                    (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+                    claim.execution_record_id,
+                ),
+            )
+
+    duplicate = SQLiteIdempotencyStore(path).acquire(
+        "tenant/charge", raw_key, _ACTION_DIGEST
+    )
+    with pytest.raises(IdempotencyOutcomeUnknownError):
+        duplicate.future.result()
+
+    migrated = SQLiteReconciliationLedger(path)
+    head = migrated.current(claim.execution_record_id)
+    assert head.state is ReconciliationState.UNKNOWN
+    pending = migrated.pending_audit_events(
+        execution_record_id=claim.execution_record_id
+    )
+    assert [event.event_type for event in pending] == [
+        "migration_snapshot_recorded"
+    ]
+    assert raw_key not in str(pending[0].to_dict())
+    with closing(sqlite3.connect(path)) as connection:
+        version = connection.execute(
+            "SELECT version FROM reconciliation_schema WHERE singleton = 1"
+        ).fetchone()[0]
+    assert version == 4
+
+
+def test_reconciliation_audit_outbox_is_ordered_and_redacted(tmp_path: Path) -> None:
+    path = tmp_path / "reconciliation-audit-outbox.db"
+    raw_key = "caller-visible-idempotency-key"
+    store = SQLiteIdempotencyStore(path)
+    claim = store.acquire("tenant/charge", raw_key, _ACTION_DIGEST)
+    assert claim.execution_record_id is not None
+    ledger = SQLiteReconciliationLedger(path)
+    action = _unknown(claim.execution_record_id)
+    head = ledger.record_unknown(claim, action, TimeoutError("outcome uncertain"))
+    context = _context(action)
+    provider = _descriptor()
+    started = ledger.start_attempt(context, provider, head.revision)
+    finding = _finding()
+    finished = ledger.finish_attempt(
+        context,
+        provider,
+        ReconciliationAttemptOutcome.SUCCESS,
+        started.revision,
+        finding=finding,
+    )
+    ledger.compare_and_append_transition(
+        action.execution_record_id,
+        ReconciliationState.UNKNOWN,
+        finished.revision,
+        finding,
+        provider=provider,
+        attempt_id=context.attempt_id,
+    )
+
+    delivered_types: list[str] = []
+    while pending := ledger.pending_audit_events(
+        execution_record_id=action.execution_record_id
+    ):
+        assert len(pending) == 1
+        envelope = pending[0]
+        delivered_types.append(envelope.event_type)
+        serialized = str(envelope.to_dict())
+        assert raw_key not in serialized
+        assert "tenant/charge" not in serialized
+        assert "rcpt-1" not in serialized
+        assert "region" not in serialized
+        ledger.mark_audit_event_delivered(envelope.outbox_id)
+
+    assert delivered_types == [
+        "unknown_recorded",
+        "attempt_started",
+        "attempt_finished",
+        "transition_recorded",
+    ]
+
+
+def test_reconciliation_audit_outbox_rejects_tampered_payload(tmp_path: Path) -> None:
+    path = tmp_path / "reconciliation-audit-integrity.db"
+    store = SQLiteIdempotencyStore(path)
+    claim = store.acquire("tenant/charge", "request-1", _ACTION_DIGEST)
+    assert claim.execution_record_id is not None
+    ledger = SQLiteReconciliationLedger(path)
+    ledger.record_unknown(
+        claim,
+        _unknown(claim.execution_record_id),
+        TimeoutError("outcome uncertain"),
+    )
+
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute(
+                "DROP TRIGGER IF EXISTS reconciliation_audit_outbox_immutable"
+            )
+            connection.execute(
+                """
+                UPDATE reconciliation_audit_outbox
+                SET event_json = '{"stage":"reconciliation","forged":true}'
+                """
+            )
+
+    with pytest.raises(ReconciliationError, match="payload digest mismatch"):
+        ledger.pending_audit_events(execution_record_id=claim.execution_record_id)
 
 
 def test_known_failure_removes_atomically_prepared_descriptor(tmp_path: Path) -> None:
