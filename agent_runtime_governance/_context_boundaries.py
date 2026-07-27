@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from typing import Any
 
@@ -112,7 +113,7 @@ def _validate_metadata(
     kind: MiddlewareKind,
 ) -> None:
     for key, value in previous.items():
-        if key not in candidate or candidate[key] != value:
+        if key not in candidate or not _same_metadata_value(candidate[key], value):
             raise ContextMutationError(
                 f"middleware cannot remove or replace metadata key {key!r}"
             )
@@ -140,3 +141,11 @@ def _same_result(left: object, right: object) -> bool:
         return comparison if isinstance(comparison, bool) else False
     except Exception:
         return False
+
+
+def _same_metadata_value(left: object, right: object) -> bool:
+    if left is right:
+        return True
+    if isinstance(left, float) and isinstance(right, float):
+        return math.isnan(left) and math.isnan(right)
+    return _same_result(left, right)

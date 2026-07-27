@@ -50,6 +50,9 @@ All notable changes are documented here.
 
 ### Fixed
 
+- JSON-safe context and audit serialization now normalizes `NaN` and infinities
+  to deterministic markers before hash-backed audit or snapshot persistence, so
+  non-critical observers cannot silently drop evidence for those values.
 - Caller deadlines now bound outbox reads, audit delivery, acknowledgement, and
   failure recording consistently. Naive public reconciliation deadlines are
   rejected with a stable validation error.
