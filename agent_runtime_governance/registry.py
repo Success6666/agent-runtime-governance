@@ -36,6 +36,34 @@ P = ParamSpec("P")
 R = TypeVar("R")
 T = TypeVar("T")
 
+_IDEMPOTENCY_SCHEMA = """
+CREATE TABLE idempotency_records (
+    execution_record_id TEXT PRIMARY KEY NOT NULL,
+    namespace TEXT NOT NULL,
+    key TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(generation >= 1),
+    fingerprint TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN (
+        'pending', 'completed', 'unknown', 'manual_review',
+        'applied_no_result', 'not_applied'
+    )),
+    result_json TEXT,
+    error TEXT,
+    owner_token TEXT,
+    lease_expires_at TEXT,
+    updated_at TEXT NOT NULL,
+    UNIQUE(namespace, key, generation),
+    CHECK(
+        (state = 'pending' AND owner_token IS NOT NULL AND lease_expires_at IS NOT NULL)
+        OR (state != 'pending' AND owner_token IS NULL AND lease_expires_at IS NULL)
+    ),
+    CHECK(
+        (state = 'completed' AND result_json IS NOT NULL AND error IS NULL)
+        OR (state != 'completed' AND result_json IS NULL)
+    )
+)
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class ToolSpec(Generic[P, R]):
@@ -88,6 +116,10 @@ class IdempotencyOutcomeUnknownError(RuntimeError):
     """Raised when the original execution may still have taken effect."""
 
 
+class IdempotencyAlreadyAppliedError(RuntimeError):
+    """Raised when an effect is confirmed but no result can be reconstructed."""
+
+
 class IdempotencyInProgressError(RuntimeError):
     """Raised when another process owns an unexpired idempotency lease."""
 
@@ -101,6 +133,8 @@ class IdempotencyClaim:
     future: Future[Any]
     owner_token: str | None = None
     lease_seconds: float | None = None
+    execution_record_id: str | None = None
+    generation: int | None = None
 
 
 class IdempotencyStore(Protocol):
@@ -130,6 +164,7 @@ class IdempotencyStore(Protocol):
 class _IdempotencyEntry:
     fingerprint: str
     future: Future[Any]
+    execution_record_id: str
 
 
 class InMemoryIdempotencyStore:
@@ -164,16 +199,34 @@ class InMemoryIdempotencyStore:
             self._evict_completed(monotonic())
             entry = self._entries.get(storage_key)
             if entry is None:
-                entry = _IdempotencyEntry(fingerprint, Future())
+                entry = _IdempotencyEntry(
+                    fingerprint, Future(), _new_execution_record_id()
+                )
                 self._entries[storage_key] = entry
-                return IdempotencyClaim(namespace, key, fingerprint, True, entry.future)
+                return IdempotencyClaim(
+                    namespace,
+                    key,
+                    fingerprint,
+                    True,
+                    entry.future,
+                    execution_record_id=entry.execution_record_id,
+                    generation=1,
+                )
             if entry.fingerprint != fingerprint:
                 raise IdempotencyConflictError(
                     "idempotency key was already used with different parameters"
                 )
             if entry.future.done():
                 self._remember_completed(storage_key, monotonic())
-            return IdempotencyClaim(namespace, key, fingerprint, False, entry.future)
+            return IdempotencyClaim(
+                namespace,
+                key,
+                fingerprint,
+                False,
+                entry.future,
+                execution_record_id=entry.execution_record_id,
+                generation=1,
+            )
 
     def complete(self, claim: IdempotencyClaim, result: Any) -> None:
         if not claim.owner:
@@ -271,20 +324,27 @@ class SQLiteIdempotencyStore:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
-                SELECT fingerprint, state, result_json, error, lease_expires_at
-                FROM idempotency_records WHERE namespace = ? AND key = ?
+                SELECT fingerprint, state, result_json, error, lease_expires_at,
+                       execution_record_id, generation
+                FROM idempotency_records
+                WHERE namespace = ? AND key = ?
+                ORDER BY generation DESC
+                LIMIT 1
                 """,
                 (namespace, key),
             ).fetchone()
             if row is None:
+                execution_record_id = _new_execution_record_id()
                 connection.execute(
                     """
                     INSERT INTO idempotency_records(
-                        namespace, key, fingerprint, state, owner_token,
+                        execution_record_id, namespace, key, generation,
+                        fingerprint, state, owner_token,
                         lease_expires_at, updated_at
-                    ) VALUES (?, ?, ?, 'pending', ?, ?, ?)
+                    ) VALUES (?, ?, ?, 1, ?, 'pending', ?, ?, ?)
                     """,
                     (
+                        execution_record_id,
                         namespace,
                         key,
                         fingerprint,
@@ -302,8 +362,18 @@ class SQLiteIdempotencyStore:
                     Future(),
                     owner_token,
                     self.lease_seconds,
+                    execution_record_id,
+                    1,
                 )
-            recorded_fingerprint, state, result_json, error, lease_value = row
+            (
+                recorded_fingerprint,
+                state,
+                result_json,
+                error,
+                lease_value,
+                execution_record_id,
+                generation,
+            ) = row
             if recorded_fingerprint != fingerprint:
                 raise IdempotencyConflictError(
                     "idempotency key was already used with different parameters"
@@ -311,23 +381,74 @@ class SQLiteIdempotencyStore:
             future: Future[Any] = Future()
             if state == "completed":
                 future.set_result(json.loads(result_json))
-            elif state == "unknown":
+            elif state in {"unknown", "manual_review"}:
                 future.set_exception(
                     IdempotencyOutcomeUnknownError(error or "outcome is unknown")
+                )
+            elif state == "applied_no_result":
+                future.set_exception(
+                    IdempotencyAlreadyAppliedError(
+                        error
+                        or "side effect applied but no result can be reconstructed"
+                    )
+                )
+            elif state == "not_applied":
+                next_execution_record_id = _new_execution_record_id()
+                next_generation = generation + 1
+                connection.execute(
+                    """
+                    INSERT INTO idempotency_records(
+                        execution_record_id, namespace, key, generation,
+                        fingerprint, state, owner_token, lease_expires_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                    """,
+                    (
+                        next_execution_record_id,
+                        namespace,
+                        key,
+                        next_generation,
+                        fingerprint,
+                        owner_token,
+                        lease_expires_at.isoformat(),
+                        now.isoformat(),
+                    ),
+                )
+                connection.commit()
+                return IdempotencyClaim(
+                    namespace,
+                    key,
+                    fingerprint,
+                    True,
+                    Future(),
+                    owner_token,
+                    self.lease_seconds,
+                    next_execution_record_id,
+                    next_generation,
                 )
             elif state == "pending":
                 lease_deadline = datetime.fromisoformat(lease_value)
                 if lease_deadline <= now:
                     message = "owner lease expired before an outcome was recorded"
-                    connection.execute(
+                    cursor = connection.execute(
                         """
                         UPDATE idempotency_records
                         SET state = 'unknown', error = ?, owner_token = NULL,
                             lease_expires_at = NULL, updated_at = ?
-                        WHERE namespace = ? AND key = ? AND state = 'pending'
+                        WHERE execution_record_id = ? AND generation = ?
+                          AND state = 'pending' AND lease_expires_at = ?
                         """,
-                        (message, now.isoformat(), namespace, key),
+                        (
+                            message,
+                            now.isoformat(),
+                            execution_record_id,
+                            generation,
+                            lease_value,
+                        ),
                     )
+                    if cursor.rowcount != 1:
+                        raise RuntimeError(
+                            "idempotency lease changed before expiry recovery"
+                        )
                     future.set_exception(IdempotencyOutcomeUnknownError(message))
                 else:
                     future.set_exception(
@@ -340,7 +461,15 @@ class SQLiteIdempotencyStore:
                     RuntimeError(f"invalid idempotency state {state!r}")
                 )
             connection.commit()
-            return IdempotencyClaim(namespace, key, fingerprint, False, future)
+            return IdempotencyClaim(
+                namespace,
+                key,
+                fingerprint,
+                False,
+                future,
+                execution_record_id=execution_record_id,
+                generation=generation,
+            )
 
     def complete(self, claim: IdempotencyClaim, result: Any) -> None:
         if not claim.owner:
@@ -360,10 +489,17 @@ class SQLiteIdempotencyStore:
             cursor = connection.execute(
                 """
                 DELETE FROM idempotency_records
-                WHERE namespace = ? AND key = ? AND fingerprint = ?
+                WHERE execution_record_id = ?
+                  AND namespace = ? AND key = ? AND fingerprint = ?
                   AND owner_token = ? AND state = 'pending'
                 """,
-                (claim.namespace, claim.key, claim.fingerprint, claim.owner_token),
+                (
+                    claim.execution_record_id,
+                    claim.namespace,
+                    claim.key,
+                    claim.fingerprint,
+                    claim.owner_token,
+                ),
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("idempotency ownership was lost before failure")
@@ -391,12 +527,14 @@ class SQLiteIdempotencyStore:
                 """
                 UPDATE idempotency_records
                 SET lease_expires_at = ?, updated_at = ?
-                WHERE namespace = ? AND key = ? AND fingerprint = ?
+                WHERE execution_record_id = ?
+                  AND namespace = ? AND key = ? AND fingerprint = ?
                   AND owner_token = ? AND state = 'pending'
                 """,
                 (
                     lease_expires_at.isoformat(),
                     now.isoformat(),
+                    claim.execution_record_id,
                     claim.namespace,
                     claim.key,
                     claim.fingerprint,
@@ -412,11 +550,32 @@ class SQLiteIdempotencyStore:
             raise ValueError("older_than must be timezone-aware")
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            has_reconciliation_heads = (
+                connection.execute(
+                    """
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = 'reconciliation_heads'
+                    """
+                ).fetchone()
+                is not None
+            )
             cursor = connection.execute(
-                """
-                DELETE FROM idempotency_records
-                WHERE state = 'completed' AND updated_at < ?
-                """,
+                (
+                    """
+                    DELETE FROM idempotency_records
+                    WHERE state = 'completed' AND updated_at < ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM reconciliation_heads
+                          WHERE reconciliation_heads.execution_record_id =
+                                idempotency_records.execution_record_id
+                      )
+                    """
+                    if has_reconciliation_heads
+                    else """
+                    DELETE FROM idempotency_records
+                    WHERE state = 'completed' AND updated_at < ?
+                    """
+                ),
                 (older_than.astimezone(timezone.utc).isoformat(),),
             )
             connection.commit()
@@ -437,7 +596,8 @@ class SQLiteIdempotencyStore:
                 UPDATE idempotency_records
                 SET state = ?, result_json = ?, error = ?, owner_token = NULL,
                     lease_expires_at = NULL, updated_at = ?
-                WHERE namespace = ? AND key = ? AND fingerprint = ?
+                WHERE execution_record_id = ?
+                  AND namespace = ? AND key = ? AND fingerprint = ?
                   AND owner_token = ? AND state = 'pending'
                 """,
                 (
@@ -445,6 +605,7 @@ class SQLiteIdempotencyStore:
                     result_json,
                     error,
                     datetime.now(timezone.utc).isoformat(),
+                    claim.execution_record_id,
                     claim.namespace,
                     claim.key,
                     claim.fingerprint,
@@ -457,25 +618,41 @@ class SQLiteIdempotencyStore:
 
     def _initialize(self) -> None:
         with initialize_sqlite(self.path, self.timeout_seconds) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            table_exists = connection.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'idempotency_records'
+                """
+            ).fetchone()
+            if table_exists is None:
+                connection.execute(_IDEMPOTENCY_SCHEMA)
+            else:
+                columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(idempotency_records)"
+                    )
+                }
+                if not {"execution_record_id", "generation"}.issubset(columns):
+                    self._migrate_v06(connection, columns)
             connection.execute(
                 """
-                CREATE TABLE IF NOT EXISTS idempotency_records (
-                    namespace TEXT NOT NULL,
-                    key TEXT NOT NULL,
-                    fingerprint TEXT NOT NULL,
-                    state TEXT NOT NULL CHECK(state IN ('pending', 'completed', 'unknown')),
-                    result_json TEXT,
-                    error TEXT,
-                    owner_token TEXT,
-                    lease_expires_at TEXT,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY(namespace, key),
-                    CHECK(
-                        (state = 'pending' AND owner_token IS NOT NULL AND lease_expires_at IS NOT NULL)
-                        OR (state != 'pending' AND owner_token IS NULL AND lease_expires_at IS NULL)
-                    )
+                CREATE TABLE IF NOT EXISTS idempotency_schema (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    version INTEGER NOT NULL
                 )
                 """
+            )
+            schema_version = connection.execute(
+                "SELECT version FROM idempotency_schema WHERE singleton = 1"
+            ).fetchone()
+            if schema_version is not None and schema_version[0] != 2:
+                raise RuntimeError(
+                    f"unsupported idempotency schema version {schema_version[0]}"
+                )
+            connection.execute(
+                "INSERT OR IGNORE INTO idempotency_schema(singleton, version) VALUES (1, 2)"
             )
             connection.execute(
                 """
@@ -483,6 +660,70 @@ class SQLiteIdempotencyStore:
                 ON idempotency_records(state, updated_at)
                 """
             )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_idempotency_execution_record
+                ON idempotency_records(execution_record_id)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_idempotency_key_generation
+                ON idempotency_records(namespace, key, generation DESC)
+                """
+            )
+            connection.commit()
+
+    @staticmethod
+    def _migrate_v06(connection: sqlite3.Connection, columns: set[str]) -> None:
+        selected = [
+            "namespace",
+            "key",
+            "fingerprint",
+            "state",
+            "result_json",
+            "error",
+            "owner_token",
+            "lease_expires_at",
+            "updated_at",
+        ]
+        if "execution_record_id" in columns:
+            selected.append("execution_record_id")
+        rows = connection.execute(
+            f"SELECT {', '.join(selected)} FROM idempotency_records"
+        ).fetchall()
+        connection.execute(
+            _IDEMPOTENCY_SCHEMA.replace(
+                "CREATE TABLE idempotency_records",
+                "CREATE TABLE idempotency_records_v07",
+                1,
+            )
+        )
+        for row in rows:
+            namespace, key, fingerprint, *remaining = row[:9]
+            migrated_id = (
+                row[9] if len(row) == 10 and row[9] else _new_execution_record_id()
+            )
+            connection.execute(
+                """
+                INSERT INTO idempotency_records_v07(
+                    execution_record_id, namespace, key, generation, fingerprint,
+                    state, result_json, error, owner_token, lease_expires_at,
+                    updated_at
+                ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    migrated_id,
+                    namespace,
+                    key,
+                    fingerprint,
+                    *remaining,
+                ),
+            )
+        connection.execute("DROP TABLE idempotency_records")
+        connection.execute(
+            "ALTER TABLE idempotency_records_v07 RENAME TO idempotency_records"
+        )
 
     def _connect(self) -> sqlite3.Connection:
         return connect_sqlite(self.path, self.timeout_seconds)
@@ -496,6 +737,12 @@ class SQLiteIdempotencyStore:
 
 
 def _new_owner_token() -> str:
+    import secrets
+
+    return secrets.token_hex(32)
+
+
+def _new_execution_record_id() -> str:
     import secrets
 
     return secrets.token_hex(32)
