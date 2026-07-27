@@ -1132,6 +1132,34 @@ def test_unknown_action_validation_and_repr_fail_closed() -> None:
     with pytest.raises(ReconciliationValidationError, match="invalid receipt_schema"):
         UnknownAction.from_dict(payload)
 
+    bound_payload = action.to_dict()
+    bound_payload.update(
+        {
+            "reconciliation_provider_id": "receipt-store",
+            "reconciliation_protocol_version": "1",
+            "reconciliation_supported_evidence_kinds": ["receipt", "probe"],
+        }
+    )
+    restored = UnknownAction.from_dict(bound_payload)
+    assert restored.reconciliation_provider_id == "receipt-store"
+    assert restored.reconciliation_protocol_version == "1"
+    assert restored.reconciliation_supported_evidence_kinds == ("probe", "receipt")
+
+    malformed_provider = action.to_dict()
+    malformed_provider["reconciliation_provider_id"] = "receipt-store"
+    with pytest.raises(ReconciliationValidationError, match="protocol version"):
+        UnknownAction.from_dict(malformed_provider)
+    malformed_kinds = action.to_dict()
+    malformed_kinds.update(
+        {
+            "reconciliation_provider_id": "receipt-store",
+            "reconciliation_protocol_version": "1",
+            "reconciliation_supported_evidence_kinds": "receipt",
+        }
+    )
+    with pytest.raises(ReconciliationValidationError, match="must be an array"):
+        UnknownAction.from_dict(malformed_kinds)
+
 
 def test_finding_state_and_retry_assertions_fail_closed() -> None:
     common = {
