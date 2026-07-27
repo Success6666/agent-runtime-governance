@@ -603,6 +603,7 @@ def test_runtime_builder_applies_all_runtime_dependencies() -> None:
         ThreadPoolExecutor(max_workers=1) as executor,
         ThreadPoolExecutor(max_workers=1) as idempotency_executor,
         ThreadPoolExecutor(max_workers=1) as reconciliation_executor,
+        ThreadPoolExecutor(max_workers=1) as reconciliation_audit_executor,
     ):
         builder = RuntimeBuilder()
         assert builder.with_identity(identity) is builder
@@ -612,6 +613,10 @@ def test_runtime_builder_applies_all_runtime_dependencies() -> None:
         assert builder.with_sync_executor(executor) is builder
         assert builder.with_idempotency_executor(idempotency_executor) is builder
         assert builder.with_reconciliation_executor(reconciliation_executor) is builder
+        assert (
+            builder.with_reconciliation_audit_executor(reconciliation_audit_executor)
+            is builder
+        )
         runtime = builder.build()
         assert runtime.identity_provider is identity
         assert runtime.require_verified_identity is True
@@ -621,7 +626,9 @@ def test_runtime_builder_applies_all_runtime_dependencies() -> None:
         assert runtime.sync_executor is executor
         assert runtime.idempotency_executor is idempotency_executor
         assert runtime.reconciliation_executor is reconciliation_executor
+        assert runtime.reconciliation_audit_executor is reconciliation_audit_executor
         runtime.close()
+        assert reconciliation_audit_executor.submit(lambda: True).result() is True
 
 
 def test_runtime_builder_rejects_empty_registration_names() -> None:

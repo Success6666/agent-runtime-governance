@@ -5,6 +5,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from time import monotonic
 
+from .._blocking import run_blocking
 from .._metadata import metadata_text as _metadata_text
 from ..approval_store import ApprovalStore
 from ..context import ExecutionContext, HistoryEntry
@@ -95,7 +96,7 @@ class DecisionMiddleware(GatingMiddleware):
         )
         if self._store is not None:
             try:
-                await asyncio.to_thread(self._store.pending, request)
+                await run_blocking(self._store.pending, request)
             except ValueError as exc:
                 decision = denial_for_request(request, str(exc), source=self.name)
                 return context.with_decision(decision).append_history(
@@ -112,10 +113,10 @@ class DecisionMiddleware(GatingMiddleware):
         if self._provider is not None:
             decision = await self._decide(context, request)
             if self._store is not None:
-                decision = await asyncio.to_thread(
+                decision = await run_blocking(
                     self._store.decide, request.request_id, decision
                 )
-                reservation = await asyncio.to_thread(
+                reservation = await run_blocking(
                     self._store.reserve,
                     request,
                     lease_seconds=self._reservation_ttl_seconds,
@@ -127,7 +128,7 @@ class DecisionMiddleware(GatingMiddleware):
                     )
         else:
             assert self._store is not None
-            reservation = await asyncio.to_thread(
+            reservation = await run_blocking(
                 self._store.reserve,
                 request,
                 lease_seconds=self._reservation_ttl_seconds,
@@ -204,7 +205,7 @@ class DecisionMiddleware(GatingMiddleware):
             )
         request, token = reservation
         try:
-            decision = await asyncio.to_thread(self._store.commit, request, token)
+            decision = await run_blocking(self._store.commit, request, token)
             decision.validate_for(request)
             if (
                 context.decision is None
@@ -212,7 +213,7 @@ class DecisionMiddleware(GatingMiddleware):
             ):
                 raise ValueError("approval decision changed before execution")
         except Exception:
-            await asyncio.to_thread(self._store.release, request.request_id, token)
+            await run_blocking(self._store.release, request.request_id, token)
             decision = denial_for_request(
                 request,
                 "approval reservation could not be committed",
@@ -238,7 +239,7 @@ class DecisionMiddleware(GatingMiddleware):
             return context
         request, token = reservation
         try:
-            await asyncio.to_thread(self._store.release, request.request_id, token)
+            await run_blocking(self._store.release, request.request_id, token)
         except Exception:
             return context.append_history(
                 HistoryEntry(

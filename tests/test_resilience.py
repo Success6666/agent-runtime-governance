@@ -29,7 +29,27 @@ def test_runtime_limits_reject_invalid_values() -> None:
     with pytest.raises(ValueError):
         RuntimeLimits(reconciliation_audit_delivery_timeout_seconds=0)
     with pytest.raises(ValueError):
+        RuntimeLimits(max_reconciliation_in_flight=0)
+    with pytest.raises(ValueError):
         RuntimeLimits(max_reconciliation_audit_delivery_in_flight=0)
+    with pytest.raises(ValueError):
+        RuntimeLimits(max_blocking_extension_in_flight=0)
+
+
+def test_runtime_limits_preserve_v06_positional_argument_order() -> None:
+    limits = RuntimeLimits(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.7, 8)
+
+    assert (
+        limits.middleware_timeout_seconds,
+        limits.observer_timeout_seconds,
+        limits.hook_timeout_seconds,
+        limits.execution_timeout_seconds,
+        limits.idempotency_operation_timeout_seconds,
+        limits.admission_timeout_seconds,
+        limits.cancellation_grace_seconds,
+        limits.max_in_flight,
+    ) == (1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.7, 8)
+    assert limits.reconciliation_operation_timeout_seconds == 30.0
 
 
 @pytest.mark.asyncio

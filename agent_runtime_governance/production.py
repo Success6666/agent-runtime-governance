@@ -17,6 +17,7 @@ from .registry import SQLiteIdempotencyStore, ToolSpec
 
 _KEY_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _POLICY_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}$")
+_PERMISSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -183,7 +184,7 @@ class ProductionProfile:
                 self.reconciliation_audit_drain_permission,
             ),
         ):
-            if type(permission) is not str or not _POLICY_VERSION.fullmatch(permission):
+            if type(permission) is not str or not _PERMISSION.fullmatch(permission):
                 raise ValueError(f"{label} is invalid")
 
     def inventory(
@@ -201,9 +202,9 @@ class ProductionProfile:
         *,
         pipeline: Pipeline,
         idempotency_store: Any,
-        reconciliation_ledger: Any,
         identity_provider: Any,
         require_verified_identity: bool,
+        reconciliation_ledger: Any = None,
     ) -> ProductionReadinessReport:
         tool_items = tuple(tools)
         inventory = self.inventory(tool_items)

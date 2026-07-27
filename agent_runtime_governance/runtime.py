@@ -5,17 +5,23 @@ import hashlib
 import hmac
 import inspect
 from concurrent.futures import Executor, ThreadPoolExecutor
+from concurrent.futures import Future as ConcurrentFuture
 from contextlib import ExitStack, contextmanager
-from contextvars import copy_context
+from contextvars import ContextVar, Token, copy_context
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import partial
-from pathlib import Path
 from threading import Lock
 from time import perf_counter
-from typing import Any, Callable, Iterable, Mapping, ParamSpec, TypeVar
+from typing import Any, Awaitable, Callable, Iterable, Mapping, ParamSpec, TypeVar
 from uuid import uuid4
 
+from ._blocking import (
+    BlockingRunner,
+    install_blocking_runner,
+    reset_blocking_runner,
+    suspend_blocking_runner,
+)
 from ._context_boundaries import validate_middleware_transition
 from ._daemon_executor import DaemonThreadPoolExecutor
 from ._metadata import metadata_text as _metadata_text
@@ -62,6 +68,7 @@ from .production import (
     ProductionProfile,
     ProductionReadinessError,
     ProductionReadinessReport,
+    _same_sqlite_database,
 )
 from .reconciliation import (
     ManualResolution,
@@ -106,12 +113,25 @@ R = TypeVar("R")
 
 _GOVERNANCE_METADATA_PREFIXES = ("approval_", "identity_", "policy_")
 _RUNTIME_METADATA_KEYS = frozenset({"duration_ms"})
+_TENANT_PARTITION_BOUND_METADATA_KEY = "tenant_partition_bound"
+_ACTIVE_RUNTIME_IDS: ContextVar[frozenset[int]] = ContextVar(
+    "agent_runtime_governance_active_runtime_ids",
+    default=frozenset(),
+)
 
 
 @dataclass(frozen=True, slots=True)
 class RunResult:
     value: Any
     context: ExecutionContext
+
+
+@dataclass(frozen=True, slots=True)
+class _ActiveOperation:
+    task: asyncio.Task[Any] | None
+    reconciliation: bool
+    context_token: Token[frozenset[int]]
+    blocking_runner_token: Token[BlockingRunner | None]
 
 
 class _ActionBindingError(RuntimeError):
@@ -169,6 +189,7 @@ class Runtime:
         self._registry = ToolRegistry()
         self._idempotency_store = idempotency_store or InMemoryIdempotencyStore()
         self._reconciliation_ledger = reconciliation_ledger
+        self._atomic_reconciliation_preparation: bool | None = None
         self._identity_provider = identity_provider
         self._require_verified_identity = require_verified_identity
         self._production_profile = production_profile
@@ -183,6 +204,16 @@ class Runtime:
         self._sync_executor = sync_executor or ThreadPoolExecutor(
             max_workers=self.limits.max_in_flight,
             thread_name_prefix="arg-tool",
+        )
+        # Third-party synchronous hooks, middleware callbacks, and audit sinks
+        # need their own lifecycle domain. Cancelling an asyncio wrapper cannot
+        # stop a Python thread, so graceful shutdown waits for this executor.
+        self._blocking_executor = ThreadPoolExecutor(
+            max_workers=min(4, self.limits.max_blocking_extension_in_flight),
+            thread_name_prefix="arg-extension",
+        )
+        self._blocking_extension_bulkhead = RuntimeBulkhead(
+            self.limits.max_blocking_extension_in_flight
         )
         self._owns_idempotency_executor = idempotency_executor is None
         self._idempotency_executor = idempotency_executor or ThreadPoolExecutor(
@@ -218,6 +249,12 @@ class Runtime:
         self._reconciliation_provider_lock = Lock()
         self._reconciliation_provider_poison: dict[str, BaseException] = {}
         self._reconciliation_provider_draining: set[str] = set()
+        self._lifecycle_lock = Lock()
+        self._closing = False
+        self._async_close_task: asyncio.Task[None] | None = None
+        self._active_operations: dict[asyncio.Task[Any], int] = {}
+        self._sync_tool_futures: set[ConcurrentFuture[Any]] = set()
+        self._detached_stage_tasks: set[asyncio.Future[Any]] = set()
         self._reconciliation_tasks: set[asyncio.Task[Any]] = set()
         self._reconciliation_finalizers: set[asyncio.Task[Any]] = set()
         self._reconciliation_workflows: dict[asyncio.Task[Any], int] = {}
@@ -225,14 +262,57 @@ class Runtime:
 
     def close(self, *, wait: bool = True) -> None:
         """Stop accepting work and release the owned synchronous executor."""
-        self._closed = True
-        if self._reconciliation_finalizers or self._reconciliation_workflows:
+
+        if id(self) in _ACTIVE_RUNTIME_IDS.get():
             raise RuntimeError(
-                "reconciliation work is pending; use await runtime.aclose()"
+                "close() cannot be called from an active runtime operation"
             )
-        for task in tuple(self._reconciliation_tasks):
-            task.cancel()
-        self._shutdown_executors(wait=wait)
+        if self.production_profile is not None and not wait:
+            raise ValueError(
+                "production runtimes require close(wait=True) or await aclose()"
+            )
+        with self._lifecycle_lock:
+            if self._closing:
+                raise RuntimeError("runtime close is already in progress")
+            if self._closed:
+                return
+            self._closing = True
+            try:
+                if any(
+                    not task.done()
+                    for task in (
+                        *self._reconciliation_tasks,
+                        *self._reconciliation_finalizers,
+                        *self._reconciliation_workflows,
+                    )
+                ):
+                    raise RuntimeError(
+                        "reconciliation work is pending; use await runtime.aclose()"
+                    )
+                if any(not task.done() for task in self._detached_stage_tasks):
+                    raise RuntimeError(
+                        "runtime work is pending; use await runtime.aclose()"
+                    )
+                if any(not task.done() for task in self._active_operations):
+                    raise RuntimeError(
+                        "runtime work is pending; use await runtime.aclose()"
+                    )
+                if any(not future.done() for future in self._sync_tool_futures):
+                    raise RuntimeError(
+                        "synchronous tool work is pending; use await runtime.aclose()"
+                    )
+                self._closed = True
+                reconciliation_tasks = tuple(self._reconciliation_tasks)
+            except BaseException:
+                self._closing = False
+                raise
+        try:
+            for task in reconciliation_tasks:
+                task.cancel()
+            self._shutdown_executors(wait=wait)
+        finally:
+            with self._lifecycle_lock:
+                self._closing = False
 
     async def aclose(self) -> None:
         """Close after durable reconciliation finalizers have completed.
@@ -242,42 +322,232 @@ class Runtime:
         the reconciliation executor is shut down.
         """
 
-        self._closed = True
-        for task in tuple(self._reconciliation_tasks):
-            task.cancel()
-        current = asyncio.current_task()
-        while True:
-            workflows = tuple(
-                task
-                for task in self._reconciliation_workflows
-                if task is not current and not task.done()
+        with self._lifecycle_lock:
+            if self._closing:
+                raise RuntimeError("runtime close is already in progress")
+            if self._closed:
+                return
+            caller = asyncio.current_task()
+            if self._is_active_operation_context(caller):
+                raise RuntimeError(
+                    "aclose() cannot be called from an active runtime operation"
+                )
+            self._reject_cross_loop_lifecycle_operation_unlocked()
+            self._closing = True
+            self._closed = True
+            reconciliation_tasks = tuple(self._reconciliation_tasks)
+            close_task = asyncio.create_task(
+                self._finish_async_close(reconciliation_tasks),
+                name="runtime-close",
             )
-            for task in workflows:
+            close_task.add_done_callback(self._consume_background_result)
+            self._async_close_task = close_task
+        await asyncio.shield(close_task)
+
+    async def _finish_async_close(
+        self,
+        reconciliation_tasks: tuple[asyncio.Task[Any], ...],
+    ) -> None:
+        """Complete shutdown even if the caller of :meth:`aclose` is cancelled."""
+
+        try:
+            for task in reconciliation_tasks:
                 task.cancel()
-            finalizers = tuple(self._reconciliation_finalizers)
-            if not workflows and not finalizers:
-                break
-            await asyncio.shield(
-                asyncio.gather(*workflows, *finalizers, return_exceptions=True)
-            )
-        await asyncio.to_thread(self._shutdown_executors, wait=True)
+            current = asyncio.current_task()
+            while True:
+                with self._lifecycle_lock:
+                    detached_stage_tasks = tuple(
+                        task
+                        for task in self._detached_stage_tasks
+                        if task is not current and not task.done()
+                    )
+                    provider_tasks = tuple(
+                        task
+                        for task in self._reconciliation_tasks
+                        if task is not current and not task.done()
+                    )
+                    active_operations = tuple(
+                        task
+                        for task in self._active_operations
+                        if task is not current and not task.done()
+                    )
+                    sync_tool_futures = tuple(
+                        future
+                        for future in self._sync_tool_futures
+                        if not future.done()
+                    )
+                    workflows = tuple(
+                        task
+                        for task in self._reconciliation_workflows
+                        if task is not current and not task.done()
+                    )
+                    finalizers = tuple(
+                        task
+                        for task in self._reconciliation_finalizers
+                        if task is not current and not task.done()
+                    )
+                for task in provider_tasks:
+                    task.cancel()
+                for task in detached_stage_tasks:
+                    task.cancel()
+                for task in workflows:
+                    task.cancel()
+                for future in sync_tool_futures:
+                    future.cancel()
+                pending = tuple(
+                    dict.fromkeys(
+                        (
+                            *provider_tasks,
+                            *detached_stage_tasks,
+                            *active_operations,
+                            *workflows,
+                            *finalizers,
+                        )
+                    )
+                )
+                if not pending and not sync_tool_futures:
+                    break
+                if pending:
+                    await asyncio.shield(
+                        asyncio.gather(*pending, return_exceptions=True)
+                    )
+                if sync_tool_futures:
+                    await asyncio.shield(
+                        asyncio.gather(
+                            *(
+                                asyncio.wrap_future(future)
+                                for future in sync_tool_futures
+                            ),
+                            return_exceptions=True,
+                        )
+                    )
+            await asyncio.to_thread(self._shutdown_executors, wait=True)
+        finally:
+            with self._lifecycle_lock:
+                self._closing = False
+                self._async_close_task = None
 
-    def _begin_reconciliation_workflow(self) -> asyncio.Task[Any] | None:
+    def _begin_reconciliation_workflow(self) -> _ActiveOperation:
+        return self._begin_active_operation(reconciliation=True)
+
+    def _end_reconciliation_workflow(self, operation: _ActiveOperation) -> None:
+        self._end_active_operation(operation)
+
+    def _begin_active_operation(
+        self,
+        *,
+        reconciliation: bool = False,
+    ) -> _ActiveOperation:
+        """Atomically admit and track one public runtime operation."""
+
         task = asyncio.current_task()
-        if task is not None:
-            self._reconciliation_workflows[task] = (
-                self._reconciliation_workflows.get(task, 0) + 1
-            )
-        return task
+        with self._lifecycle_lock:
+            if self._closed or self._closing:
+                raise RuntimeError("runtime is closed")
+            self._reject_cross_loop_lifecycle_operation_unlocked()
+            if task is not None:
+                self._active_operations[task] = (
+                    self._active_operations.get(task, 0) + 1
+                )
+                if reconciliation:
+                    self._reconciliation_workflows[task] = (
+                        self._reconciliation_workflows.get(task, 0) + 1
+                    )
+        context_token = _ACTIVE_RUNTIME_IDS.set(
+            _ACTIVE_RUNTIME_IDS.get() | frozenset({id(self)})
+        )
+        blocking_runner_token = install_blocking_runner(self._run_blocking_extension)
+        return _ActiveOperation(
+            task,
+            reconciliation,
+            context_token,
+            blocking_runner_token,
+        )
 
-    def _end_reconciliation_workflow(self, task: asyncio.Task[Any] | None) -> None:
+    def _end_active_operation(
+        self,
+        operation: _ActiveOperation,
+    ) -> None:
+        reset_blocking_runner(operation.blocking_runner_token)
+        _ACTIVE_RUNTIME_IDS.reset(operation.context_token)
+        task = operation.task
         if task is None:
             return
-        remaining = self._reconciliation_workflows.get(task, 0) - 1
-        if remaining > 0:
-            self._reconciliation_workflows[task] = remaining
-        else:
-            self._reconciliation_workflows.pop(task, None)
+        with self._lifecycle_lock:
+            remaining_operations = self._active_operations.get(task, 0) - 1
+            if remaining_operations > 0:
+                self._active_operations[task] = remaining_operations
+            else:
+                self._active_operations.pop(task, None)
+            if operation.reconciliation:
+                self._reconciliation_workflows[task] = (
+                    self._reconciliation_workflows.get(task, 0) - 1
+                )
+                if self._reconciliation_workflows[task] <= 0:
+                    self._reconciliation_workflows.pop(task, None)
+
+    def _is_active_operation_context(
+        self,
+        caller: asyncio.Task[Any] | None,
+    ) -> bool:
+        return (
+            id(self) in _ACTIVE_RUNTIME_IDS.get()
+            or caller is not None and caller in self._active_operations
+        )
+
+    def _reject_cross_loop_lifecycle_operation_unlocked(self) -> None:
+        """Reject lifecycle coordination across active event loops.
+
+        ``asyncio.Task`` instances cannot be awaited or cancelled safely from a
+        different event loop.  Runtime operations may run sequentially from
+        distinct loops after previous work has settled, but admission and
+        asynchronous shutdown require the loop that owns outstanding work.
+        """
+
+        current_loop = asyncio.get_running_loop()
+        pending_tasks = (
+            *self._active_operations,
+            *self._detached_stage_tasks,
+            *self._reconciliation_workflows,
+            *self._reconciliation_tasks,
+            *self._reconciliation_finalizers,
+        )
+        if any(
+            not task.done() and task.get_loop() is not current_loop
+            for task in pending_tasks
+        ):
+            raise RuntimeError(
+                "runtime has active lifecycle work on another event loop"
+            )
+
+    def _track_detached_stage(self, task: asyncio.Future[Any]) -> None:
+        """Keep an uncooperative coroutine in shutdown coordination."""
+
+        with self._lifecycle_lock:
+            self._detached_stage_tasks.add(task)
+        task.add_done_callback(self._forget_detached_stage)
+
+    def _forget_detached_stage(self, task: asyncio.Future[Any]) -> None:
+        with self._lifecycle_lock:
+            self._detached_stage_tasks.discard(task)
+
+    def _track_sync_tool_future(self, future: ConcurrentFuture[Any]) -> None:
+        """Retain a submitted sync tool even if its asyncio wrapper is cancelled."""
+
+        with self._lifecycle_lock:
+            self._sync_tool_futures.add(future)
+        future.add_done_callback(self._forget_sync_tool_future)
+
+    def _forget_sync_tool_future(self, future: ConcurrentFuture[Any]) -> None:
+        with self._lifecycle_lock:
+            self._sync_tool_futures.discard(future)
+
+    def _assert_accepting_work(self) -> None:
+        """Atomically reject public work once shutdown starts."""
+
+        with self._lifecycle_lock:
+            if self._closed or self._closing:
+                raise RuntimeError("runtime is closed")
 
     def _shutdown_executors(self, *, wait: bool) -> None:
         if self._owns_reconciliation_audit_executor:
@@ -295,6 +565,7 @@ class Runtime:
             self._idempotency_executor.shutdown(wait=wait, cancel_futures=True)
         if self._owns_sync_executor:
             self._sync_executor.shutdown(wait=wait, cancel_futures=True)
+        self._blocking_executor.shutdown(wait=wait, cancel_futures=True)
 
     @property
     def sync_executor(self) -> Executor:
@@ -319,6 +590,16 @@ class Runtime:
         """Return the executor isolated for reconciliation audit delivery."""
 
         return self._reconciliation_audit_executor
+
+    @property
+    def reconciliation_ledger_healthy(self) -> bool:
+        """Return whether reconciliation ledger work is neither poisoned nor draining."""
+
+        with self._reconciliation_poison_lock:
+            return (
+                self._reconciliation_poison is None
+                and self._reconciliation_draining == 0
+            )
 
     def __enter__(self) -> "Runtime":
         return self
@@ -395,6 +676,7 @@ class Runtime:
         with self._production_seal_lock:
             self._guard_sealed_mutation("idempotency_store")
             self._idempotency_store = value
+            self._atomic_reconciliation_preparation = None
 
     @property
     def reconciliation_ledger(self) -> ReconciliationLedger | None:
@@ -405,6 +687,7 @@ class Runtime:
         with self._production_seal_lock:
             self._guard_sealed_mutation("reconciliation_ledger")
             self._reconciliation_ledger = value
+            self._atomic_reconciliation_preparation = None
 
     @property
     def identity_provider(self) -> IdentityProvider | None:
@@ -556,8 +839,20 @@ class Runtime:
         _governance: InvocationOptions | None = None,
         **kwargs: Any,
     ) -> RunResult:
-        if self._closed:
-            raise RuntimeError("runtime is closed")
+        operation = self._begin_active_operation()
+        try:
+            return await self._arun(name, *args, _governance=_governance, **kwargs)
+        finally:
+            self._end_active_operation(operation)
+
+    async def _arun(
+        self,
+        name: str,
+        *args: Any,
+        _governance: InvocationOptions | None = None,
+        **kwargs: Any,
+    ) -> RunResult:
+        self._assert_accepting_work()
         if self.production_profile is not None and not self._production_sealed:
             raise ProductionReadinessError(self.production_readiness())
         options = _governance or InvocationOptions()
@@ -708,7 +1003,7 @@ class Runtime:
                         self.limits.execution_timeout_seconds,
                         "idempotency wait",
                     )
-                    value = await await_stage(
+                    value = await self._await_runtime_stage(
                         asyncio.shield(asyncio.wrap_future(claim.future)),
                         stage="idempotency wait",
                         timeout_seconds=timeout,
@@ -974,9 +1269,28 @@ class Runtime:
         replayable_only: bool = True,
         **kwargs: Any,
     ) -> ExecutionContext:
+        operation = self._begin_active_operation()
+        try:
+            return await self._apreview(
+                name,
+                *args,
+                _governance=_governance,
+                replayable_only=replayable_only,
+                **kwargs,
+            )
+        finally:
+            self._end_active_operation(operation)
+
+    async def _apreview(
+        self,
+        name: str,
+        *args: Any,
+        _governance: InvocationOptions | None = None,
+        replayable_only: bool = True,
+        **kwargs: Any,
+    ) -> ExecutionContext:
         """Evaluate governance without executing the tool."""
-        if self._closed:
-            raise RuntimeError("runtime is closed")
+        self._assert_accepting_work()
         if self._production_profile is not None and not self._production_sealed:
             raise ProductionReadinessError(self.production_readiness())
         spec = self.registry.get(name)
@@ -1019,6 +1333,13 @@ class Runtime:
             raise GovernanceCancelledError(context) from exc
 
     async def areplay(self, context: ExecutionContext) -> ExecutionContext:
+        operation = self._begin_active_operation()
+        try:
+            return await self._areplay(context)
+        finally:
+            self._end_active_operation(operation)
+
+    async def _areplay(self, context: ExecutionContext) -> ExecutionContext:
         """Reapply deterministic middleware as non-authoritative analysis.
 
         Replay never executes a tool or creates an executor-authoritative
@@ -1026,8 +1347,7 @@ class Runtime:
         with current trusted identity claims when a fresh action binding is
         required.
         """
-        if self._closed:
-            raise RuntimeError("runtime is closed")
+        self._assert_accepting_work()
         if self._production_profile is not None and not self._production_sealed:
             raise ProductionReadinessError(self.production_readiness())
         spec = self.registry.get(context.tool_call.name)
@@ -1093,8 +1413,7 @@ class Runtime:
     ) -> ReconciliationHead:
         """Run one explicit, read-only reconciliation attempt for UNKNOWN work."""
 
-        if self._closed:
-            raise RuntimeError("runtime is closed")
+        self._assert_accepting_work()
         if self.production_profile is not None and not self._production_sealed:
             raise ProductionReadinessError(self.production_readiness())
         ledger = self.reconciliation_ledger
@@ -1518,10 +1837,10 @@ class Runtime:
         deadline: datetime | None,
         operation: str,
     ) -> VerifiedPrincipal | None:
-        """Verify the caller before a strict control-plane read or mutation."""
+        """Verify control-plane callers whenever identity enforcement is enabled."""
 
         profile = self.production_profile
-        if profile is None:
+        if profile is None and not self.require_verified_identity:
             return None
         if self.identity_provider is None:
             raise PermissionError("reconciliation requires a trusted identity provider")
@@ -1537,10 +1856,11 @@ class Runtime:
             raise PermissionError("reconciliation authorization denied")
         if operation not in {"probe", "resolve", "drain"}:
             raise RuntimeError(f"unsupported reconciliation operation {operation!r}")
+        authorization_profile = profile or ProductionProfile()
         required_permission = {
-            "probe": profile.reconciliation_probe_permission,
-            "resolve": profile.reconciliation_resolve_permission,
-            "drain": profile.reconciliation_audit_drain_permission,
+            "probe": authorization_profile.reconciliation_probe_permission,
+            "resolve": authorization_profile.reconciliation_resolve_permission,
+            "drain": authorization_profile.reconciliation_audit_drain_permission,
         }[operation]
         if required_permission not in principal.permissions:
             raise PermissionError("reconciliation authorization denied")
@@ -1554,6 +1874,17 @@ class Runtime:
         if principal is None:
             return
         expected = action.tenant_partition_digest
+        # Earlier pre-release records encoded an absent tenant as the digest of
+        # "global". That value is indistinguishable from a real legacy global
+        # tenant, so deny the ambiguous case rather than authorizing an
+        # unbound record. New runtime-created actions persist ``None`` when no
+        # tenant is bound and explicitly mark bound partitions in metadata.
+        if (
+            expected is not None
+            and principal.tenant == "global"
+            and action.metadata.get(_TENANT_PARTITION_BOUND_METADATA_KEY) is not True
+        ):
+            raise PermissionError("reconciliation authorization denied")
         actual = tenant_partition_digest(principal.tenant)
         if expected is None or not hmac.compare_digest(expected, actual):
             raise PermissionError("reconciliation authorization denied")
@@ -1813,12 +2144,14 @@ class Runtime:
             ),
             name=f"reconciliation-finalize:{attempt.attempt_id}",
         )
-        self._reconciliation_finalizers.add(task)
+        with self._lifecycle_lock:
+            self._reconciliation_finalizers.add(task)
         task.add_done_callback(self._forget_reconciliation_finalizer)
         return await asyncio.shield(task)
 
     def _forget_reconciliation_finalizer(self, task: asyncio.Task[Any]) -> None:
-        self._reconciliation_finalizers.discard(task)
+        with self._lifecycle_lock:
+            self._reconciliation_finalizers.discard(task)
         if task.cancelled():
             self._poison_reconciliation(
                 RuntimeError("reconciliation finalization was cancelled")
@@ -1890,7 +2223,8 @@ class Runtime:
                 f"reconciliation-provider:{provider.provider_id}:{attempt.attempt_id}"
             ),
         )
-        self._reconciliation_tasks.add(task)
+        with self._lifecycle_lock:
+            self._reconciliation_tasks.add(task)
         task.add_done_callback(self._forget_reconciliation_task)
         timeout = self._bounded_timeout(
             attempt.deadline,
@@ -1923,7 +2257,8 @@ class Runtime:
             raise
 
     def _forget_reconciliation_task(self, task: asyncio.Task[Any]) -> None:
-        self._reconciliation_tasks.discard(task)
+        with self._lifecycle_lock:
+            self._reconciliation_tasks.discard(task)
         self._consume_background_result(task)
 
     def _raise_if_reconciliation_provider_available(self, provider_id: str) -> None:
@@ -2123,8 +2458,8 @@ class Runtime:
             self.limits.middleware_timeout_seconds,
             "identity verification",
         )
-        return await await_stage(
-            asyncio.to_thread(self.identity_provider.verify, claims),
+        return await self._await_runtime_stage(
+            self._run_blocking_extension(self.identity_provider.verify, claims),
             stage="identity verification",
             timeout_seconds=timeout,
             cancellation_grace_seconds=self.limits.cancellation_grace_seconds,
@@ -2138,12 +2473,61 @@ class Runtime:
             self.limits.execution_timeout_seconds,
             "tool execution",
         )
-        return await await_stage(
+        return await self._await_runtime_stage(
             call(context),
             stage="tool execution",
             timeout_seconds=timeout,
             cancellation_grace_seconds=self.limits.cancellation_grace_seconds,
         )
+
+    async def _await_runtime_stage(
+        self,
+        awaitable: Awaitable[Any],
+        *,
+        stage: str,
+        timeout_seconds: float,
+        cancellation_grace_seconds: float,
+    ) -> Any:
+        """Bound a stage and retain any coroutine that ignores cancellation."""
+
+        return await await_stage(
+            awaitable,
+            stage=stage,
+            timeout_seconds=timeout_seconds,
+            cancellation_grace_seconds=cancellation_grace_seconds,
+            on_detached=self._track_detached_stage,
+        )
+
+    async def _run_blocking_extension(
+        self,
+        callback: Callable[..., Any],
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Run a synchronous extension in the runtime-owned lifecycle domain."""
+
+        lease = await self._blocking_extension_bulkhead.acquire(
+            self.limits.execution_timeout_seconds
+        )
+        inherited_context = copy_context()
+
+        def invoke() -> Any:
+            # A callback can itself invoke SDK helpers. Avoid recursively
+            # submitting to this bounded worker pool from its own worker.
+            with suspend_blocking_runner():
+                return callback(*args, **kwargs)
+
+        try:
+            with self._lifecycle_lock:
+                if self._closed or self._closing:
+                    raise RuntimeError("runtime is closed")
+                future = self._blocking_executor.submit(inherited_context.run, invoke)
+        except BaseException:
+            lease.release()
+            raise
+        future.add_done_callback(lambda _future: lease.release())
+        return await asyncio.wrap_future(future)
 
     async def _run_sync_tool(
         self,
@@ -2171,6 +2555,7 @@ class Runtime:
             lease.release()
             raise
         future.add_done_callback(lambda _future: lease.release())
+        self._track_sync_tool_future(future)
         on_submitted()
         return await asyncio.wrap_future(future)
 
@@ -2352,8 +2737,8 @@ class Runtime:
             self.limits.middleware_timeout_seconds,
             stage,
         )
-        return await await_stage(
-            asyncio.to_thread(callback, **kwargs),
+        return await self._await_runtime_stage(
+            self._run_blocking_extension(callback, **kwargs),
             stage=stage,
             timeout_seconds=timeout,
             cancellation_grace_seconds=self.limits.cancellation_grace_seconds,
@@ -2463,13 +2848,19 @@ class Runtime:
     def _supports_atomic_reconciliation_preparation(self) -> bool:
         """Return whether a claim and recovery descriptor share one SQLite DB."""
 
-        store = self.idempotency_store
-        ledger = self.reconciliation_ledger
-        return (
-            isinstance(store, SQLiteIdempotencyStore)
-            and isinstance(ledger, SQLiteReconciliationLedger)
-            and Path(store.path).resolve() == Path(ledger.path).resolve()
-        )
+        with self._production_seal_lock:
+            cached = self._atomic_reconciliation_preparation
+            if cached is not None:
+                return cached
+            store = self.idempotency_store
+            ledger = self.reconciliation_ledger
+            cached = (
+                isinstance(store, SQLiteIdempotencyStore)
+                and isinstance(ledger, SQLiteReconciliationLedger)
+                and _same_sqlite_database(store, ledger)
+            )
+            self._atomic_reconciliation_preparation = cached
+            return cached
 
     @staticmethod
     def _normalize_result(
@@ -2733,12 +3124,6 @@ class Runtime:
             future.add_done_callback(lambda _completed: lease.release())
             task.add_done_callback(self._consume_background_result)
             raise error
-        except asyncio.CancelledError:
-            if task is not None and not task.done():
-                deferred_release = True
-                task.add_done_callback(lambda _completed: lease.release())
-                task.add_done_callback(self._consume_background_result)
-            raise
         except BaseException:
             if task is not None and not task.done():
                 deferred_release = True
@@ -2783,17 +3168,6 @@ class Runtime:
             )
             task.add_done_callback(self._consume_background_result)
             raise error
-        except asyncio.CancelledError:
-            if task is not None and not task.done():
-                self._suspend_reconciliation()
-                deferred_release = True
-                task.add_done_callback(
-                    lambda _completed: self._finish_detached_reconciliation(
-                        lease, resume=True
-                    )
-                )
-                task.add_done_callback(self._consume_background_result)
-            raise
         except BaseException:
             if task is not None and not task.done():
                 self._suspend_reconciliation()
@@ -2972,8 +3346,10 @@ class Runtime:
             ),
             contract_version=(contract.contract_version if contract is not None else 1),
             idempotency_namespace_digest=idempotency_namespace_digest(namespace),
-            tenant_partition_digest=tenant_partition_digest(
-                context.tenant or "global"
+            tenant_partition_digest=(
+                None
+                if context.tenant is None
+                else tenant_partition_digest(context.tenant)
             ),
             uncertainty_reason=(
                 "execution outcome may require explicit reconciliation"
@@ -2998,7 +3374,11 @@ class Runtime:
                 () if provider is None else provider.supported_evidence_kinds
             ),
             max_result_bytes=spec.max_result_bytes or 1_048_576,
-            metadata={"trace_id": context.trace_id, "request_id": context.request_id},
+            metadata={
+                "trace_id": context.trace_id,
+                "request_id": context.request_id,
+                _TENANT_PARTITION_BOUND_METADATA_KEY: bool(context.tenant),
+            },
         )
 
     def _start_idempotency_heartbeat(
@@ -3150,7 +3530,7 @@ class Runtime:
                     ),
                     f"middleware:{middleware.name}",
                 )
-                candidate = await await_stage(
+                candidate = await self._await_runtime_stage(
                     middleware.process(context),
                     stage=f"middleware:{middleware.name}",
                     timeout_seconds=timeout,
@@ -3201,7 +3581,7 @@ class Runtime:
                     self.limits.middleware_timeout_seconds,
                     "approval commit",
                 )
-                context = await await_stage(
+                context = await self._await_runtime_stage(
                     commit(context),
                     stage="approval commit",
                     timeout_seconds=timeout,
@@ -3221,7 +3601,7 @@ class Runtime:
                         self.limits.middleware_timeout_seconds,
                         "approval release",
                     )
-                    context = await await_stage(
+                    context = await self._await_runtime_stage(
                         release(context),
                         stage="approval release",
                         timeout_seconds=timeout,
@@ -3336,7 +3716,7 @@ class Runtime:
                     self.limits.observer_timeout_seconds,
                     f"observer:{middleware.name}",
                 )
-                candidate = await await_stage(
+                candidate = await self._await_runtime_stage(
                     middleware.process(context),
                     stage=f"observer:{middleware.name}",
                     timeout_seconds=timeout,
@@ -3447,7 +3827,7 @@ class Runtime:
             try:
                 result = abort(context.trace_id)
                 if inspect.isawaitable(result):
-                    await await_stage(
+                    await self._await_runtime_stage(
                         result,
                         stage=f"observer:{middleware.name}:abort",
                         timeout_seconds=self.limits.observer_timeout_seconds,
@@ -3499,7 +3879,7 @@ class Runtime:
                 self.limits.hook_timeout_seconds,
                 f"hook:{point.value}",
             )
-            return await await_stage(
+            return await self._await_runtime_stage(
                 self.hooks.emit(point, context, allow_critical=allow_critical),
                 stage=f"hook:{point.value}",
                 timeout_seconds=timeout,

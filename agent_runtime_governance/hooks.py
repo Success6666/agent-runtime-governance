@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 import inspect
 from dataclasses import dataclass
 from enum import Enum
 from typing import Awaitable, Callable, TypeAlias
 
+from ._blocking import run_blocking
 from .context import ExecutionContext, HistoryEntry
 
 
@@ -68,7 +68,7 @@ class HookRegistry:
                 if inspect.iscoroutinefunction(registration.callback):
                     value = await registration.callback(current)
                 else:
-                    value = await asyncio.to_thread(registration.callback, current)
+                    value = await run_blocking(registration.callback, current)
                 if inspect.isawaitable(value):
                     value = await value
                 if value is not None:

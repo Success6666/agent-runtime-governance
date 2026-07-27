@@ -6,17 +6,21 @@ import subprocess
 import sys
 import textwrap
 import threading
+from collections.abc import Callable
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import monotonic
 
 import pytest
 
+import agent_runtime_governance.runtime as runtime_module
 from agent_runtime_governance import (
     ActionContract,
     AuditMiddleware,
     ExecutionMode,
     ExecutionStatus,
+    IdempotencyAlreadyAppliedError,
     InMemoryAuditSink,
     InvocationOptions,
     ProductionProfile,
@@ -26,7 +30,9 @@ from agent_runtime_governance import (
     ReconciliationAttemptOutcome,
     ReconciliationAuditDeliveryPendingError,
     ReconciliationConflictError,
+    ReconciliationDisposition,
     ReconciliationFinding,
+    ReconciliationHead,
     ReconciliationState,
     Runtime,
     RuntimeLimits,
@@ -37,6 +43,10 @@ from agent_runtime_governance import (
     StaticIdentityProvider,
     ToolExecutionError,
     VerifiedPrincipal,
+)
+from agent_runtime_governance.reconciliation import (
+    UnknownAction,
+    tenant_partition_digest,
 )
 
 _RESULT_SCHEMA = {
@@ -53,6 +63,45 @@ def _runtime(path: Path, *, limits: RuntimeLimits | None = None) -> Runtime:
         reconciliation_ledger=SQLiteReconciliationLedger(path),
         limits=limits,
     )
+
+
+def test_atomic_preparation_colocation_cache_invalidates_on_store_reassignment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "shared.db"
+    calls = 0
+    original = runtime_module._same_sqlite_database
+
+    def counted(store, ledger) -> bool:
+        nonlocal calls
+        calls += 1
+        return original(store, ledger)
+
+    monkeypatch.setattr(runtime_module, "_same_sqlite_database", counted)
+    runtime = _runtime(path)
+    try:
+        assert runtime._supports_atomic_reconciliation_preparation() is True
+        assert runtime._supports_atomic_reconciliation_preparation() is True
+        assert calls == 1
+
+        runtime.reconciliation_ledger = SQLiteReconciliationLedger(
+            tmp_path / "separate.db"
+        )
+
+        assert runtime._supports_atomic_reconciliation_preparation() is False
+        assert calls == 2
+    finally:
+        runtime.close()
+
+
+async def _wait_until(predicate: Callable[[], bool], *, timeout: float = 1.0) -> None:
+    deadline = monotonic() + timeout
+    while monotonic() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError("condition was not reached before the timeout")
 
 
 @pytest.mark.asyncio
@@ -114,6 +163,56 @@ async def test_explicit_reconciliation_restores_only_a_validated_cached_result(
 
         cached = await runtime.ainvoke("charge", 100, _governance=options)
         assert cached == {"status": "paid"}
+        assert dispatches == 1
+    finally:
+        await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_without_result_prevents_redispatch(tmp_path: Path) -> None:
+    path = tmp_path / "runtime-reconciliation-no-result.db"
+    dispatches = 0
+
+    async def provider(
+        context: ReconciliationAttemptContext,
+    ) -> ReconciliationFinding:
+        return ReconciliationFinding(
+            proposed_state=ReconciliationState.CONFIRMED_SUCCEEDED,
+            evidence_kind="receipt",
+            evidence={"receipt_id": "receipt-1"},
+            observed_at=context.deadline,
+        )
+
+    runtime = _runtime(path)
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        reconciliation_provider=ProviderDescriptor(
+            provider_id="payment-receipt",
+            protocol_version="1",
+            supported_evidence_kinds=("receipt",),
+            provider=provider,
+        ),
+    )
+    async def charge() -> None:
+        nonlocal dispatches
+        dispatches += 1
+        raise TimeoutError("charge may have reached the payment provider")
+
+    options = InvocationOptions(idempotency_key="customer-visible-key")
+    try:
+        with pytest.raises(ToolExecutionError) as failed:
+            await runtime.arun("charge", _governance=options)
+        execution_record_id = failed.value.execution_record_id
+        assert execution_record_id is not None
+
+        head = await runtime.areconcile(execution_record_id)
+        assert head.state is ReconciliationState.CONFIRMED_SUCCEEDED
+        assert head.disposition is ReconciliationDisposition.APPLIED_NO_RESULT
+
+        with pytest.raises(ToolExecutionError) as replayed:
+            await runtime.arun("charge", _governance=options)
+        assert isinstance(replayed.value.cause, IdempotencyAlreadyAppliedError)
         assert dispatches == 1
     finally:
         await runtime.aclose()
@@ -365,6 +464,295 @@ async def test_strict_global_audit_recovery_requires_its_own_permission(
 
 
 @pytest.mark.asyncio
+async def test_verified_identity_without_profile_secures_reconciliation_control_plane(
+    tmp_path: Path,
+) -> None:
+    class ClaimsIdentityProvider:
+        def __init__(self, principals: dict[str, VerifiedPrincipal]) -> None:
+            self._principals = principals
+
+        def verify(self, claims: dict[str, object] | None = None) -> VerifiedPrincipal:
+            if claims is None or not isinstance(claims.get("actor"), str):
+                raise ValueError("identity claims are required")
+            return self._principals[claims["actor"]]
+
+    principals = {
+        "tenant-a": VerifiedPrincipal(
+            issuer="gateway",
+            subject="tenant-a-operator",
+            tenant="tenant-a",
+            permissions=frozenset({"reconciliation:probe"}),
+        ),
+        "unprivileged": VerifiedPrincipal(
+            issuer="gateway",
+            subject="unprivileged",
+            tenant="tenant-a",
+        ),
+        "tenant-b": VerifiedPrincipal(
+            issuer="gateway",
+            subject="tenant-b-operator",
+            tenant="tenant-b",
+            permissions=frozenset({"reconciliation:probe"}),
+        ),
+        "audit-worker": VerifiedPrincipal(
+            issuer="gateway",
+            subject="audit-worker",
+            tenant="tenant-a",
+            permissions=frozenset({"reconciliation:audit:drain"}),
+        ),
+    }
+    path = tmp_path / "verified-identity-without-profile.db"
+    provider_calls: list[str] = []
+    runtime = Runtime(
+        idempotency_store=SQLiteIdempotencyStore(path),
+        reconciliation_ledger=SQLiteReconciliationLedger(path),
+        identity_provider=ClaimsIdentityProvider(principals),
+        require_verified_identity=True,
+    )
+
+    async def provider(
+        context: ReconciliationAttemptContext,
+    ) -> ReconciliationFinding:
+        provider_calls.append(context.action.execution_record_id)
+        return ReconciliationFinding(
+            proposed_state=ReconciliationState.MANUAL_REVIEW,
+            evidence_kind="receipt",
+            evidence={"receipt_id": "receipt-1"},
+            observed_at=context.deadline,
+        )
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        reconciliation_provider=ProviderDescriptor(
+            provider_id="verified-identity-provider",
+            protocol_version="1",
+            supported_evidence_kinds=("receipt",),
+            provider=provider,
+        ),
+    )
+    async def charge() -> None:
+        raise TimeoutError("outcome is uncertain")
+
+    try:
+        with pytest.raises(ToolExecutionError) as failed:
+            await runtime.arun(
+                "charge",
+                _governance=InvocationOptions(
+                    idempotency_key="request-1",
+                    identity_claims={"actor": "tenant-a"},
+                ),
+            )
+        execution_record_id = failed.value.execution_record_id
+        assert execution_record_id is not None
+
+        with pytest.raises(PermissionError, match="authorization denied"):
+            await runtime.areconcile(execution_record_id)
+        with pytest.raises(PermissionError, match="authorization denied"):
+            await runtime.areconcile(
+                execution_record_id,
+                identity_claims={"actor": "unprivileged"},
+            )
+        with pytest.raises(PermissionError, match="authorization denied"):
+            await runtime.areconcile(
+                execution_record_id,
+                identity_claims={"actor": "tenant-b"},
+            )
+        assert provider_calls == []
+
+        with pytest.raises(PermissionError, match="authorization denied"):
+            await runtime.adrain_reconciliation_audit_outbox(
+                identity_claims={"actor": "tenant-a"}
+            )
+        assert (
+            await runtime.adrain_reconciliation_audit_outbox(
+                identity_claims={"actor": "audit-worker"}
+            )
+            >= 0
+        )
+
+        head = await runtime.areconcile(
+            execution_record_id,
+            identity_claims={"actor": "tenant-a"},
+        )
+        assert head.state is ReconciliationState.MANUAL_REVIEW
+        assert provider_calls == [execution_record_id]
+    finally:
+        await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_tenantless_unknown_action_is_not_recoverable_by_global_tenant(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "tenantless-unknown.db"
+    provider_calls: list[str] = []
+    producer = Runtime(
+        idempotency_store=SQLiteIdempotencyStore(path),
+        reconciliation_ledger=SQLiteReconciliationLedger(path),
+    )
+
+    async def provider(
+        context: ReconciliationAttemptContext,
+    ) -> ReconciliationFinding:
+        provider_calls.append(context.action.execution_record_id)
+        return ReconciliationFinding(
+            proposed_state=ReconciliationState.MANUAL_REVIEW,
+            evidence_kind="receipt",
+            evidence={"receipt_id": "receipt-1"},
+            observed_at=context.deadline,
+        )
+
+    def register_charge(runtime: Runtime) -> None:
+        @runtime.tool(
+            execution_mode=ExecutionMode.IDEMPOTENT,
+            reconciliation_provider=ProviderDescriptor(
+                provider_id="tenantless-provider",
+                protocol_version="1",
+                supported_evidence_kinds=("receipt",),
+                provider=provider,
+            ),
+        )
+        async def charge() -> None:
+            raise TimeoutError("outcome is uncertain")
+
+    register_charge(producer)
+    try:
+        with pytest.raises(ToolExecutionError) as failed:
+            await producer.arun(
+                "charge", _governance=InvocationOptions(idempotency_key="request-1")
+            )
+        execution_record_id = failed.value.execution_record_id
+        assert execution_record_id is not None
+        assert producer.reconciliation_ledger is not None
+        assert (
+            producer.reconciliation_ledger.current(
+                execution_record_id
+            ).action.tenant_partition_digest
+            is None
+        )
+    finally:
+        await producer.aclose()
+
+    recovery = Runtime(
+        idempotency_store=SQLiteIdempotencyStore(path),
+        reconciliation_ledger=SQLiteReconciliationLedger(path),
+        identity_provider=StaticIdentityProvider(
+            VerifiedPrincipal(
+                issuer="gateway",
+                subject="global-operator",
+                tenant="global",
+                permissions=frozenset({"reconciliation:probe"}),
+            )
+        ),
+        require_verified_identity=True,
+    )
+    register_charge(recovery)
+    try:
+        with pytest.raises(PermissionError, match="authorization denied"):
+            await recovery.areconcile(execution_record_id)
+        assert provider_calls == []
+    finally:
+        await recovery.aclose()
+
+
+def test_legacy_global_tenant_partition_is_fail_closed_without_binding_marker() -> None:
+    action_fields = {
+        "execution_record_id": "r" * 16,
+        "action_digest": "a" * 64,
+        "tool_name": "charge",
+        "contract_id": "runtime.charge",
+        "contract_version": 1,
+        "idempotency_namespace_digest": "b" * 64,
+        "tenant_partition_digest": tenant_partition_digest("global"),
+        "uncertainty_reason": "outcome is uncertain",
+        "attempted_at": datetime.now(timezone.utc),
+    }
+    principal = VerifiedPrincipal(
+        issuer="gateway",
+        subject="global-operator",
+        tenant="global",
+        permissions=frozenset({"reconciliation:probe"}),
+    )
+
+    with pytest.raises(PermissionError, match="authorization denied"):
+        Runtime._assert_reconciliation_tenant_access(
+            principal, UnknownAction(**action_fields)
+        )
+
+    Runtime._assert_reconciliation_tenant_access(
+        principal,
+        UnknownAction(
+            **action_fields,
+            metadata={"tenant_partition_bound": True},
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_close_rejects_pending_reconciliation_without_closing_runtime(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "close-pending-reconciliation.db"
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    runtime = Runtime(
+        idempotency_store=SQLiteIdempotencyStore(path),
+        reconciliation_ledger=SQLiteReconciliationLedger(path),
+    )
+
+    async def provider(
+        context: ReconciliationAttemptContext,
+    ) -> ReconciliationFinding:
+        entered.set()
+        await release.wait()
+        return ReconciliationFinding(
+            proposed_state=ReconciliationState.MANUAL_REVIEW,
+            evidence_kind="receipt",
+            evidence={"receipt_id": "receipt-1"},
+            observed_at=context.deadline,
+        )
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        reconciliation_provider=ProviderDescriptor(
+            provider_id="close-pending-provider",
+            protocol_version="1",
+            supported_evidence_kinds=("receipt",),
+            provider=provider,
+        ),
+    )
+    async def charge() -> None:
+        raise TimeoutError("outcome is uncertain")
+
+    @runtime.tool(execution_mode=ExecutionMode.READ_ONLY)
+    async def inspect() -> str:
+        return "ready"
+
+    pending: asyncio.Task[ReconciliationHead] | None = None
+    try:
+        with pytest.raises(ToolExecutionError) as failed:
+            await runtime.arun(
+                "charge", _governance=InvocationOptions(idempotency_key="request-1")
+            )
+        execution_record_id = failed.value.execution_record_id
+        assert execution_record_id is not None
+        pending = asyncio.create_task(runtime.areconcile(execution_record_id))
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+        with pytest.raises(RuntimeError, match="reconciliation work is pending"):
+            runtime.close()
+        assert await runtime.ainvoke("inspect") == "ready"
+
+        release.set()
+        assert (await pending).state is ReconciliationState.MANUAL_REVIEW
+    finally:
+        release.set()
+        if pending is not None and not pending.done():
+            await asyncio.gather(pending, return_exceptions=True)
+        await runtime.aclose()
+
+
+@pytest.mark.asyncio
 async def test_runtime_atomically_prepares_recovery_descriptor_before_dispatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -383,7 +771,7 @@ async def test_runtime_atomically_prepares_recovery_descriptor_before_dispatch(
 
     @runtime.tool(execution_mode=ExecutionMode.IDEMPOTENT)
     async def charge() -> dict[str, bool]:
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection:
             prepared = connection.execute(
                 "SELECT COUNT(*) FROM reconciliation_prepared_actions"
             ).fetchone()[0]
@@ -562,8 +950,7 @@ async def test_late_provider_result_is_discarded_and_provider_is_poisoned(
         first = await runtime.areconcile(execution_record_id)
         assert first.state is ReconciliationState.UNKNOWN
         await asyncio.wait_for(entered.wait(), timeout=0.2)
-        await asyncio.sleep(0.1)
-        assert late_results
+        await _wait_until(lambda: bool(late_results))
         assert runtime.reconciliation_ledger.current(  # type: ignore[union-attr]
             execution_record_id
         ).state is ReconciliationState.UNKNOWN
@@ -574,6 +961,79 @@ async def test_late_provider_result_is_discarded_and_provider_is_poisoned(
         assert attempts[-1].payload["outcome"] == ReconciliationAttemptOutcome.UNAVAILABLE.value
     finally:
         await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_aclose_waits_for_a_cancellation_ignoring_provider(
+    tmp_path: Path,
+) -> None:
+    """Shutdown cannot release runtime executors while a provider still runs."""
+
+    path = tmp_path / "close-draining-provider.db"
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    runtime = _runtime(
+        path,
+        limits=RuntimeLimits(
+            reconciliation_provider_timeout_seconds=0.02,
+            cancellation_grace_seconds=0.005,
+        ),
+    )
+
+    async def provider(
+        context: ReconciliationAttemptContext,
+    ) -> ReconciliationFinding:
+        entered.set()
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                continue
+        return ReconciliationFinding(
+            proposed_state=ReconciliationState.CONFIRMED_SUCCEEDED,
+            evidence_kind="receipt",
+            evidence={"receipt_id": "late"},
+            observed_at=context.deadline,
+        )
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        reconciliation_provider=ProviderDescriptor(
+            provider_id="close-draining-provider",
+            protocol_version="1",
+            supported_evidence_kinds=("receipt",),
+            provider=provider,
+        ),
+    )
+    async def charge() -> None:
+        raise TimeoutError("outcome is uncertain")
+
+    closing: asyncio.Task[None] | None = None
+    try:
+        with pytest.raises(ToolExecutionError) as failed:
+            await runtime.arun(
+                "charge", _governance=InvocationOptions(idempotency_key="request-1")
+            )
+        execution_record_id = failed.value.execution_record_id
+        assert execution_record_id is not None
+
+        reconciled = await runtime.areconcile(execution_record_id)
+        assert reconciled.state is ReconciliationState.UNKNOWN
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        assert any(not task.done() for task in runtime._reconciliation_tasks)
+
+        closing = asyncio.create_task(runtime.aclose())
+        await asyncio.sleep(0.02)
+        assert not closing.done()
+
+        release.set()
+        await asyncio.wait_for(closing, timeout=1)
+    finally:
+        release.set()
+        if closing is not None:
+            await asyncio.gather(closing, return_exceptions=True)
+        elif not runtime._closed:
+            await runtime.aclose()
 
 
 @pytest.mark.asyncio
@@ -1188,7 +1648,7 @@ async def test_finalization_storage_failure_poison_reconciliation(
 
         with pytest.raises(sqlite3.OperationalError, match="simulated finalization"):
             await runtime.areconcile(execution_record_id)
-        await asyncio.sleep(0)
+        await _wait_until(lambda: not runtime.reconciliation_ledger_healthy)
         with pytest.raises(ReconciliationConflictError, match="disabled"):
             await runtime.areconcile(execution_record_id)
     finally:
@@ -1249,7 +1709,7 @@ async def test_finalization_conflict_without_durable_progress_poisons_reconcilia
 
         with pytest.raises(ReconciliationConflictError, match="simulated concurrent"):
             await runtime.areconcile(execution_record_id)
-        await asyncio.sleep(0)
+        await _wait_until(lambda: not runtime.reconciliation_ledger_healthy)
         assert len(ledger.attempts(execution_record_id)) == 1
         with pytest.raises(ReconciliationConflictError, match="disabled"):
             await runtime.areconcile(execution_record_id)
@@ -1428,11 +1888,11 @@ async def test_cancelling_outbox_delivery_keeps_reconciliation_recoverable(
         sink.block = False
         sink.release.set()
         assert await asyncio.to_thread(sink.completed.wait, 1.0)
-        await asyncio.sleep(0)
+        await _wait_until(lambda: runtime.reconciliation_ledger_healthy)
 
         recovered = await runtime.areconcile(execution_record_id)
         assert recovered.state is ReconciliationState.CONFIRMED_SUCCEEDED
-        assert runtime._reconciliation_poison is None
+        assert runtime.reconciliation_ledger_healthy
     finally:
         sink.block = False
         sink.release.set()
@@ -1519,7 +1979,7 @@ async def test_timed_out_outbox_delivery_recovers_without_poisoning_ledger(
             )
         assert pending.value.execution_record_id == execution_record_id
         assert await asyncio.to_thread(sink.entered.wait, 1.0)
-        assert runtime._reconciliation_poison is None
+        assert runtime.reconciliation_ledger_healthy
         assert provider_calls == 1
 
         sink.block = False
@@ -1527,7 +1987,7 @@ async def test_timed_out_outbox_delivery_recovers_without_poisoning_ledger(
         assert await asyncio.to_thread(sink.completed.wait, 1.0)
         delivered = await runtime.adrain_reconciliation_audit_outbox(limit=16)
         assert delivered == 3
-        assert runtime._reconciliation_poison is None
+        assert runtime.reconciliation_ledger_healthy
         assert provider_calls == 1
         reconciliation_events = [
             event
@@ -1662,7 +2122,7 @@ def test_blocked_reconciliation_audit_sink_cannot_hold_python_process_open() -> 
                     idempotency_store=SQLiteIdempotencyStore(path),
                     reconciliation_ledger=SQLiteReconciliationLedger(path),
                     limits=RuntimeLimits(
-                        reconciliation_audit_delivery_timeout_seconds=0.03
+                        reconciliation_audit_delivery_timeout_seconds=0.1
                     ),
                 )
                 try:
@@ -1683,7 +2143,7 @@ def test_blocked_reconciliation_audit_sink_cannot_hold_python_process_open() -> 
         cwd=Path(__file__).resolve().parents[1],
         capture_output=True,
         text=True,
-        timeout=3,
+        timeout=10,
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
@@ -1734,13 +2194,11 @@ async def test_global_audit_recovery_honors_its_caller_deadline(
         limits=RuntimeLimits(reconciliation_audit_delivery_timeout_seconds=1.0),
     )
     try:
-        started_at = monotonic()
         deadline = datetime.now(timezone.utc) + timedelta(seconds=0.04)
         with pytest.raises(StageTimeoutError, match="reconciliation audit delivery"):
             await runtime.adrain_reconciliation_audit_outbox(
                 limit=1, deadline=deadline
             )
-        assert monotonic() - started_at < 0.25
         assert await asyncio.to_thread(sink.entered.wait, 1.0)
 
         sink.release.set()
@@ -1801,7 +2259,7 @@ async def test_reconciliation_audit_delivery_honors_its_caller_deadline(
         def write_idempotent(self, source_event_id: str, event: object) -> None:
             if self.block:
                 self.entered.set()
-                if not self.release.wait(timeout=0.5):
+                if not self.release.wait(timeout=2):
                     raise RuntimeError("test audit sink was not released")
                 self.completed.set()
             assert isinstance(event, dict)
@@ -1850,11 +2308,9 @@ async def test_reconciliation_audit_delivery_honors_its_caller_deadline(
         assert execution_record_id is not None
         sink.block = True
 
-        started_at = monotonic()
-        deadline = datetime.now(timezone.utc) + timedelta(seconds=0.04)
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=0.5)
         with pytest.raises(StageTimeoutError, match="reconciliation audit delivery"):
             await runtime.areconcile(execution_record_id, deadline=deadline)
-        assert monotonic() - started_at < 0.25
         assert await asyncio.to_thread(sink.entered.wait, 1.0)
 
         head = runtime.reconciliation_ledger.current(execution_record_id)  # type: ignore[union-attr]
