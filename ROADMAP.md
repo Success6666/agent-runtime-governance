@@ -17,6 +17,19 @@ The detailed production plan is in
 - [x] v0.6.0: immutable action contracts across policy, approval, idempotency,
   execution, telemetry, and audit
 
+## Implementation under release verification
+
+- [x] v0.7: deterministic `UNKNOWN` reconciliation on an append-only,
+  revision-checked ledger; atomic SQLite claim/descriptor preparation;
+  persisted provider binding; and a durable, ordered reconciliation-audit
+  outbox with source-idempotent SQLite delivery
+- [x] v0.7: strict probe, manual-resolution, and audit-drain authorization;
+  tenant isolation; bounded provider/finalization/audit-delivery paths; and
+  recovery of expired unfinished probes into `MANUAL_REVIEW`
+
+The v0.7 implementation is not listed as released until its protected CI,
+Docker integration, migration, package, and publication evidence is recorded.
+
 ## Product direction
 
 The next releases focus on **Action Commit Safety for AI Agents**:
@@ -56,10 +69,21 @@ this release.
 
 ## v0.7 - Reconciliation and recovery
 
-- Explicit `UNKNOWN` resolution state machine
-- Tool-specific receipts and `ReconciliationProvider`
-- No automatic key reuse before resolution
-- Crash, timeout, cancellation, lease-loss, and competing-worker fault matrix
+- [x] Explicit `UNKNOWN` state machine with append-only, revision-checked
+  transitions to `CONFIRMED_SUCCEEDED`, `CONFIRMED_NOT_APPLIED`, or
+  `MANUAL_REVIEW`
+- [x] Tool-specific `ReconciliationProvider` bindings persisted with the action
+  and rejected on provider identity drift after restart; applications must keep
+  provider implementations read-only
+- [x] No automatic key reuse while the reconciliation disposition is
+  `BLOCKED_UNKNOWN` or `BLOCKED_MANUAL_REVIEW`
+- [x] Atomic prepared-action recovery, cancellation/finalization, timeout,
+  audit-delivery, crash/restart, and competing-worker regression coverage on
+  local durable SQLite storage
+
+Release evidence still requires the protected workflow and documented
+publication record. The implementation does not claim external exactly-once
+behavior without a downstream idempotency or receipt/probe guarantee.
 
 ## v0.8 - Evidence and conformance
 

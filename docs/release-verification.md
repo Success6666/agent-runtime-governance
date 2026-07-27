@@ -5,6 +5,37 @@ latency SLA or a guarantee against future advisories. CI repeats the test
 matrix, policy checks, dependency audit, and Docker integration smoke from
 clean runners.
 
+## v0.7.0 (pending publication)
+
+There is intentionally no verification result or release claim for v0.7.0 in
+this file yet. The implementation must not be described as published or
+verified until the protected CI/integration workflows, the post-publication
+release-artifact workflow, the PyPI publication workflow, and the recorded
+operator checks together provide evidence for all of the following:
+
+- the full test suite and coverage gate on the supported Python matrix in
+  `ci.yml`, plus Docker-backed integration smoke in `integration.yml`;
+- deterministic-reconciliation fault and restart coverage, including atomic
+  prepared-claim rollback, provider identity drift, cancellation/finalization,
+  expired unfinished attempts, manual-resolution authorization, migration
+  snapshots, and idempotent audit redelivery after acknowledgement failure;
+- Docker-backed external integration smoke for OPA, OTLP, and Prometheus, plus
+  the release's documented local durable-storage checks;
+- migration validation from the supported prior SQLite schema, including a
+  backup/restore drill and delivery of pending outbox envelopes;
+- post-publication release-artifact verification on Python 3.13: isolated
+  dependency audit, wheel/source-distribution build and `twine check`, clean
+  wheel/source installation/import, SBOM, checksums, and provenance; and
+- release assets, SHA256 checksums, SPDX SBOM, and GitHub provenance, followed
+  by PyPI Trusted Publishing and an independent public-index installation
+  check.
+
+The eventual v0.7.0 entry must name the protected `main` commit, dates, exact
+test and coverage results, immutable GitHub workflow/release links, PyPI
+version, the result of the recorded migration restore/public-index installation
+checks, and any measured benchmark evidence. It must distinguish the SDK's
+durable local protocol from a claim of downstream exactly-once execution.
+
 ## v0.6.0
 
 The release was validated on 2026-07-26 (UTC) from protected `main` commit

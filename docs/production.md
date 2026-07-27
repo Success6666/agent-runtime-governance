@@ -1,10 +1,11 @@
 # Production Operations
 
-This guide covers the operational contract for v0.5 and v0.6. Applications
-remain responsible for tool-specific authorization, business rollback, and
-data retention requirements.
+This guide covers the operational contract through the v0.7 implementation.
+Applications remain responsible for tool-specific authorization, business
+rollback, downstream idempotency, and data-retention requirements.
 
-The v0.6 strict profile adds an explicit registration and sealing lifecycle.
+The v0.6 strict profile adds an explicit registration and sealing lifecycle;
+v0.7 adds deterministic reconciliation requirements for idempotent tools.
 Configure `ProductionProfile`, register every tool, call
 `seal_production()`, and expose readiness or accept traffic only after the
 returned report has `ready=True`. Compatibility runtimes can call
@@ -21,13 +22,28 @@ runtime identity decision.
 - Use `SQLiteIdempotencyStore`, `SQLiteApprovalStore`, and
   `SQLiteIdentityReplayStore` when state must survive process restarts. Store
   each database on a local durable filesystem with restrictive permissions.
+- For strict `IDEMPOTENT` tools, use a `SQLiteIdempotencyStore` and a
+  `SQLiteReconciliationLedger` configured with the **same SQLite database
+  path**. Register a tool-specific `ReconciliationProvider` with a stable
+  provider ID, protocol version, and bounded evidence kinds. The application
+  must ensure the provider is read-only: the runtime validates its binding and
+  returned evidence, not the absence of provider side effects. The strict
+  profile rejects a missing, non-durable, non-atomic, non-colocated, or
+  provider-less configuration.
 - Construct the runtime with a trusted `identity_provider` and
   `require_verified_identity=True`. Compatibility identity fields supplied by
   the caller are not a production trust boundary.
 - Configure absolute request deadlines and bounded concurrency. Capacity must
   be derived from downstream limits, not only CPU count.
-- Use a signed JSONL or SQLite audit sink. Mark audit delivery critical for
-  actions that must never execute without a durable record.
+- Use a signed JSONL or SQLite audit sink for ordinary audit. Mark audit
+  delivery critical for actions that must never execute without a durable
+  record. Strict reconciliation requires a signed, durable, integrity-protected
+  audit sink behind a fail-closed `AuditMiddleware`; it must advertise the
+  reconciliation-delivery capability and implement
+  `write_idempotent(source_event_id, event)` so a durable outbox envelope can
+  be retried without appending a second audit record. `SQLiteAuditSink` is the
+  built-in tested implementation. JSONL audit is not a replacement for that
+  source-idempotent delivery boundary.
 - Keep identity and audit HMAC keys in a secret manager. Rotate identity keys by
   adding a new `kid`, switching issuers, waiting for the maximum envelope
   lifetime, and only then removing the old key.
@@ -64,10 +80,73 @@ the finalized governance state on every supported Python version. Python 3.10
 re-materializes task cancellation exceptions and therefore cannot guarantee
 that custom attributes remain directly attached to the caught exception.
 
-Never automatically retry `UNKNOWN`. Reconcile the external system using the
-trace ID, request ID, tool name, and idempotency key. After confirming the
-outcome, close the operational incident or write a new compensating action with
-a new idempotency key.
+Never automatically retry an unresolved `UNKNOWN`. The original key remains
+blocked while its reconciliation disposition is `BLOCKED_UNKNOWN` or
+`BLOCKED_MANUAL_REVIEW`. Use the deterministic reconciliation protocol below;
+do not delete a durable record to force a retry.
+
+## Deterministic UNKNOWN reconciliation
+
+For the strict SQLite path, an idempotency owner and a bounded
+`UnknownAction` recovery descriptor commit in the same transaction before a
+side-effecting tool body is dispatched. The descriptor binds the action digest,
+contract identity, tenant partition digest, receipt/probe schemas, and
+reconciliation provider binding (identifier, protocol version, and evidence
+kinds). It deliberately excludes the raw caller idempotency key and provider
+callable. If the process fails before a terminal result is known, the same key
+is not re-opened for execution; lease recovery can materialize an explicit
+`UNKNOWN` reconciliation head from the descriptor.
+
+`Runtime.areconcile(execution_record_id, ...)` starts a tracked control-plane
+workflow. The application must ensure its provider call is a read-only
+receipt/probe attempt; the runtime persists the attempt and transition protocol
+records. A provider must return supported, bounded evidence and may only be
+used when its registered ID, protocol version, and evidence kinds match the
+descriptor stored with the unresolved action. A restart with a different
+provider does not authorize a substitute probe. In a strict profile, the caller must have
+`reconciliation:probe` (or the configured replacement) and its verified tenant
+must match the persisted tenant partition.
+
+After `ATTEMPT_STARTED` is durable, its terminal record is finalized under
+`RuntimeLimits.reconciliation_finalization_timeout_seconds`, independently of
+the caller cancellation budget. If that finalization cannot make durable
+progress, the reconciliation channel fails closed for new work. If an attempt
+is still unclosed before its own deadline, another worker cannot start a second
+probe. After the deadline expires, recovery records a
+`recovery_required` outcome and moves the action to `MANUAL_REVIEW`; it does
+not invoke another provider.
+
+`Runtime.aresolve_reconciliation(...)` is an optimistic, manual control-plane
+operation. It requires the configured `reconciliation:resolve` permission,
+verified tenant access, the expected review state and revision, a reason, and
+bounded evidence. The runtime records a keyed operator-identity digest rather
+than a raw principal. A transition to `CONFIRMED_NOT_APPLIED` additionally
+requires an explicit `retry_safe=True` assertion; timeouts and absent receipts
+never imply that a write was not applied.
+
+Every reconciliation head/event lineage mutation enqueues a fixed-allowlist
+audit envelope in the same SQLite transaction. It excludes raw provider
+evidence, raw tenant identities, and idempotency keys. The worker path
+`Runtime.adrain_reconciliation_audit_outbox(...)` performs no provider call;
+it delivers pending envelopes in revision order for each execution, requires
+the separately configured `reconciliation:audit:drain` permission in a strict
+profile, and uses the outbox ID as the audit sink source identity. Sink failure
+or timeout leaves the envelope pending for a later authorized worker. It does
+not rewrite reconciliation history or make the original idempotency key
+reusable. Audit delivery uses its own bounded timeout and bulkhead; runtime
+shutdown does not wait indefinitely for a synchronous sink thread that has
+already exceeded that delivery budget. The runtime-owned delivery executor uses
+daemon workers only because this is an outbox-backed, source-idempotent retry
+path. If an application injects its own audit-delivery executor, that executor
+must provide equivalent bounded shutdown behavior. The reconciliation ledger
+and finalization paths intentionally remain authoritative and cannot be made
+daemon work without weakening their durability contract.
+
+The protocol establishes durable local recovery state. It does **not** make an
+arbitrary downstream side effect exactly-once. Confirm an external success or
+non-application only when the target system's stable idempotency key, receipt,
+or probe semantics support that conclusion; otherwise retain `UNKNOWN` or
+`MANUAL_REVIEW` and follow the application's incident process.
 
 ## Approval recovery
 
@@ -94,6 +173,18 @@ Verification proves tampering or truncation only when the chain anchor and key
 are protected separately. Back up databases, chain state, and keys according to
 the same recovery point objective. Test restore and `verify()` before every
 release that changes persistence code.
+
+For v0.7, the reconciliation SQLite database contains a per-execution ordered
+audit outbox in addition to the reconciliation heads and append-only events.
+The envelope payload and identity are immutable; delivery attempt count,
+acknowledgement time, and last error are intentionally mutable operational
+state. Back up and restore it as part of the same recovery unit as the
+colocated idempotency database. A restored database can have pending audit
+envelopes; drain those through the authorized recovery worker rather than
+editing payloads or marking them delivered by hand. `SQLiteAuditSink`
+independently checks its hash chain and source-event payload identity, so back
+up its database and signing key with the same care. The outbox is delivery
+intent, not a second authoritative copy of the external side effect.
 
 Configure `sign_key` for snapshot stores when tamper evidence is required. In
 unsigned mode the snapshot sequence state uses only a recomputable
@@ -183,5 +274,9 @@ SDK dependency closure.
 
 Verify a restart with pending approval and idempotency records, a forced OPA
 failure, a critical audit failure, cancellation of an in-flight mutating tool,
-and concurrent requests sharing an idempotency key. Alert on denied, failed, and
-`UNKNOWN` terminal outcomes separately.
+and concurrent requests sharing an idempotency key. For v0.7, also verify an
+expired unclosed reconciliation attempt, a provider identity mismatch after
+restart, an audit acknowledgement failure followed by idempotent redelivery,
+and recovery-worker authorization. Alert on denied, failed, `UNKNOWN`, and
+`MANUAL_REVIEW` outcomes separately; alert separately on pending outbox age,
+delivery failures, and reconciliation-channel fail-closed state.

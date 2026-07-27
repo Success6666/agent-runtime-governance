@@ -4,8 +4,9 @@
 
 - Direction approved after the v0.5.1 production reliability release.
 - Last reviewed: 2026-07-26.
-- This document defines planned work, not shipped behavior. Shipped behavior is
-  documented in the release notes and production guide.
+- This document defines future work and the v0.7 implementation's release exit
+  criteria, not shipped behavior. Shipped behavior is documented in the release
+  notes and production guide.
 - A production claim is published only when it points to a repeatable test,
   benchmark, integration run, or release artifact.
 
@@ -157,7 +158,7 @@ User intent + trusted principal + tool request
                +------------------+------------------+
                |                  |                  |
                v                  v                  v
-     CONFIRMED_SUCCEEDED  CONFIRMED_FAILED  MANUAL_REVIEW/UNKNOWN
+     CONFIRMED_SUCCEEDED  CONFIRMED_NOT_APPLIED  MANUAL_REVIEW/UNKNOWN
                |                  |                  |
                +------------------+------------------+
                                   |
@@ -264,14 +265,24 @@ representations, and oversized payloads.
 Turn `UNKNOWN` from an operator warning into an explicit recovery protocol
 without ever treating uncertainty as permission to repeat a side effect.
 
-### Planned model
+### Implementation status
 
-- Add a versioned `ReconciliationProvider` protocol.
-- Define legal transitions from `UNKNOWN` to `CONFIRMED_SUCCEEDED`,
-  `CONFIRMED_FAILED`, or `MANUAL_REVIEW`.
-- Accept tool-specific receipts and external state probes as evidence.
-- Block automatic reuse of an idempotency key while its action is unresolved.
-- Append reconciliation records; never overwrite the original execution event.
+The core protocol is implemented in the v0.7 worktree, but it is not a release
+claim until the exit criteria and protected publication workflow have complete,
+recorded evidence. The implemented model is:
+
+- A versioned `ReconciliationProvider` protocol whose stable identifier,
+  protocol version, and supported evidence kinds are persisted with the
+  unresolved action; the callable itself is not persisted. The application is
+  responsible for making the provider read-only.
+- Legal, append-only, expected-revision transitions from `UNKNOWN` to
+  `CONFIRMED_SUCCEEDED`, `CONFIRMED_NOT_APPLIED`, or `MANUAL_REVIEW`.
+- Tool-specific receipts and external state probes as bounded evidence.
+- No automatic reuse of an idempotency key while its reconciliation disposition
+  remains blocked.
+- A SQLite recovery descriptor prepared atomically with the idempotency owner,
+  a transactional fixed-allowlist audit outbox, and expired-unclosed-attempt
+  recovery into `MANUAL_REVIEW` without a second provider invocation.
 
 ### Exit criteria
 
