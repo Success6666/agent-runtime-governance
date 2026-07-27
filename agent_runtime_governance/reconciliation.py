@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from threading import Lock
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import rfc8785
 
@@ -23,6 +23,9 @@ from ._sqlite import (
 )
 from .contracts import canonical_json_bytes, validate_instance, validate_schema
 from .errors import ContractValidationError, RegistryError
+
+if TYPE_CHECKING:
+    from .registry import IdempotencyClaim
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
@@ -980,6 +983,101 @@ class SQLiteReconciliationLedger:
                     "a reconciliation head already exists for this execution record"
                 ) from exc
             connection.commit()
+        return self.current(action.execution_record_id)
+
+    def record_unknown(
+        self,
+        claim: "IdempotencyClaim",
+        action: UnknownAction,
+        error: BaseException,
+    ) -> ReconciliationHead:
+        """Atomically persist an UNKNOWN idempotency outcome and its head.
+
+        This boundary is intentionally owned by the co-located SQLite ledger.
+        A caller cannot first commit an UNKNOWN authority row and then lose the
+        reconciliation head during a process crash.
+        """
+
+        if not isinstance(action, UnknownAction):
+            raise TypeError("action must be an UnknownAction")
+        if not getattr(claim, "owner", False):
+            raise ReconciliationConflictError(
+                "only the current idempotency owner can record UNKNOWN"
+            )
+        if claim.execution_record_id != action.execution_record_id:
+            raise ReconciliationValidationError(
+                "unknown action execution record does not match the idempotency claim"
+            )
+        if claim.fingerprint != action.action_digest:
+            raise ReconciliationValidationError(
+                "unknown action digest does not match the idempotency claim"
+            )
+        if idempotency_namespace_digest(claim.namespace) != action.idempotency_namespace_digest:
+            raise ReconciliationValidationError(
+                "unknown action namespace does not match the idempotency claim"
+            )
+        if not claim.owner_token:
+            raise ReconciliationValidationError(
+                "durable idempotency claim must include an owner token"
+            )
+
+        now = datetime.now(timezone.utc)
+        stored_error = f"{type(error).__name__}: execution outcome is unknown"
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE idempotency_records
+                SET state = 'unknown', result_json = NULL, error = ?,
+                    owner_token = NULL, lease_expires_at = NULL, updated_at = ?
+                WHERE execution_record_id = ?
+                  AND namespace = ? AND key = ? AND fingerprint = ?
+                  AND owner_token = ? AND state = 'pending'
+                """,
+                (
+                    stored_error,
+                    _timestamp_text(now),
+                    claim.execution_record_id,
+                    claim.namespace,
+                    claim.key,
+                    claim.fingerprint,
+                    claim.owner_token,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ReconciliationConflictError(
+                    "idempotency ownership was lost before UNKNOWN could be recorded"
+                )
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO reconciliation_heads(
+                        execution_record_id, action_json, state, revision,
+                        disposition, resolved_result_available,
+                        resolved_result_json, updated_at
+                    ) VALUES (?, ?, 'UNKNOWN', 0, 'blocked_unknown', 0, NULL, ?)
+                    """,
+                    (
+                        action.execution_record_id,
+                        _dump(action.to_dict()),
+                        _timestamp_text(now),
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ReconciliationConflictError(
+                    "a reconciliation head already exists for this execution record"
+                ) from exc
+            connection.commit()
+
+        from .registry import IdempotencyOutcomeUnknownError
+
+        if not claim.future.done():
+            claim.future.set_exception(
+                IdempotencyOutcomeUnknownError(
+                    stored_error, execution_record_id=claim.execution_record_id
+                )
+            )
+            claim.future.exception()
         return self.current(action.execution_record_id)
 
     @staticmethod
