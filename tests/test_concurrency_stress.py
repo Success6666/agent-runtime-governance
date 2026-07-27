@@ -17,6 +17,7 @@ from agent_runtime_governance.decisions import (
 )
 from agent_runtime_governance.identity import SQLiteIdentityReplayStore
 from agent_runtime_governance.registry import SQLiteIdempotencyStore
+from agent_runtime_governance.resilience import RuntimeLimits
 from agent_runtime_governance.runtime import InvocationOptions, Runtime
 from agent_runtime_governance.snapshots import JSONLSnapshotStore, SQLiteSnapshotStore
 
@@ -139,7 +140,9 @@ def test_join_all_terminates_timed_out_workers() -> None:
 
 @pytest.mark.asyncio
 async def test_500_concurrent_contexts_are_isolated() -> None:
-    runtime = Runtime()
+    runtime = Runtime(
+        limits=RuntimeLimits(max_in_flight=500, admission_timeout_seconds=5.0)
+    )
 
     @runtime.tool(execution_mode=ExecutionMode.READ_ONLY)
     async def echo(value: int) -> int:
