@@ -5,6 +5,7 @@ import inspect
 import threading
 import warnings
 from concurrent.futures import Future as ConcurrentFuture
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import contextmanager, nullcontext
 from contextvars import Context, copy_context
 from dataclasses import dataclass
@@ -15,7 +16,7 @@ from ._blocking import (
     invoke_extension,
     schedule_extension_cleanup,
 )
-from ._extensions import is_native_async_callable
+from ._extensions import is_native_async_callable, resolve_extension_result
 from .context import ExecutionContext, ExecutionStatus, HistoryEntry
 from .middleware.base import ObservingMiddleware
 
@@ -69,7 +70,12 @@ class _SpanHandle:
         self._end()
         self.ended = True
 
-    async def afinish(self, context: ExecutionContext) -> None:
+    async def afinish(
+        self,
+        context: ExecutionContext,
+        *,
+        attributes: tuple[tuple[str, Any], ...] = (),
+    ) -> None:
         """Finish a normal span through the extension dispatcher."""
 
         if self.ended:
@@ -77,8 +83,15 @@ class _SpanHandle:
         if self.manager is not None:
             # A legacy ``start_as_current_span`` manager owns a ContextVar token
             # that can only be exited by its creating task.
+            for key, value in attributes:
+                await _aset_span_attribute(self.span, key, value)
             self.finish(context)
             return
+        if self._uses_sync_terminal_callbacks():
+            await self._afinish_sync_batch(context, attributes)
+            return
+        for key, value in attributes:
+            await _aset_span_attribute(self.span, key, value)
         await _aset_span_terminal_state(
             self.span,
             context,
@@ -96,6 +109,9 @@ class _SpanHandle:
         if self.manager is not None:
             self.abort(description)
             return
+        if self._uses_sync_terminal_callbacks():
+            await self._aabort_sync_batch(description)
+            return
         await _arecord_exception(self.span, RuntimeError(description))
         await _aset_status(
             self.span,
@@ -105,6 +121,47 @@ class _SpanHandle:
             status_code_cls=self.status_code_cls,
         )
         await invoke_extension(self.span.end)
+        self.ended = True
+
+    def _uses_sync_terminal_callbacks(self) -> bool:
+        """Whether one worker callback can safely own normal terminal calls."""
+
+        callbacks = [self.span.set_attribute, self.span.end]
+        for name in ("record_exception", "set_status"):
+            callback = getattr(self.span, name, None)
+            if callable(callback):
+                callbacks.append(callback)
+        return all(not is_native_async_callable(callback) for callback in callbacks)
+
+    async def _afinish_sync_batch(
+        self,
+        context: ExecutionContext,
+        attributes: tuple[tuple[str, Any], ...],
+    ) -> None:
+        """Run synchronous terminal span methods in one owned worker turn."""
+
+        await invoke_extension(
+            _finish_sync_span,
+            self.span,
+            context,
+            attributes,
+            owner_loop=asyncio.get_running_loop(),
+            status_cls=self.status_cls,
+            status_code_cls=self.status_code_cls,
+        )
+        self.ended = True
+
+    async def _aabort_sync_batch(self, description: str) -> None:
+        """Run a synchronous abort and end in one owned worker turn."""
+
+        await invoke_extension(
+            _abort_sync_span,
+            self.span,
+            description,
+            owner_loop=asyncio.get_running_loop(),
+            status_cls=self.status_cls,
+            status_code_cls=self.status_code_cls,
+        )
         self.ended = True
 
     def _end(self) -> None:
@@ -135,6 +192,7 @@ class _SpanEntry:
     start_result_awaitable: bool = False
     handle: _SpanHandle | None = None
     terminal_context: ExecutionContext | None = None
+    terminal_attributes: tuple[tuple[str, Any], ...] = ()
     abort_description: str | None = None
     finalizer: asyncio.Task[Any] | None = None
     direct_terminal: bool = False
@@ -147,7 +205,15 @@ class OpenTelemetryMiddleware(ObservingMiddleware):
     priority = 950
     replayable = False
 
-    def __init__(self, tracer: Tracer | None = None, *, parent_context: Any = None) -> None:
+    def __init__(
+        self,
+        tracer: Tracer | None = None,
+        *,
+        parent_context: Any = None,
+        terminal_wait_seconds: float = 5.0,
+    ) -> None:
+        if terminal_wait_seconds <= 0:
+            raise ValueError("terminal_wait_seconds must be greater than zero")
         self._status_cls = None
         self._status_code_cls = None
         if tracer is None:
@@ -176,8 +242,15 @@ class OpenTelemetryMiddleware(ObservingMiddleware):
         )
         self._tracer = tracer
         self._parent_context = parent_context
+        self._terminal_wait_seconds = terminal_wait_seconds
+        self._extension_shutdown_signal: threading.Event | None = None
         self._spans: dict[str, _SpanEntry] = {}
         self._lock = threading.Lock()
+
+    def _bind_extension_shutdown_signal(self, signal: threading.Event) -> None:
+        """Allow the Runtime-owned dispatcher to release a legacy span worker."""
+
+        self._extension_shutdown_signal = signal
 
     async def process(self, context: ExecutionContext) -> ExecutionContext:
         if any(
@@ -188,22 +261,23 @@ class OpenTelemetryMiddleware(ObservingMiddleware):
         entry = self._admit_span(context)
         try:
             handle = await self._await_handle(context.trace_id, entry)
-            await _aset_span_attribute(handle.span, "arg.status", context.status.value)
-            await _aset_span_attribute(handle.span, "arg.risk.score", context.risk_score)
-            if context.decision:
-                await _aset_span_attribute(
-                    handle.span, "arg.decision", context.decision.outcome.value
-                )
-                await _aset_span_attribute(
-                    handle.span, "arg.decision.source", context.decision.source
-                )
+            attributes = _span_update_attributes(context)
             if context.status in {
                 ExecutionStatus.SUCCEEDED,
                 ExecutionStatus.FAILED,
                 ExecutionStatus.DENIED,
                 ExecutionStatus.UNKNOWN,
             }:
+                with self._lock:
+                    if (
+                        entry.abort_description is None
+                        and entry.terminal_context is None
+                    ):
+                        entry.terminal_attributes = attributes
                 await self.afinish(context)
+            else:
+                for key, value in attributes:
+                    await _aset_span_attribute(handle.span, key, value)
             return context.append_history(
                 HistoryEntry(self.name, context.status.value, "telemetry exported")
             )
@@ -408,7 +482,10 @@ class OpenTelemetryMiddleware(ObservingMiddleware):
             try:
                 asyncio.get_running_loop()
             except RuntimeError:
-                return terminal.result()
+                try:
+                    return terminal.result(timeout=self._terminal_wait_seconds)
+                except FutureTimeoutError:
+                    return True
             return True
 
         return self._request_direct_terminal_sync(
@@ -597,11 +674,12 @@ class OpenTelemetryMiddleware(ObservingMiddleware):
                 entry.terminal_context = context
             description = entry.abort_description
             context = entry.terminal_context
+            attributes = entry.terminal_attributes
         try:
             if description is not None:
                 await handle.aabort(description)
             elif context is not None:
-                await handle.afinish(context)
+                await handle.afinish(context, attributes=attributes)
             else:
                 await handle.aabort("telemetry span closed without terminal context")
         finally:
@@ -693,6 +771,7 @@ class OpenTelemetryMiddleware(ObservingMiddleware):
             with self._lock:
                 description = entry.abort_description
                 context = entry.terminal_context
+                attributes = entry.terminal_attributes
             if entry.legacy_terminal is not None:
                 if not entry.legacy_terminal.done():
                     entry.legacy_terminal.set_result(None)
@@ -702,7 +781,7 @@ class OpenTelemetryMiddleware(ObservingMiddleware):
             elif description is not None:
                 await handle.aabort(description)
             elif context is not None:
-                await handle.afinish(context)
+                await handle.afinish(context, attributes=attributes)
         finally:
             with self._lock:
                 if self._spans.get(trace_id) is entry:
@@ -842,11 +921,15 @@ class OpenTelemetryMiddleware(ObservingMiddleware):
 
         try:
             with extension_lifecycle_scope():
-                await invoke_extension(
+                forced_terminal = await invoke_extension(
                     self._run_current_span_manager_in_worker,
                     context,
                     entry,
                 )
+            if forced_terminal:
+                with self._lock:
+                    if entry.finalizer is None and self._spans.get(context.trace_id) is entry:
+                        self._spans.pop(context.trace_id, None)
         except asyncio.CancelledError:
             self._signal_legacy_terminal(
                 entry,
@@ -862,16 +945,25 @@ class OpenTelemetryMiddleware(ObservingMiddleware):
         self,
         context: ExecutionContext,
         entry: _SpanEntry,
-    ) -> None:
-        """Run ``__enter__`` and ``__exit__`` in one task on one worker thread."""
+    ) -> bool:
+        """Run ``__enter__`` and ``__exit__`` in one worker-owned asyncio task."""
 
-        asyncio.run(self._run_current_span_manager_lifecycle(context, entry))
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(
+                self._run_current_span_manager_lifecycle(context, entry)
+            )
+        finally:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.close()
+            asyncio.set_event_loop(None)
 
     async def _run_current_span_manager_lifecycle(
         self,
         context: ExecutionContext,
         entry: _SpanEntry,
-    ) -> None:
+    ) -> bool:
         """Keep a legacy ContextVar token local to the extension worker task."""
 
         manager = self._current_span_manager(context, self._span_attributes(context))
@@ -881,11 +973,14 @@ class OpenTelemetryMiddleware(ObservingMiddleware):
             signal = entry.legacy_terminal_signal
             if signal is None:
                 raise RuntimeError("legacy telemetry span has no terminal signal")
-            while not signal.is_set():
-                await asyncio.sleep(0.001)
+            forced_terminal = self._wait_for_legacy_terminal(entry, signal)
             with self._lock:
                 description = entry.abort_description
                 terminal_context = entry.terminal_context
+                attributes = entry.terminal_attributes
+            for key, value in attributes:
+                if value is not None:
+                    await resolve_extension_result(span.set_attribute(key, value))
             if description is not None:
                 _record_exception(span, RuntimeError(description))
                 _set_status(
@@ -907,6 +1002,23 @@ class OpenTelemetryMiddleware(ObservingMiddleware):
                     span,
                     RuntimeError("legacy telemetry span closed without terminal context"),
                 )
+            return forced_terminal
+
+    def _wait_for_legacy_terminal(
+        self,
+        entry: _SpanEntry,
+        signal: threading.Event,
+    ) -> bool:
+        """Wait for terminal work, waking promptly when runtime shutdown begins."""
+
+        while not signal.wait(timeout=0.1):
+            shutdown = self._extension_shutdown_signal
+            if shutdown is not None and shutdown.is_set():
+                self._signal_legacy_terminal(
+                    entry, description="runtime shutdown interrupted legacy telemetry"
+                )
+                return True
+        return False
 
     def _publish_legacy_handle(self, entry: _SpanEntry, handle: _SpanHandle) -> None:
         """Resolve the caller-loop admission future from the owned worker."""
@@ -998,6 +1110,153 @@ def _set_span_terminal_state(
         )
 
 
+def _span_update_attributes(
+    context: ExecutionContext,
+) -> tuple[tuple[str, Any], ...]:
+    """Build the low-cardinality attributes emitted for one observer pass."""
+
+    attributes: list[tuple[str, Any]] = [
+        ("arg.status", context.status.value),
+        ("arg.risk.score", context.risk_score),
+    ]
+    if context.decision is not None:
+        attributes.extend(
+            (
+                ("arg.decision", context.decision.outcome.value),
+                ("arg.decision.source", context.decision.source),
+            )
+        )
+    return tuple((key, value) for key, value in attributes if value is not None)
+
+
+def _finish_sync_span(
+    span: Span,
+    context: ExecutionContext,
+    attributes: tuple[tuple[str, Any], ...],
+    *,
+    owner_loop: asyncio.AbstractEventLoop,
+    status_cls: Any = None,
+    status_code_cls: Any = None,
+) -> None:
+    """Apply all synchronous terminal calls while the worker owns the adapter."""
+
+    for key, value in attributes:
+        if value is not None:
+            _resolve_sync_terminal_result(
+                span.set_attribute(key, value), owner_loop
+            )
+    _apply_sync_terminal_state(
+        span,
+        context,
+        owner_loop=owner_loop,
+        status_cls=status_cls,
+        status_code_cls=status_code_cls,
+    )
+    _resolve_sync_terminal_result(span.end(), owner_loop)
+
+
+def _abort_sync_span(
+    span: Span,
+    description: str,
+    *,
+    owner_loop: asyncio.AbstractEventLoop,
+    status_cls: Any = None,
+    status_code_cls: Any = None,
+) -> None:
+    """Apply a synchronous abort and end in one worker-owned callback."""
+
+    recorder = getattr(span, "record_exception", None)
+    if callable(recorder):
+        _resolve_sync_terminal_result(recorder(RuntimeError(description)), owner_loop)
+    _apply_sync_status(
+        span,
+        "ERROR",
+        description,
+        owner_loop=owner_loop,
+        status_cls=status_cls,
+        status_code_cls=status_code_cls,
+    )
+    _resolve_sync_terminal_result(span.end(), owner_loop)
+
+
+def _apply_sync_terminal_state(
+    span: Span,
+    context: ExecutionContext,
+    *,
+    owner_loop: asyncio.AbstractEventLoop,
+    status_cls: Any = None,
+    status_code_cls: Any = None,
+) -> None:
+    if context.status is ExecutionStatus.SUCCEEDED:
+        _apply_sync_status(
+            span,
+            "OK",
+            "succeeded",
+            owner_loop=owner_loop,
+            status_cls=status_cls,
+            status_code_cls=status_code_cls,
+        )
+        return
+    if context.status in {
+        ExecutionStatus.FAILED,
+        ExecutionStatus.DENIED,
+        ExecutionStatus.UNKNOWN,
+    }:
+        description = context.status.value
+        if context.status in {ExecutionStatus.FAILED, ExecutionStatus.UNKNOWN}:
+            recorder = getattr(span, "record_exception", None)
+            if callable(recorder):
+                _resolve_sync_terminal_result(
+                    recorder(
+                        RuntimeError(f"tool execution ended with status {description}")
+                    ),
+                    owner_loop,
+                )
+        _apply_sync_status(
+            span,
+            "ERROR",
+            description,
+            owner_loop=owner_loop,
+            status_cls=status_cls,
+            status_code_cls=status_code_cls,
+        )
+
+
+def _apply_sync_status(
+    span: Span,
+    code_name: str,
+    description: str,
+    *,
+    owner_loop: asyncio.AbstractEventLoop,
+    status_cls: Any = None,
+    status_code_cls: Any = None,
+) -> None:
+    update = _status_update(
+        span,
+        code_name,
+        description,
+        status_cls=status_cls,
+        status_code_cls=status_code_cls,
+    )
+    if update is not None:
+        setter, status = update
+        _resolve_sync_terminal_result(setter(status), owner_loop)
+
+
+def _resolve_sync_terminal_result(
+    value: Any,
+    owner_loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Await a sync-wrapper result in its original event loop before continuing."""
+
+    if not inspect.isawaitable(value):
+        return
+    completion = asyncio.run_coroutine_threadsafe(
+        resolve_extension_result(value), owner_loop
+    )
+    completion.result()
+
+
 async def _aset_span_terminal_state(
     span: Span,
     context: ExecutionContext,
@@ -1042,22 +1301,17 @@ def _set_status(
     status_cls: Any = None,
     status_code_cls: Any = None,
 ) -> None:
-    setter = getattr(span, "set_status", None)
-    if not callable(setter):
-        return
-    status_cls = status_cls or _exposed_type(span, "Status", "status_cls")
-    status_code_cls = status_code_cls or _exposed_type(
-        span, "StatusCode", "status_code_cls"
+    update = _status_update(
+        span,
+        code_name,
+        description,
+        status_cls=status_cls,
+        status_code_cls=status_code_cls,
     )
-    if status_cls is None or status_code_cls is None:
-        _warn_missing_status_types_once()
+    if update is None:
         return
-    code = status_code_cls.OK if code_name == "OK" else status_code_cls.ERROR
-    setter(
-        status_cls(code)
-        if code is status_code_cls.OK
-        else status_cls(code, description=description)
-    )
+    setter, status = update
+    setter(status)
 
 
 async def _aset_status(
@@ -1068,23 +1322,46 @@ async def _aset_status(
     status_cls: Any = None,
     status_code_cls: Any = None,
 ) -> None:
+    update = _status_update(
+        span,
+        code_name,
+        description,
+        status_cls=status_cls,
+        status_code_cls=status_code_cls,
+    )
+    if update is None:
+        return
+    setter, status = update
+    await invoke_extension(setter, status)
+
+
+def _status_update(
+    span: Span,
+    code_name: str,
+    description: str,
+    *,
+    status_cls: Any = None,
+    status_code_cls: Any = None,
+) -> tuple[Any, Any] | None:
+    """Build one status setter call for sync and async terminal paths."""
+
     setter = getattr(span, "set_status", None)
     if not callable(setter):
-        return
+        return None
     status_cls = status_cls or _exposed_type(span, "Status", "status_cls")
     status_code_cls = status_code_cls or _exposed_type(
         span, "StatusCode", "status_code_cls"
     )
     if status_cls is None or status_code_cls is None:
         _warn_missing_status_types_once()
-        return
+        return None
     code = status_code_cls.OK if code_name == "OK" else status_code_cls.ERROR
     status = (
         status_cls(code)
         if code is status_code_cls.OK
         else status_cls(code, description=description)
     )
-    await invoke_extension(setter, status)
+    return setter, status
 
 
 def _exposed_type(owner: Any, *names: str) -> Any:

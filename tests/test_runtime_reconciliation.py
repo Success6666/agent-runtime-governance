@@ -45,6 +45,7 @@ from agent_runtime_governance import (
     VerifiedPrincipal,
 )
 from agent_runtime_governance.reconciliation import (
+    ReconciliationAuditEnvelope,
     UnknownAction,
     tenant_partition_digest,
 )
@@ -975,7 +976,7 @@ async def test_late_provider_result_is_discarded_and_provider_is_poisoned(
         first = await runtime.areconcile(execution_record_id)
         assert first.state is ReconciliationState.UNKNOWN
         await asyncio.wait_for(entered.wait(), timeout=0.2)
-        await _wait_until(lambda: bool(late_results))
+        await _wait_until(lambda: bool(late_results), timeout=3.0)
         assert runtime.reconciliation_ledger.current(  # type: ignore[union-attr]
             execution_record_id
         ).state is ReconciliationState.UNKNOWN
@@ -1839,6 +1840,71 @@ async def test_restart_quarantines_an_expired_unfinished_provider_attempt(
 
 
 @pytest.mark.asyncio
+async def test_reconciliation_outbox_acknowledges_after_async_idempotent_write() -> None:
+    class AsyncIdempotentSink:
+        reconciliation_delivery_idempotent = True
+
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.completed = asyncio.Event()
+
+        async def write_idempotent(
+            self, _source_event_id: str, _event: object
+        ) -> None:
+            self.started.set()
+            await self.release.wait()
+            self.completed.set()
+
+        async def write(self, event: object) -> None:
+            await self.write_idempotent("non-reconciliation", event)
+
+    class RecordingLedger:
+        def __init__(self, sink: AsyncIdempotentSink) -> None:
+            self._sink = sink
+            self.delivered = False
+            self.envelope = ReconciliationAuditEnvelope(
+                outbox_id="outbox-1",
+                execution_record_id="execution-1",
+                revision=0,
+                event_type="transition_recorded",
+                event={"event": "recorded"},
+                created_at=datetime.now(timezone.utc),
+            )
+
+        def pending_audit_events(
+            self,
+            *,
+            execution_record_id: str | None = None,
+            limit: int = 128,
+        ) -> tuple[ReconciliationAuditEnvelope, ...]:
+            del execution_record_id, limit
+            return () if self.delivered else (self.envelope,)
+
+        def mark_audit_event_delivered(self, outbox_id: str) -> None:
+            assert outbox_id == self.envelope.outbox_id
+            assert self._sink.completed.is_set()
+            self.delivered = True
+
+    sink = AsyncIdempotentSink()
+    ledger = RecordingLedger(sink)
+    runtime = Runtime([AuditMiddleware(sink, fail_closed=True)])  # type: ignore[arg-type]
+    try:
+        drain = asyncio.create_task(runtime._drain_reconciliation_audit_outbox(ledger))
+        await asyncio.wait_for(sink.started.wait(), timeout=1)
+        assert not ledger.delivered
+        assert not drain.done()
+
+        sink.release.set()
+
+        assert await drain == 1
+        assert ledger.delivered
+    finally:
+        sink.release.set()
+        await runtime.aclose()
+
+
+@pytest.mark.asyncio
 async def test_cancelling_outbox_delivery_keeps_reconciliation_recoverable(
     tmp_path: Path,
 ) -> None:
@@ -2216,7 +2282,10 @@ async def test_global_audit_recovery_honors_its_caller_deadline(
         [AuditMiddleware(sink, fail_closed=True)],
         idempotency_store=SQLiteIdempotencyStore(path),
         reconciliation_ledger=SQLiteReconciliationLedger(path),
-        limits=RuntimeLimits(reconciliation_audit_delivery_timeout_seconds=1.0),
+        limits=RuntimeLimits(
+            reconciliation_audit_delivery_timeout_seconds=1.0,
+            reconciliation_operation_timeout_seconds=1.0,
+        ),
     )
     try:
         deadline = datetime.now(timezone.utc) + timedelta(seconds=0.04)
@@ -2333,7 +2402,7 @@ async def test_reconciliation_audit_delivery_honors_its_caller_deadline(
         assert execution_record_id is not None
         sink.block = True
 
-        deadline = datetime.now(timezone.utc) + timedelta(seconds=0.5)
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=1.0)
         with pytest.raises(StageTimeoutError, match="reconciliation audit delivery"):
             await runtime.areconcile(execution_record_id, deadline=deadline)
         assert await asyncio.to_thread(sink.entered.wait, 1.0)

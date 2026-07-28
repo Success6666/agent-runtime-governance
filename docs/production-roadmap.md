@@ -3,7 +3,7 @@
 ## Status
 
 - Direction approved after the v0.5.1 production reliability release.
-- Last reviewed: 2026-07-26.
+- Last reviewed: 2026-07-27.
 - This document defines future work and retains the v0.7 release exit criteria
   as historical evidence. Shipped behavior is documented in the release notes
   and production guide.

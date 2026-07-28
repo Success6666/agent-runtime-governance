@@ -9,6 +9,7 @@ from benchmarks.benchmark_runtime import (
     Measurement,
     _median_extension_dispatch_measurement,
     _median_measurement,
+    _validate_dispatch_inputs,
     build_scenarios,
     measure_extension_dispatch,
     run_extension_dispatch_matrix,
@@ -159,4 +160,38 @@ async def test_extension_dispatch_rejects_invalid_mode() -> None:
             io_latency_ms=1,
             requests=1,
             concurrency=1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("io_latency_ms", 0, "io_latency_ms must be positive"),
+        ("requests", 0, "requests must be positive"),
+        ("concurrency", 0, "concurrency must be positive"),
+        ("worker_capacity", 0, "worker_capacity must be positive"),
+    ],
+)
+def test_extension_dispatch_rejects_non_positive_inputs(
+    field: str, value: int, message: str
+) -> None:
+    inputs = {
+        "mode": "native_async",
+        "io_latency_ms": 1.0,
+        "requests": 1,
+        "concurrency": 1,
+        "worker_capacity": 1,
+    }
+    inputs[field] = value
+
+    with pytest.raises(ValueError, match=message):
+        _validate_dispatch_inputs(**inputs)
+
+
+def test_extension_dispatch_median_rejects_empty_or_mixed_cells() -> None:
+    with pytest.raises(ValueError, match="at least one dispatch benchmark sample"):
+        _median_extension_dispatch_measurement([])
+    with pytest.raises(ValueError, match="same cell"):
+        _median_extension_dispatch_measurement(
+            [_dispatch_measurement(1.0), _dispatch_measurement(2.0, mode="legacy_sync")]
         )

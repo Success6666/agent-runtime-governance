@@ -243,6 +243,8 @@ class OPAMiddleware(GatingMiddleware):
                 else self.client.evaluate
             )
             decision = await invoke_extension(evaluator, context)
+            if not isinstance(decision, OPADecision):
+                raise TypeError("OPA evaluator must return an OPADecision")
         except Exception as exc:
             if self.fail_closed:
                 raise

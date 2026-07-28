@@ -120,6 +120,8 @@ def _evaluate_extension_dispatch(
         limits_by_concurrency = budget["limits_by_concurrency"]
     except (KeyError, TypeError, ValueError):
         return failures + ["extension dispatch budget is invalid"]
+    if not isinstance(limits_by_concurrency, dict):
+        return failures + ["extension dispatch budget is invalid"]
     if minimum_requests < 1:
         return failures + ["extension dispatch minimum_requests_per_cell must be positive"]
     configured_worker_capacity = budget.get("worker_capacity")

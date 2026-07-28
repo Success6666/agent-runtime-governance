@@ -77,6 +77,23 @@ def test_invalid_opa_response_fails_closed() -> None:
         runtime_with_opa({"result": {"value": True}}).invoke("operate")
 
 
+def test_custom_opa_evaluator_invalid_result_obeys_fail_open_mode() -> None:
+    class InvalidEvaluator:
+        def evaluate(self, context: ExecutionContext) -> object:
+            return object()
+
+    runtime = Runtime([OPAMiddleware(InvalidEvaluator(), fail_closed=False)])
+
+    @runtime.tool()
+    def operate() -> bool:
+        return True
+
+    try:
+        assert runtime.invoke("operate") is True
+    finally:
+        runtime.close()
+
+
 @pytest.mark.parametrize(
     "endpoint",
     [

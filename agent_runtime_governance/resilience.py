@@ -167,6 +167,7 @@ class RuntimeLimits:
     max_reconciliation_audit_delivery_in_flight: int = 8
     max_blocking_extension_in_flight: int = 16
     max_blocking_extension_workers: int = 4
+    sync_loop_startup_timeout_seconds: float = 5.0
 
     def __post_init__(self) -> None:
         for name in (
@@ -179,6 +180,7 @@ class RuntimeLimits:
             "reconciliation_provider_timeout_seconds",
             "reconciliation_finalization_timeout_seconds",
             "reconciliation_audit_delivery_timeout_seconds",
+            "sync_loop_startup_timeout_seconds",
             "admission_timeout_seconds",
             "cancellation_grace_seconds",
         ):

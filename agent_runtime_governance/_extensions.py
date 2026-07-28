@@ -91,6 +91,7 @@ class _ExtensionDispatcher:
         self._cleanup_tasks: set[asyncio.Task[Any]] = set()
         self._observers: list[ExtensionDispatchObserver] = []
         self._shutdown = False
+        self._shutdown_signal = Event()
 
     async def invoke(
         self,
@@ -122,6 +123,12 @@ class _ExtensionDispatcher:
 
         with self._state_lock:
             self._observers.append(observer)
+
+    @property
+    def shutdown_signal(self) -> Event:
+        """Signal synchronous extensions that Runtime shutdown has begun."""
+
+        return self._shutdown_signal
 
     def create_cleanup_task(
         self,
@@ -200,6 +207,7 @@ class _ExtensionDispatcher:
                     "synchronous extension work is pending; use await runtime.aclose()"
                 )
             self._shutdown = True
+            self._shutdown_signal.set()
         self._executor.shutdown(wait=wait, cancel_futures=True)
 
     async def _invoke_native_async(
@@ -278,6 +286,7 @@ class _ExtensionDispatcher:
         try:
             value = await asyncio.shield(wrapped)
         except asyncio.CancelledError:
+            wrapped.add_done_callback(_consume_asyncio_future_result)
             if not future.cancel():
                 if future.done():
                     _discard_unawaited_result(future)
@@ -420,6 +429,15 @@ def _discard_unawaited_result(future: Any) -> None:
     except BaseException:
         return
     _discard_unawaited_value(value)
+
+
+def _consume_asyncio_future_result(future: asyncio.Future[Any]) -> None:
+    """Observe a detached asyncio wrapper's terminal exception."""
+
+    try:
+        future.result()
+    except BaseException:
+        return
 
 
 def _discard_unawaited_value(value: Any) -> None:

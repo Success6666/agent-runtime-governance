@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 from prometheus_client import CollectorRegistry, generate_latest
 
+import agent_runtime_governance.telemetry as telemetry_module
 from agent_runtime_governance import (
     AuditMiddleware,
     LLMMiddleware,
@@ -497,7 +498,12 @@ async def test_async_extension_is_not_queued_behind_saturated_sync_workers() -> 
     first = asyncio.create_task(runtime._run_blocking_extension(block))
     try:
         assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 1), timeout=1.1)
-        assert await asyncio.wait_for(runtime._invoke_extension(async_extension), timeout=0.05) == "async"
+        assert (
+            await asyncio.wait_for(
+                runtime._invoke_extension(async_extension), timeout=0.5
+            )
+            == "async"
+        )
     finally:
         release.set()
         await asyncio.gather(first, return_exceptions=True)
@@ -526,6 +532,81 @@ async def test_sync_observer_does_not_stall_a_ten_millisecond_ticker() -> None:
         assert await _assert_ticker_stays_responsive(runtime.ainvoke("work")) == "ok"
     finally:
         await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_sync_otel_terminal_export_uses_one_dispatch_turn(monkeypatch) -> None:
+    class Span:
+        def __init__(self) -> None:
+            self.attributes: dict[str, object] = {}
+            self.end_calls = 0
+
+        def set_attribute(self, key: str, value: object) -> None:
+            self.attributes[key] = value
+
+        def end(self) -> None:
+            self.end_calls += 1
+
+    class Tracer:
+        def __init__(self) -> None:
+            self.span = Span()
+
+        def start_span(self, _name: str, *, attributes: dict[str, object]) -> Span:
+            self.span.attributes.update(attributes)
+            return self.span
+
+    original_invoke_extension = telemetry_module.invoke_extension
+    dispatches: list[str] = []
+
+    async def record_dispatch(callback, *args, **kwargs):
+        dispatches.append(getattr(callback, "__name__", type(callback).__name__))
+        return await original_invoke_extension(callback, *args, **kwargs)
+
+    monkeypatch.setattr(telemetry_module, "invoke_extension", record_dispatch)
+    tracer = Tracer()
+    middleware = OpenTelemetryMiddleware(tracer)
+    context = ExecutionContext.create(ToolCall("work"))
+
+    await middleware.process(context)
+    dispatches.clear()
+
+    await middleware.process(context.evolve(status=ExecutionStatus.SUCCEEDED))
+
+    assert dispatches == ["_finish_sync_span"]
+    assert tracer.span.attributes["arg.status"] == ExecutionStatus.SUCCEEDED.value
+    assert tracer.span.end_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_sync_otel_terminal_awaits_wrapped_attributes_before_end() -> None:
+    class Span:
+        def __init__(self) -> None:
+            self.status = ExecutionStatus.PENDING.value
+
+        def set_attribute(self, key: str, value: object):
+            async def apply() -> None:
+                await asyncio.sleep(0)
+                if key == "arg.status":
+                    self.status = str(value)
+
+            return apply()
+
+        def end(self) -> None:
+            assert self.status == ExecutionStatus.SUCCEEDED.value
+
+    class Tracer:
+        def __init__(self) -> None:
+            self.span = Span()
+
+        def start_span(self, _name: str, *, attributes: dict[str, object]) -> Span:
+            del attributes
+            return self.span
+
+    middleware = OpenTelemetryMiddleware(Tracer())
+    context = ExecutionContext.create(ToolCall("work"))
+
+    await middleware.process(context)
+    await middleware.process(context.evolve(status=ExecutionStatus.SUCCEEDED))
 
 
 @pytest.mark.asyncio
@@ -592,6 +673,42 @@ async def test_legacy_sync_tracer_does_not_stall_a_ten_millisecond_ticker() -> N
         assert manager_threads[0] != caller_thread
     finally:
         await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_legacy_otel_manager_releases_on_runtime_shutdown_signal() -> None:
+    exited = threading.Event()
+
+    class Span:
+        def set_attribute(self, _key: str, _value: object) -> None:
+            return None
+
+        def end(self) -> None:
+            return None
+
+    class LegacyTracer:
+        def start_as_current_span(self, _name: str, **_kwargs: object):
+            @contextmanager
+            def manager():
+                try:
+                    yield Span()
+                finally:
+                    exited.set()
+
+            return manager()
+
+    shutdown = threading.Event()
+    middleware = OpenTelemetryMiddleware(
+        LegacyTracer(), terminal_wait_seconds=1.0
+    )
+    middleware._bind_extension_shutdown_signal(shutdown)
+    context = ExecutionContext.create(ToolCall("work"))
+
+    await middleware.process(context)
+    shutdown.set()
+
+    assert await asyncio.wait_for(asyncio.to_thread(exited.wait, 1), timeout=1.1)
+    await _wait_until(lambda: middleware.active_span_count == 0)
 
 
 @pytest.mark.asyncio
@@ -664,7 +781,10 @@ async def test_foreign_event_loop_future_is_rejected() -> None:
 async def test_prometheus_exposes_low_cardinality_extension_dispatch_metrics() -> None:
     registry = CollectorRegistry()
     metrics = PrometheusMiddleware(registry=registry, prefix="dispatch_test")
-    runtime = Runtime([metrics])
+    runtime = Runtime(
+        [metrics],
+        limits=RuntimeLimits(max_blocking_extension_workers=4),
+    )
 
     async def async_hook(context):
         return context
@@ -1096,8 +1216,100 @@ async def test_legacy_otel_manager_exits_in_its_owner_task() -> None:
         assert [event[0] for event in events] == ["enter", "exit"]
         assert events[0][1] == events[1][1]
         assert events[0][2] == events[1][2]
+        assert tracer.span.attributes["arg.status"] == ExecutionStatus.SUCCEEDED.value
         assert tracer.span.end_calls == 1
         assert active_span.get() is None
+    finally:
+        await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_legacy_otel_manager_does_not_expire_a_live_tool_span() -> None:
+    class Span:
+        def __init__(self) -> None:
+            self.end_calls = 0
+
+        def set_attribute(self, _key: str, _value: object) -> None:
+            return None
+
+        def end(self) -> None:
+            self.end_calls += 1
+
+    class LegacyTracer:
+        def __init__(self) -> None:
+            self.spans: list[Span] = []
+
+        def start_as_current_span(self, _name: str, **_kwargs: object):
+            span = Span()
+            self.spans.append(span)
+
+            @contextmanager
+            def manager():
+                yield span
+                span.end()
+
+            return manager()
+
+    tracer = LegacyTracer()
+    runtime = Runtime(
+        [OpenTelemetryMiddleware(tracer, terminal_wait_seconds=0.01)]
+    )
+
+    @runtime.tool()
+    async def work() -> str:
+        await asyncio.sleep(0.12)
+        return "ok"
+
+    try:
+        assert await runtime.ainvoke("work") == "ok"
+        assert len(tracer.spans) == 1
+        assert tracer.spans[0].end_calls == 1
+    finally:
+        await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_legacy_otel_terminal_awaits_wrapped_attributes_before_end() -> None:
+    class Span:
+        def __init__(self) -> None:
+            self.status = ExecutionStatus.PENDING.value
+            self.end_calls = 0
+
+        def set_attribute(self, key: str, value: object):
+            async def apply() -> None:
+                await asyncio.sleep(0)
+                if key == "arg.status":
+                    self.status = str(value)
+
+            return apply()
+
+        def end(self) -> None:
+            assert self.status == ExecutionStatus.SUCCEEDED.value
+            self.end_calls += 1
+
+    class LegacyTracer:
+        def __init__(self) -> None:
+            self.span = Span()
+
+        def start_as_current_span(self, _name: str, **_kwargs: object):
+            @contextmanager
+            def manager():
+                yield self.span
+                self.span.end()
+
+            return manager()
+
+    tracer = LegacyTracer()
+    runtime = Runtime([OpenTelemetryMiddleware(tracer)])
+
+    @runtime.tool()
+    def work() -> str:
+        return "ok"
+
+    try:
+        assert await runtime.ainvoke("work") == "ok"
+        assert tracer.span.status == ExecutionStatus.SUCCEEDED.value
+        assert tracer.span.end_calls == 1
     finally:
         await runtime.aclose()
 

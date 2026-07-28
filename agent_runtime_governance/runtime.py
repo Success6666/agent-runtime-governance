@@ -20,6 +20,7 @@ from ._blocking import (
     BlockingRunner,
     ExtensionCleanupScheduler,
     ExtensionRunner,
+    _discard_unstarted_awaitable,
     extension_cleanup_scope,
     has_extension_cleanup_context,
     install_blocking_runner,
@@ -134,14 +135,6 @@ _ACTIVE_RUNTIME_IDS: ContextVar[frozenset[int]] = ContextVar(
 class RunResult:
     value: Any
     context: ExecutionContext
-
-
-def _discard_unstarted_awaitable(awaitable: Awaitable[Any]) -> None:
-    """Close a rejected coroutine so stale cleanup contexts cannot leak it."""
-
-    close = getattr(awaitable, "close", None)
-    if callable(close):
-        close()
 
 
 @dataclass(slots=True)
@@ -307,6 +300,7 @@ class Runtime:
             is_accepting=self._is_extension_dispatch_accepting,
         )
         self._bind_extension_dispatch_metrics()
+        self._bind_extension_dispatch_lifecycle()
         self._owns_idempotency_executor = idempotency_executor is None
         self._idempotency_executor = idempotency_executor or ThreadPoolExecutor(
             max_workers=min(4, self.limits.max_in_flight),
@@ -466,11 +460,11 @@ class Runtime:
                 raise
             close_future.add_done_callback(self._stop_sync_loop_after_close)
             await asyncio.shield(asyncio.wrap_future(close_future))
-            self._stop_sync_loop()
+            await asyncio.to_thread(self._stop_sync_loop)
             return
 
         await self._aclose_on_current_loop(close_claimed=True)
-        self._stop_sync_loop()
+        await asyncio.to_thread(self._stop_sync_loop)
 
     async def _aclose_on_current_loop(self, *, close_claimed: bool = False) -> None:
         """Close after durable reconciliation finalizers have completed.
@@ -637,7 +631,7 @@ class Runtime:
                 self._sync_loop_stopping = False
                 thread.start()
         assert ready is not None
-        if not ready.wait(timeout=5):
+        if not ready.wait(timeout=self.limits.sync_loop_startup_timeout_seconds):
             raise RuntimeError("runtime synchronous event loop did not start")
         with self._sync_loop_lock:
             if self._sync_loop_error is not None:
@@ -715,7 +709,9 @@ class Runtime:
         self._request_sync_loop_stop()
         thread.join()
 
-    def _stop_sync_loop_after_close(self, future: ConcurrentFuture[Any]) -> None:
+    def _stop_sync_loop_after_close(
+        self, future: ConcurrentFuture[Any] | asyncio.Future[Any]
+    ) -> None:
         if future.cancelled():
             return
         try:
@@ -952,10 +948,25 @@ class Runtime:
     def _bind_extension_dispatch_metrics(self) -> None:
         """Allow built-in optional metrics middleware to observe internal dispatch."""
 
+        from .plugins.prometheus import PrometheusMiddleware
+
         for middleware in self._pipeline:
-            bind = getattr(middleware, "_bind_extension_dispatcher", None)
-            if callable(bind):
-                bind(self._extension_dispatcher)
+            if isinstance(middleware, PrometheusMiddleware):
+                middleware._bind_extension_dispatch_snapshot(
+                    self._extension_dispatcher.snapshot
+                )
+                self._extension_dispatcher.add_observer(middleware)
+
+    def _bind_extension_dispatch_lifecycle(self) -> None:
+        """Expose Runtime shutdown only to the built-in legacy OTel bridge."""
+
+        from .telemetry import OpenTelemetryMiddleware
+
+        for middleware in self._pipeline:
+            if isinstance(middleware, OpenTelemetryMiddleware):
+                middleware._bind_extension_shutdown_signal(
+                    self._extension_dispatcher.shutdown_signal
+                )
 
     @property
     def reconciliation_ledger_healthy(self) -> bool:
@@ -1194,17 +1205,25 @@ class Runtime:
         except RuntimeError:
             with self._lifecycle_lock:
                 if self._closed or self._closing:
-                    raise RuntimeError("runtime is closed")
-                loop = self._ensure_sync_loop()
-                coroutine = self.ainvoke(name, *args, **kwargs)
-                try:
-                    future = copy_context().run(
-                        asyncio.run_coroutine_threadsafe, coroutine, loop
-                    )
-                except BaseException:
-                    coroutine.close()
-                    raise
-                self._sync_invoke_futures.add(future)
+                    raise RuntimeError("runtime is closed") from None
+            loop = self._ensure_sync_loop()
+            stop_loop = False
+            with self._lifecycle_lock:
+                if self._closed or self._closing:
+                    stop_loop = True
+                else:
+                    coroutine = self.ainvoke(name, *args, **kwargs)
+                    try:
+                        future = copy_context().run(
+                            asyncio.run_coroutine_threadsafe, coroutine, loop
+                        )
+                    except BaseException:
+                        coroutine.close()
+                        raise
+                    self._sync_invoke_futures.add(future)
+            if stop_loop:
+                self._stop_sync_loop()
+                raise RuntimeError("runtime is closed") from None
             future.add_done_callback(self._forget_sync_invoke_future)
             return future.result()
         raise RuntimeError("invoke() cannot run inside an event loop; use ainvoke()")
@@ -2483,12 +2502,11 @@ class Runtime:
         sink: Any,
         outbox_id: str,
         event: Mapping[str, Any],
-    ) -> None:
+    ) -> Any:
         idempotent_writer = getattr(sink, "write_idempotent", None)
         if callable(idempotent_writer):
-            idempotent_writer(outbox_id, event)
-            return
-        sink.write(event)
+            return idempotent_writer(outbox_id, event)
+        return sink.write(event)
 
     async def _finalize_reconciliation_attempt(
         self,
@@ -3476,6 +3494,7 @@ class Runtime:
             self.limits.reconciliation_audit_delivery_timeout_seconds,
             stage,
         )
+        started = perf_counter()
         lease = await self._reconciliation_audit_bulkhead.acquire(timeout)
         task: asyncio.Future[Any] | None = None
         deferred_release = False
@@ -3487,7 +3506,26 @@ class Runtime:
             task = asyncio.wrap_future(future, loop=loop)
             done, _ = await asyncio.wait({task}, timeout=timeout)
             if task in done:
-                return task.result()
+                result = task.result()
+                if not inspect.isawaitable(result):
+                    return result
+
+                def retain_async_delivery(
+                    detached: asyncio.Future[Any],
+                ) -> None:
+                    nonlocal deferred_release
+                    deferred_release = True
+                    detached.add_done_callback(lambda _completed: lease.release())
+                    self._track_detached_stage(detached)
+
+                remaining = max(0.0, timeout - (perf_counter() - started))
+                return await await_stage(
+                    result,
+                    stage=stage,
+                    timeout_seconds=remaining,
+                    cancellation_grace_seconds=self.limits.cancellation_grace_seconds,
+                    on_detached=retain_async_delivery,
+                )
             error = StageTimeoutError(stage, timeout)
             deferred_release = True
             future.add_done_callback(lambda _completed: lease.release())

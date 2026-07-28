@@ -697,6 +697,16 @@ def test_tool_failure_carries_final_context() -> None:
     assert "ValueError" in (caught.value.context.error or "")
 
 
+def test_closed_sync_invoke_does_not_start_an_owned_event_loop() -> None:
+    runtime = Runtime()
+    runtime.close()
+
+    with pytest.raises(RuntimeError, match="runtime is closed"):
+        runtime.invoke("missing")
+
+    assert runtime._get_sync_loop() is None
+
+
 @pytest.mark.asyncio
 async def test_sync_invoke_rejected_inside_event_loop() -> None:
     runtime = Runtime()

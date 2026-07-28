@@ -234,3 +234,51 @@ def test_extension_dispatch_budget_requires_the_configured_worker_capacity() -> 
         "legacy_sync dispatch worker_capacity 2 does not match 4 at "
         "5 ms / 1 concurrency"
     ]
+
+
+def test_extension_dispatch_budget_rejects_missing_or_non_list_measurements() -> None:
+    assert evaluate({}, _dispatch_budget()) == [
+        "missing extension_dispatch benchmark result"
+    ]
+    result = _dispatch_result()
+    result["extension_dispatch"]["measurements"] = {}  # type: ignore[index]
+    assert evaluate(result, _dispatch_budget()) == [
+        "extension_dispatch measurements must be a list"
+    ]
+
+
+def test_extension_dispatch_budget_reports_invalid_or_duplicate_cells() -> None:
+    result = _dispatch_result()
+    result["extension_dispatch"]["measurements"][0].pop("mode")  # type: ignore[index]
+    assert evaluate(result, _dispatch_budget()) == [
+        "dispatch measurement has an invalid cell identity",
+        "missing dispatch pair at 5 ms / 1 concurrency",
+    ]
+
+    result = _dispatch_result()
+    result["extension_dispatch"]["measurements"].append(  # type: ignore[index]
+        dict(result["extension_dispatch"]["measurements"][0])  # type: ignore[index]
+    )
+    assert evaluate(result, _dispatch_budget()) == [
+        "duplicate dispatch measurement for native_async at 5 ms / 1 concurrency"
+    ]
+
+
+def test_extension_dispatch_budget_rejects_missing_or_invalid_ratio_limits() -> None:
+    budget = _dispatch_budget()
+    budget["limits_by_concurrency"] = []
+    assert evaluate(_dispatch_result(), budget) == [
+        "extension dispatch budget is invalid"
+    ]
+
+    budget = _dispatch_budget()
+    budget["limits_by_concurrency"] = {}
+    assert evaluate(_dispatch_result(), budget) == [
+        "missing dispatch budget for 1 concurrency"
+    ]
+
+    budget = _dispatch_budget()
+    budget["limits_by_concurrency"]["1"]["maximum_ratios"] = []
+    assert evaluate(_dispatch_result(), budget) == [
+        "dispatch ratio limits must be objects at 5 ms / 1 concurrency"
+    ]

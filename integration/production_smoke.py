@@ -320,46 +320,52 @@ async def _async_post_json(
     port: int,
     path: str,
     payload: dict[str, object],
+    *,
+    timeout_seconds: float = 10.0,
 ) -> dict[str, object]:
     """POST a local JSON request without moving native adapter work to a worker."""
 
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
     body = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode(
         "utf-8"
     )
-    reader, writer = await asyncio.open_connection(host, port)
-    try:
-        writer.write(
-            (
-                f"POST {path} HTTP/1.1\r\n"
-                f"Host: {host}:{port}\r\n"
-                "Content-Type: application/json\r\n"
-                f"Content-Length: {len(body)}\r\n"
-                "Connection: close\r\n\r\n"
-            ).encode("ascii")
-            + body
-        )
-        await writer.drain()
-        status_line = await reader.readline()
-        if not status_line.startswith(b"HTTP/1.1 200"):
-            raise RuntimeError(
-                f"controlled async HTTP request failed: {status_line!r}"
+    async def exchange() -> dict[str, object]:
+        reader, writer = await asyncio.open_connection(host, port)
+        try:
+            writer.write(
+                (
+                    f"POST {path} HTTP/1.1\r\n"
+                    f"Host: {host}:{port}\r\n"
+                    "Content-Type: application/json\r\n"
+                    f"Content-Length: {len(body)}\r\n"
+                    "Connection: close\r\n\r\n"
+                ).encode("ascii")
+                + body
             )
-        content_length = 0
-        while True:
-            line = await reader.readline()
-            if line in {b"\r\n", b""}:
-                break
-            name, _, value = line.decode("iso-8859-1").partition(":")
-            if name.lower() == "content-length":
-                content_length = int(value.strip())
-        response = await reader.readexactly(content_length)
-        decoded = json.loads(response.decode("utf-8"))
-        if not isinstance(decoded, dict):
-            raise RuntimeError("controlled async HTTP response must be a JSON object")
-        return decoded
-    finally:
-        writer.close()
-        await writer.wait_closed()
+            await writer.drain()
+            status_line = await reader.readline()
+            if not status_line.startswith(b"HTTP/1.1 200"):
+                raise RuntimeError(
+                    f"controlled async HTTP request failed: {status_line!r}"
+                )
+            content_length = 0
+            while True:
+                line = await reader.readline()
+                if line in {b"\r\n", b""}:
+                    break
+                name, _, value = line.decode("iso-8859-1").partition(":")
+                if name.lower() == "content-length":
+                    content_length = int(value.strip())
+            response = await reader.readexactly(content_length)
+            decoded = json.loads(response.decode("utf-8"))
+            if not isinstance(decoded, dict):
+                raise RuntimeError("controlled async HTTP response must be a JSON object")
+            return decoded
+        finally:
+            writer.close()
+
+    return await asyncio.wait_for(exchange(), timeout=timeout_seconds)
 
 
 def _strict_opa_runtime(

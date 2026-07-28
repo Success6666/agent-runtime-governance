@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import subprocess
 import sys
@@ -117,3 +118,40 @@ def test_kind_manifest_renders_exactly_one_run_scoped_image(tmp_path) -> None:
     content = manifest.read_text(encoding="utf-8")
     assert content.count("image: example.test/smoke:run") == 1
     assert smoke._KIND_IMAGE_PLACEHOLDER not in content
+
+
+@pytest.mark.asyncio
+async def test_async_post_json_bounds_a_stalled_socket_exchange() -> None:
+    smoke = _load_smoke_script()
+    connected = asyncio.Event()
+    release = asyncio.Event()
+    handler_finished = asyncio.Event()
+
+    async def stall(
+        _reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        connected.set()
+        try:
+            await release.wait()
+        finally:
+            writer.close()
+            handler_finished.set()
+
+    server = await asyncio.start_server(stall, "127.0.0.1", 0)
+    address = server.sockets[0].getsockname()
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await smoke._async_post_json(
+                "127.0.0.1",
+                int(address[1]),
+                "/stalled",
+                {},
+                timeout_seconds=0.01,
+            )
+        await asyncio.wait_for(connected.wait(), timeout=1)
+    finally:
+        release.set()
+        await asyncio.wait_for(handler_finished.wait(), timeout=1)
+        server.close()
+        await server.wait_closed()
