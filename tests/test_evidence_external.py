@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import agent_runtime_governance.evidence_external as evidence_external_module
 import agent_runtime_governance.verify as verifier_module
 from agent_runtime_governance import (
     ActionContract,
@@ -227,6 +228,25 @@ def test_anchor_request_is_strict_and_binds_the_subject_before_provider_entry() 
     assert cross_tenant["integrity"]["reasons"] == ["anchor_tenant_digest_mismatch"]
 
 
+def test_anchor_provider_append_preserves_protected_sequence_invariants(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = InMemoryAnchorProvider(
+        sequence_id="production-sequence-v1",
+        tenant_digest="a" * 64,
+    )
+    first = provider.append("evidence-anchor-1", "1" * 64)
+
+    with pytest.raises(EvidenceExternalValidationError, match="repeat a bundle_id"):
+        provider.append(first.bundle_id, "2" * 64)
+    assert provider._protected_entries == (first,)
+
+    monkeypatch.setattr(evidence_external_module, "_MAX_ANCHOR_ENTRIES", 1)
+    with pytest.raises(EvidenceExternalValidationError, match="at most 1 values"):
+        provider.append("evidence-anchor-2", "2" * 64)
+    assert provider._protected_entries == (first,)
+
+
 def test_absent_or_unsupported_anchor_never_claims_continuity() -> None:
     bundle = _bundle()
     subject = AnchorSequenceEntry(1, bundle.bundle_id, bundle.bundle_digest)
@@ -360,6 +380,41 @@ def test_damaged_receipt_attachment_fails_closed_without_raising() -> None:
     }
 
 
+def test_receipt_request_failure_is_not_reported_as_digest_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = _bundle()
+    attachment = ReceiptAttachment(
+        bundle_digest=bundle.bundle_digest,
+        value=base64.b64encode(b"receipt-v1").decode("ascii"),
+    )
+
+    def fail_from_bundle(
+        _cls: type[ReceiptVerificationRequest],
+        _bundle: EvidenceBundle,
+        _receipt: ReceiptAttachment,
+    ) -> ReceiptVerificationRequest:
+        raise EvidenceExternalValidationError("receipt request is invalid")
+
+    monkeypatch.setattr(
+        ReceiptVerificationRequest,
+        "from_bundle",
+        classmethod(fail_from_bundle),
+    )
+
+    report = verify_evidence_bundle_document(
+        bundle.to_dict(),
+        receipt_verifier=UnsupportedReceiptVerifier(),
+        receipt=attachment,
+    )
+
+    assert report["outcome_verified"] == {
+        "ok": False,
+        "reasons": ["receipt_request_invalid"],
+        "state": "failed",
+    }
+
+
 def test_reference_receipt_verifier_binds_bundle_and_tenant_identity() -> None:
     raw_receipt = b"receipt-v1"
     original = _bundle()
@@ -473,6 +528,14 @@ class _NoisyReceiptVerifier:
     def verify(self, request: object) -> ReceiptVerificationResult:
         print("receipt-output-must-not-reach-json")
         return ReceiptVerificationResult("passed", outcome="succeeded")
+
+
+class _MismatchedReceiptVerifier:
+    verifier_id = "mismatched-receipt-verifier-v1"
+    protocol_version = "1"
+
+    def verify(self, request: object) -> ReceiptVerificationResult:
+        return ReceiptVerificationResult("passed", outcome="failed")
 
 
 def test_cli_loads_only_selected_provider_and_preserves_one_json_stdout(
@@ -634,6 +697,42 @@ def test_cli_returns_stable_external_provider_exit_codes(
         ANCHOR_PROVIDER_ENTRY_POINT_GROUP,
         RECEIPT_VERIFIER_ENTRY_POINT_GROUP,
     ]
+
+
+def test_cli_receipt_outcome_mismatch_exits_verification_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    bundle = _bundle()
+    bundle_path = _write_json(tmp_path / "bundle.json", bundle.to_dict())
+    receipt_path = _write_json(
+        tmp_path / "receipt.json",
+        ReceiptAttachment(
+            bundle_digest=bundle.bundle_digest,
+            value=base64.b64encode(b"receipt-v1").decode("ascii"),
+        ).to_dict(),
+    )
+    entry = _AnchorEntryPoint("mismatched-receipt", _MismatchedReceiptVerifier)
+    monkeypatch.setattr(
+        verifier_module.metadata,
+        "entry_points",
+        lambda: _EntryPoints((entry,)),
+    )
+
+    exit_code = main(
+        [
+            str(bundle_path),
+            "--receipt-verifier",
+            "mismatched-receipt",
+            "--receipt",
+            str(receipt_path),
+        ]
+    )
+    report = json.loads(capsys.readouterr().out)
+
+    assert exit_code == EXIT_VERIFICATION_FAILURE
+    assert report["outcome_verified"]["reasons"] == ["receipt_outcome_mismatch"]
 
 
 def test_cli_never_imports_a_provider_for_invalid_or_incomplete_input(

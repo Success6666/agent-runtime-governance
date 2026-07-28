@@ -244,6 +244,8 @@ def _read_dependency_audit(root: Path) -> int:
     vulnerability_count = 0
     for dependency in dependencies:
         entry = _as_object(dependency, "dependency audit entry")
+        if entry.get("skip_reason") is not None:
+            raise ReleaseManifestError("dependency audit skipped a dependency")
         vulnerabilities = entry.get("vulns")
         if not isinstance(vulnerabilities, list):
             raise ReleaseManifestError("dependency audit entry has no vulnerabilities list")

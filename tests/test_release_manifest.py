@@ -293,6 +293,64 @@ def test_generation_rejects_a_dependency_audit_with_vulnerabilities(
 
 
 @pytest.mark.parametrize(
+    "skip_reason",
+    ("dependency could not be audited", "", False, 0, [], {}),
+    ids=("message", "empty-string", "false", "zero", "empty-list", "empty-object"),
+)
+def test_generation_rejects_a_dependency_audit_with_skipped_dependency(
+    tmp_path: Path,
+    release_manifest: ModuleType,
+    skip_reason: object,
+) -> None:
+    _write_release_inputs(tmp_path)
+    (tmp_path / "release-evidence" / "dependency-audit.json").write_text(
+        json.dumps(
+            {
+                "dependencies": [
+                    {
+                        "name": "unresolved-example",
+                        "skip_reason": skip_reason,
+                        "vulns": [],
+                    }
+                ],
+                "fixes": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(release_manifest.ReleaseManifestError, match="skipped a dependency"):
+        _manifest(release_manifest, tmp_path)
+
+
+def test_generation_allows_a_dependency_audit_with_null_skip_reason(
+    tmp_path: Path,
+    release_manifest: ModuleType,
+) -> None:
+    _write_release_inputs(tmp_path)
+    (tmp_path / "release-evidence" / "dependency-audit.json").write_text(
+        json.dumps(
+            {
+                "dependencies": [
+                    {
+                        "name": "audited-example",
+                        "skip_reason": None,
+                        "vulns": [],
+                    }
+                ],
+                "fixes": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert (
+        _manifest(release_manifest, tmp_path)["dependency_audit"]["vulnerability_count"]
+        == 0
+    )
+
+
+@pytest.mark.parametrize(
     ("options", "message"),
     [
         ({"omit_manifest": True}, "subjects do not match"),
@@ -515,7 +573,7 @@ def test_release_documentation_keeps_the_manifest_claim_bounded() -> None:
     verification = (ROOT / "docs" / "release-verification.md").read_text(
         encoding="utf-8"
     ).lower()
-    combined = f"{releasing}\n{verification}"
+    assert "release verification manifest" in releasing
 
     for value in ("point-in-time", "uptime", "security", "latency", "compliance"):
-        assert value in combined
+        assert value in verification

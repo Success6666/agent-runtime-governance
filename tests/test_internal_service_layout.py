@@ -96,7 +96,7 @@ def test_package_sources_do_not_import_the_moved_private_modules() -> None:
         legacy_imports = [
             node
             for node in ast.walk(module)
-            if _is_legacy_private_import(node)
+            if _is_legacy_private_import(node, source_path)
         ]
         assert not legacy_imports, source_path.relative_to(_PACKAGE_ROOT)
 
@@ -116,10 +116,58 @@ def _is_runtime_facade(node: ast.AST) -> bool:
     )
 
 
-def _is_legacy_private_import(node: ast.AST) -> bool:
+def test_legacy_private_import_detection_catches_package_and_relative_forms() -> None:
+    package_import = ast.parse("from agent_runtime_governance import _blocking").body[0]
+    assert _is_legacy_private_import(package_import, _PACKAGE_ROOT / "runtime.py")
+
+    root_relative_import = ast.parse("from . import _blocking").body[0]
+    assert _is_legacy_private_import(root_relative_import, _PACKAGE_ROOT / "runtime.py")
+
+    root_package_relative_import = ast.parse("from . import _blocking").body[0]
+    assert _is_legacy_private_import(
+        root_package_relative_import,
+        _PACKAGE_ROOT / "__init__.py",
+    )
+
+    nested_relative_import = ast.parse("from .. import _blocking").body[0]
+    assert _is_legacy_private_import(
+        nested_relative_import,
+        _PACKAGE_ROOT / "middleware" / "audit.py",
+    )
+
+    nested_package_relative_import = ast.parse("from .. import _blocking").body[0]
+    assert _is_legacy_private_import(
+        nested_package_relative_import,
+        _PACKAGE_ROOT / "middleware" / "__init__.py",
+    )
+
+    non_legacy_relative_import = ast.parse("from . import _blocking").body[0]
+    assert not _is_legacy_private_import(
+        non_legacy_relative_import,
+        _PACKAGE_ROOT / "middleware" / "audit.py",
+    )
+
+
+def _is_legacy_private_import(node: ast.AST, source_path: Path) -> bool:
     if isinstance(node, ast.Import):
         return any(alias.name in _LEGACY_PRIVATE_MODULE_NAMES for alias in node.names)
-    return (
-        isinstance(node, ast.ImportFrom)
-        and node.module in _LEGACY_PRIVATE_MODULE_NAMES
+    if not isinstance(node, ast.ImportFrom):
+        return False
+    if node.module in _LEGACY_PRIVATE_MODULE_NAMES:
+        return True
+    if node.module == "agent_runtime_governance":
+        return any(alias.name in _LEGACY_PRIVATE_MODULES for alias in node.names)
+    if node.level == 0:
+        return False
+
+    package_parts = [
+        "agent_runtime_governance",
+        *source_path.relative_to(_PACKAGE_ROOT).parent.parts,
+    ]
+    parent_parts = package_parts[: len(package_parts) - node.level + 1]
+    if node.module is not None:
+        parent_parts.extend(node.module.split("."))
+    return any(
+        ".".join((*parent_parts, alias.name)) in _LEGACY_PRIVATE_MODULE_NAMES
+        for alias in node.names
     )

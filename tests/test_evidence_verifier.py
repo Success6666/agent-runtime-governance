@@ -490,7 +490,11 @@ def test_cli_returns_unsupported_exit_code_when_outcome_is_requested(
 
     assert completed.returncode == EXIT_UNSUPPORTED
     assert report["integrity"]["ok"] is True
-    assert report["outcome_verified"]["state"] == "unsupported"
+    assert report["outcome_verified"] == {
+        "ok": False,
+        "reasons": ["receipt_verifier_missing"],
+        "state": "unsupported",
+    }
 
 
 def test_cli_detects_mutation_against_detached_signature_and_expected_digest(
