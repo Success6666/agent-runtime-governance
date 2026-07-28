@@ -124,6 +124,12 @@ from .resilience import (
     StageTimeoutError,
     await_stage,
 )
+from .runtime_events import (
+    RuntimeEvent,
+    RuntimeEventStream,
+    RuntimeEventSubscriber,
+    _RuntimeEventHub,
+)
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -272,6 +278,7 @@ class Runtime:
         reconciliation_executor: Executor | None = None,
         reconciliation_audit_executor: Executor | None = None,
         production_profile: ProductionProfile | None = None,
+        event_subscribers: Iterable[RuntimeEventSubscriber] = (),
     ) -> None:
         self._pipeline = (
             pipeline if isinstance(pipeline, Pipeline) else Pipeline(pipeline)
@@ -288,6 +295,8 @@ class Runtime:
         self._production_report: ProductionReadinessReport | None = None
         self._production_sealed = production_profile is None
         self._production_seal_lock = Lock()
+        self._runtime_event_hub = _RuntimeEventHub(event_subscribers)
+        self._event_stream = RuntimeEventStream(self._runtime_event_hub)
         self.limits = limits or RuntimeLimits()
         self._lifecycle_lock = Lock()
         self._closing = False
@@ -880,6 +889,25 @@ class Runtime:
             _discard_unstarted_awaitable(awaitable)
         return task
 
+    def _schedule_runtime_event(self, context: ExecutionContext) -> None:
+        """Queue a detached event without changing the governed outcome."""
+
+        delivery: Awaitable[Any] | None = None
+        try:
+            subscribers = self._runtime_event_hub.subscribers()
+            if not subscribers:
+                return
+            event = RuntimeEvent.from_context(context)
+            delivery = self._runtime_event_hub.publish(
+                event,
+                self._invoke_extension,
+                subscribers,
+            )
+            self._schedule_extension_cleanup(delivery)
+        except Exception:
+            if delivery is not None:
+                _discard_unstarted_awaitable(delivery)
+
     def _forget_detached_stage(self, task: asyncio.Future[Any]) -> None:
         with self._lifecycle_lock:
             self._detached_stage_tasks.discard(task)
@@ -955,6 +983,12 @@ class Runtime:
         """Return read-only capacity state for third-party extension dispatch."""
 
         return self._extension_dispatcher.snapshot()
+
+    @property
+    def events(self) -> RuntimeEventStream:
+        """Return the read-only, redacted terminal-event subscription surface."""
+
+        return self._event_stream
 
     def _is_extension_dispatch_accepting(self) -> bool:
         """Read the lifecycle state while the dispatcher's admission lock is held."""
@@ -1300,7 +1334,20 @@ class Runtime:
     ) -> RunResult:
         operation = self._begin_active_operation()
         try:
-            return await self._arun(name, *args, _governance=_governance, **kwargs)
+            try:
+                result = await self._arun(
+                    name, *args, _governance=_governance, **kwargs
+                )
+            except (
+                AuditDeliveryError,
+                GovernanceCancelledError,
+                GovernanceDenied,
+                ToolExecutionError,
+            ) as exc:
+                self._schedule_runtime_event(exc.context)
+                raise
+            self._schedule_runtime_event(result.context)
+            return result
         finally:
             self._end_active_operation(operation)
 

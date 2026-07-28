@@ -55,6 +55,10 @@ All notable changes are documented here.
   lineage. It reports integrity, authenticity, and outcome verification as
   independent JSON levels; anchors and receipt verification remain explicitly
   unsupported.
+- A versioned, immutable, redacted terminal-event stream for debugger and
+  replay consumers. Event subscribers receive only an allowlisted DTO and are
+  delivered through the Runtime-owned extension dispatcher without becoming
+  governance-authoritative.
 
 ### Changed
 
