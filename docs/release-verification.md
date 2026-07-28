@@ -5,6 +5,24 @@ latency SLA or a guarantee against future advisories. CI repeats the test
 matrix, policy checks, dependency audit, and Docker integration smoke from
 clean runners.
 
+## Release Verification Manifest
+
+From v0.8 onward, each release asset set includes a closed, versioned Release
+Verification Manifest. The protected release job derives it from that job's
+JUnit, coverage, Docker integration, dependency-audit, build, SBOM, checksum,
+and pinned service-image evidence. The job validates the manifest before it
+attests and uploads release assets; PyPI Trusted Publishing rechecks the
+manifest's checksum and GitHub provenance before package distributions are
+published.
+
+The manifest is point-in-time CI evidence only. It is not an uptime, security,
+latency, or compliance guarantee, and it does not make claims about systems or
+advisories that arise after the recorded release job finishes.
+
+The workflow runs after GitHub records a published release, so a missing or
+invalid manifest blocks release assets and PyPI publication. It does not claim
+to retract an already-created GitHub Release object.
+
 ## v0.7.0
 
 v0.7.0 was released on 2026-07-27 (UTC) from protected `main` commit

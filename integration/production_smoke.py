@@ -56,6 +56,10 @@ OTEL_IMAGE = (
     "otel/opentelemetry-collector-contrib@"
     "sha256:f2f01157055a9b2aab9df7118e1f1c9abf345e99b23bc7a2bc791db374a7d0f6"
 )
+RELEASE_SERVICE_IMAGES = {
+    "opa": OPA_IMAGE,
+    "otel": OTEL_IMAGE,
+}
 KIND_NODE_IMAGE = (
     "kindest/node:v1.34.3@"
     "sha256:08497ee19eace7b4b5348db5c6a1591d7752b164530a36f855cb0f2bdcbadd48"
@@ -71,6 +75,12 @@ class SmokeIdentityDigestKeyProvider:
         return hashlib.sha256(
             f"production-smoke:{version}:{tenant}".encode("utf-8")
         ).digest()
+
+
+def release_service_images() -> dict[str, str]:
+    """Return the immutable service images exercised by release integration."""
+
+    return dict(RELEASE_SERVICE_IMAGES)
 
 
 def main() -> None:
@@ -90,8 +100,9 @@ def main() -> None:
 
 def run_opa_smoke(keep_containers: bool) -> None:
     name = "arg-v07-opa"
+    opa_image = RELEASE_SERVICE_IMAGES["opa"]
     cleanup_container(name)
-    pull_image(OPA_IMAGE)
+    pull_image(opa_image)
     policy_dir = ROOT / "integration" / "opa"
     command = [
         "docker",
@@ -111,7 +122,7 @@ def run_opa_smoke(keep_containers: bool) -> None:
         "256m",
         "--mount",
         f"type=bind,source={policy_dir},target=/policies,readonly",
-        OPA_IMAGE,
+        opa_image,
         "run",
         "--server",
         "--addr",
@@ -488,8 +499,9 @@ def run_otel_smoke(keep_containers: bool) -> None:
         raise SystemExit("Install the otel extra before running this smoke check") from exc
 
     name = "arg-v07-otel"
+    otel_image = RELEASE_SERVICE_IMAGES["otel"]
     cleanup_container(name)
-    pull_image(OTEL_IMAGE)
+    pull_image(otel_image)
     config = ROOT / "integration" / "otel" / "collector-config.yaml"
     provider = None
     runtime = None
@@ -513,7 +525,7 @@ def run_otel_smoke(keep_containers: bool) -> None:
         "256m",
         "--mount",
         f"type=bind,source={config},target=/etc/otelcol-contrib/config.yaml,readonly",
-        OTEL_IMAGE,
+        otel_image,
     ]
     try:
         run(command)

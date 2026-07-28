@@ -6,6 +6,11 @@ All notable changes are documented here.
 
 ### Added
 
+- A versioned, closed Release Verification Manifest generated from protected
+  release-job outputs. Release assets now include its checksum and provenance
+  alongside the package distributions and SPDX SBOM; the record is bounded to
+  point-in-time CI evidence and does not claim uptime, security, latency, or
+  compliance guarantees.
 - Extras-gated LangGraph and OpenAI Agents SDK conformance coverage for one
   real tool-entry path each, including the SDK's native Runner tool loop,
   compared with the standalone Runtime for

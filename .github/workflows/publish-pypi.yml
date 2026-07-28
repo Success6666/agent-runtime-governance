@@ -50,7 +50,8 @@ jobs:
             --pattern '*.whl' \
             --pattern '*.tar.gz' \
             --pattern 'SHA256SUMS' \
-            --pattern 'sbom.spdx.json'
+            --pattern 'sbom.spdx.json' \
+            --pattern 'release-manifest.json'
 
       - name: Verify checksums and expected package files
         run: |
@@ -58,6 +59,7 @@ jobs:
           test "$(find dist -maxdepth 1 -name '*.tar.gz' -type f | wc -l)" -eq 1
           test -s dist/SHA256SUMS
           test -s dist/sbom.spdx.json
+          test -s dist/release-manifest.json
           sha256sum --check dist/SHA256SUMS
 
       - name: Verify GitHub artifact provenance
@@ -70,6 +72,7 @@ jobs:
           gh attestation verify dist/*.tar.gz --repo "$GITHUB_REPOSITORY" --signer-workflow "$signer_workflow" --source-ref "$source_ref" --deny-self-hosted-runners
           gh attestation verify dist/SHA256SUMS --repo "$GITHUB_REPOSITORY" --signer-workflow "$signer_workflow" --source-ref "$source_ref" --deny-self-hosted-runners
           gh attestation verify dist/sbom.spdx.json --repo "$GITHUB_REPOSITORY" --signer-workflow "$signer_workflow" --source-ref "$source_ref" --deny-self-hosted-runners
+          gh attestation verify dist/release-manifest.json --repo "$GITHUB_REPOSITORY" --signer-workflow "$signer_workflow" --source-ref "$source_ref" --deny-self-hosted-runners
 
       - name: Isolate package distributions from release metadata
         run: |
