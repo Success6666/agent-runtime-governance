@@ -44,6 +44,7 @@ _MANAGED_BLOCKING_WORKER: ContextVar[bool] = ContextVar(
     "agent_runtime_governance_managed_blocking_worker",
     default=False,
 )
+_STANDALONE_CLEANUP_TASKS: set[asyncio.Task[Any]] = set()
 
 
 async def run_blocking(
@@ -124,6 +125,8 @@ def schedule_extension_cleanup(awaitable: Awaitable[Any]) -> asyncio.Task[Any] |
     if scheduler is not None:
         return scheduler(awaitable)
     task = asyncio.create_task(awaitable, name="extension-cleanup")
+    _STANDALONE_CLEANUP_TASKS.add(task)
+    task.add_done_callback(_STANDALONE_CLEANUP_TASKS.discard)
     task.add_done_callback(_consume_cleanup_result)
     return task
 

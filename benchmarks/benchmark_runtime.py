@@ -528,17 +528,10 @@ async def measure_extension_dispatch(
         monitor = _ExtensionDispatchMonitor(runtime)
         monitor.observe()
         stop_monitor = asyncio.Event()
-        monitor_task = asyncio.create_task(
-            monitor.sample(stop_monitor),
-            name="benchmark-extension-monitor",
-        )
-        semaphore = asyncio.Semaphore(concurrency)
+        monitor_task: asyncio.Task[None] | None = None
         latencies_ms: list[float] = []
         tracing_was_active = tracemalloc.is_tracing()
-        if tracing_was_active:
-            tracemalloc.reset_peak()
-        else:
-            tracemalloc.start()
+        peak = 0
 
         async def invoke(index: int) -> None:
             async with semaphore:
@@ -550,15 +543,26 @@ async def measure_extension_dispatch(
                 latencies_ms.append(latency_ms)
 
         try:
+            semaphore = asyncio.Semaphore(concurrency)
+            if tracing_was_active:
+                tracemalloc.reset_peak()
+            else:
+                tracemalloc.start()
+            monitor_task = asyncio.create_task(
+                monitor.sample(stop_monitor),
+                name="benchmark-extension-monitor",
+            )
             started = perf_counter()
             await asyncio.gather(*(invoke(index) for index in range(requests)))
             duration = perf_counter() - started
         finally:
-            _, peak = tracemalloc.get_traced_memory()
-            if not tracing_was_active:
+            if tracemalloc.is_tracing():
+                _, peak = tracemalloc.get_traced_memory()
+            if not tracing_was_active and tracemalloc.is_tracing():
                 tracemalloc.stop()
             stop_monitor.set()
-            await monitor_task
+            if monitor_task is not None:
+                await monitor_task
             monitor.observe()
 
         ordered_latencies = sorted(latencies_ms)

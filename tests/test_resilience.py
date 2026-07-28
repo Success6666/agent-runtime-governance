@@ -29,6 +29,8 @@ def test_runtime_limits_reject_invalid_values() -> None:
     with pytest.raises(ValueError):
         RuntimeLimits(reconciliation_audit_delivery_timeout_seconds=0)
     with pytest.raises(ValueError):
+        RuntimeLimits(sync_loop_startup_timeout_seconds=0)
+    with pytest.raises(ValueError):
         RuntimeLimits(max_reconciliation_in_flight=0)
     with pytest.raises(ValueError):
         RuntimeLimits(max_reconciliation_audit_delivery_in_flight=0)
@@ -50,6 +52,39 @@ def test_runtime_limits_preserve_v06_positional_argument_order() -> None:
         limits.max_in_flight,
     ) == (1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.7, 8)
     assert limits.reconciliation_operation_timeout_seconds == 30.0
+
+
+def test_runtime_limits_preserve_v07_appended_positional_argument_order() -> None:
+    limits = RuntimeLimits(
+        1.0,
+        2.0,
+        3.0,
+        4.0,
+        5.0,
+        6.0,
+        0.7,
+        8,
+        9.0,
+        10.0,
+        11.0,
+        12.0,
+        13,
+        14,
+        15,
+        16,
+    )
+
+    assert (
+        limits.reconciliation_operation_timeout_seconds,
+        limits.reconciliation_provider_timeout_seconds,
+        limits.reconciliation_finalization_timeout_seconds,
+        limits.reconciliation_audit_delivery_timeout_seconds,
+        limits.max_reconciliation_in_flight,
+        limits.max_reconciliation_audit_delivery_in_flight,
+        limits.max_blocking_extension_in_flight,
+        limits.max_blocking_extension_workers,
+    ) == (9.0, 10.0, 11.0, 12.0, 13, 14, 15, 16)
+    assert limits.sync_loop_startup_timeout_seconds == 5.0
 
 
 @pytest.mark.asyncio

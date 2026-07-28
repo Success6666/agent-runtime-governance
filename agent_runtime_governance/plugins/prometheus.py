@@ -1,11 +1,62 @@
 from __future__ import annotations
 
+import weakref
+from collections.abc import Callable, Iterator
 from typing import Any
 
-from .._extensions import ExtensionDispatchSnapshot, _ExtensionDispatcher
+from .._extensions import ExtensionDispatchSnapshot
 from ..context import ExecutionContext, ExecutionStatus, HistoryEntry
 from ..middleware.base import ObservingMiddleware
 from .core import RuntimeBuilder
+
+_EMPTY_EXTENSION_SNAPSHOT = ExtensionDispatchSnapshot(
+    worker_capacity=0,
+    in_flight_capacity=0,
+    active_workers=0,
+    in_flight=0,
+    executor_queued=0,
+    admission_waiters=0,
+    detached_sync_work=0,
+    saturated=False,
+)
+
+
+class _ExtensionDispatchSnapshotCollector:
+    """Expose one coherent capacity snapshot for each Prometheus scrape."""
+
+    def __init__(self, *, middleware: "PrometheusMiddleware", prefix: str) -> None:
+        self._middleware = weakref.ref(middleware)
+        self._prefix = prefix
+
+    def collect(self) -> Iterator[Any]:
+        from prometheus_client.core import GaugeMetricFamily
+
+        middleware = self._middleware()
+        snapshot = (
+            middleware._extension_snapshot()
+            if middleware is not None
+            else _EMPTY_EXTENSION_SNAPSHOT
+        )
+        workers = GaugeMetricFamily(
+            f"{self._prefix}_extension_dispatch_workers",
+            "Runtime-owned extension worker capacity and activity.",
+            labels=("state",),
+        )
+        workers.add_metric(["capacity"], float(snapshot.worker_capacity))
+        workers.add_metric(["active"], float(snapshot.active_workers))
+        yield workers
+
+        queue_depth = GaugeMetricFamily(
+            f"{self._prefix}_extension_dispatch_queue_depth",
+            "Extension dispatch queue and admission depth.",
+            labels=("state",),
+        )
+        queue_depth.add_metric(["executor"], float(snapshot.executor_queued))
+        queue_depth.add_metric(["admission"], float(snapshot.admission_waiters))
+        yield queue_depth
+
+    def describe(self) -> Iterator[Any]:
+        return iter(())
 
 
 class PrometheusMiddleware(ObservingMiddleware):
@@ -68,31 +119,12 @@ class PrometheusMiddleware(ObservingMiddleware):
             "Synchronous extension calls still running after caller cancellation.",
             registry=target_registry,
         )
-        self.extension_dispatch_workers = Gauge(
-            f"{prefix}_extension_dispatch_workers",
-            "Runtime-owned extension worker capacity and activity.",
-            ("state",),
-            registry=target_registry,
+        self._extension_snapshot_provider: weakref.WeakMethod[Any] | None = None
+        self._extension_dispatch_collector = _ExtensionDispatchSnapshotCollector(
+            middleware=self,
+            prefix=prefix,
         )
-        self.extension_dispatch_queue_depth = Gauge(
-            f"{prefix}_extension_dispatch_queue_depth",
-            "Extension dispatch queue and admission depth.",
-            ("state",),
-            registry=target_registry,
-        )
-        self._extension_dispatcher: _ExtensionDispatcher | None = None
-        self.extension_dispatch_workers.labels("capacity").set_function(
-            lambda: float(self._extension_snapshot().worker_capacity)
-        )
-        self.extension_dispatch_workers.labels("active").set_function(
-            lambda: float(self._extension_snapshot().active_workers)
-        )
-        self.extension_dispatch_queue_depth.labels("executor").set_function(
-            lambda: float(self._extension_snapshot().executor_queued)
-        )
-        self.extension_dispatch_queue_depth.labels("admission").set_function(
-            lambda: float(self._extension_snapshot().admission_waiters)
-        )
+        target_registry.register(self._extension_dispatch_collector)
 
     async def process(self, context: ExecutionContext) -> ExecutionContext:
         if context.status not in {
@@ -131,11 +163,13 @@ class PrometheusMiddleware(ObservingMiddleware):
             _safe_label(component), _safe_label(outcome), _safe_label(reason)
         ).inc()
 
-    def _bind_extension_dispatcher(self, dispatcher: _ExtensionDispatcher) -> None:
-        """Receive the Runtime-owned dispatcher without exposing an injection API."""
+    def _bind_extension_dispatch_snapshot(
+        self,
+        snapshot_provider: Callable[[], ExtensionDispatchSnapshot],
+    ) -> None:
+        """Receive only a weak, observation-only view of dispatcher capacity."""
 
-        self._extension_dispatcher = dispatcher
-        dispatcher.add_observer(self)
+        self._extension_snapshot_provider = weakref.WeakMethod(snapshot_provider)
 
     def record_queue_wait(self, *, mode: str, seconds: float) -> None:
         self.extension_dispatch_queue_wait.labels(mode).observe(seconds)
@@ -150,18 +184,12 @@ class PrometheusMiddleware(ObservingMiddleware):
         self.extension_dispatch_detached_work.set(count)
 
     def _extension_snapshot(self) -> ExtensionDispatchSnapshot:
-        if self._extension_dispatcher is None:
-            return ExtensionDispatchSnapshot(
-                worker_capacity=0,
-                in_flight_capacity=0,
-                active_workers=0,
-                in_flight=0,
-                executor_queued=0,
-                admission_waiters=0,
-                detached_sync_work=0,
-                saturated=False,
-            )
-        return self._extension_dispatcher.snapshot()
+        provider = (
+            None
+            if self._extension_snapshot_provider is None
+            else self._extension_snapshot_provider()
+        )
+        return _EMPTY_EXTENSION_SNAPSHOT if provider is None else provider()
 
     def _record_external_failures(self, context: ExecutionContext) -> None:
         for entry in context.history:
