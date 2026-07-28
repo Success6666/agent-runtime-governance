@@ -123,9 +123,11 @@ The staged v0.8-v1.0 direction and its exit criteria are in
 [`ROADMAP.md`](ROADMAP.md) and [`docs/production-roadmap.md`](docs/production-roadmap.md).
 Planned capabilities are never presented as shipped.
 
-The unreleased v0.8 offline verifier, its explicit unsupported paths, and its
-input/exit-code contract are documented in
-[`docs/evidence-verification.md`](docs/evidence-verification.md).
+The unreleased v0.8 verifier, its detached external-evidence boundaries, and
+its input/exit-code contract are documented in
+[`docs/evidence-verification.md`](docs/evidence-verification.md). Its closed v1
+schema and future-version policy are in
+[`docs/evidence-schema-compatibility.md`](docs/evidence-schema-compatibility.md).
 
 ## How it compares
 
