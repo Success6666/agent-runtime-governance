@@ -1,0 +1,17 @@
+{
+  "audit_event_hash": "c75d34d2b14d865dec68436666c5f62dee2c884a8b4db76dab1c2e275615d556",
+  "audit_signature": "f888851bae4f6a98f568eba34f4ce5290ac8e1abcd688b6a2e4e2cde4802d329",
+  "legacy_audit_json": "{\"a\":1.0,\"nested\":{\"alpha\":\"line\\nfeed\",\"beta\":\"\\u20ac\"},\"z\":\"\\u00e9\"}",
+  "legacy_contract_json": "{\"a\":1.0,\"nested\":{\"alpha\":\"line\\nfeed\",\"beta\":\"€\"},\"z\":\"é\"}",
+  "payload": {
+    "a": 1.0,
+    "nested": {
+      "alpha": "line\nfeed",
+      "beta": "€"
+    },
+    "z": "é"
+  },
+  "rfc8785_json": "{\"a\":1,\"nested\":{\"alpha\":\"line\\nfeed\",\"beta\":\"€\"},\"z\":\"é\"}",
+  "snapshot_hash": "c75d34d2b14d865dec68436666c5f62dee2c884a8b4db76dab1c2e275615d556",
+  "snapshot_signature": "f888851bae4f6a98f568eba34f4ce5290ac8e1abcd688b6a2e4e2cde4802d329"
+}

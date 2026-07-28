@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,7 @@ from agent_runtime_governance import (
     StaticIdentityProvider,
     VerifiedPrincipal,
 )
+from agent_runtime_governance.approval_store import ApprovalStatus, SQLiteApprovalStore
 
 FIXTURES = Path(__file__).parent / "fixtures" / "v0.5"
 
@@ -48,6 +50,31 @@ def test_v05_approval_without_action_digest_remains_readable() -> None:
     assert request.action_digest is None
     assert request.request_id == "legacy-approval-1"
     assert ApprovalRequest.from_dict(request.to_dict()) == request
+
+
+def test_v05_approval_fixture_remains_readable_from_sqlite_store(tmp_path) -> None:
+    fixture_text = (FIXTURES / "approval-request.json").read_text(encoding="utf-8")
+    payload = json.loads(fixture_text)
+    path = tmp_path / "approvals.db"
+    store = SQLiteApprovalStore(path)
+
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            INSERT INTO approvals(
+                request_id, request_json, decision_json, status, consumed_at,
+                integrity_tag, reservation_token, reserved_until
+            ) VALUES (?, ?, NULL, 'pending', NULL, NULL, NULL, NULL)
+            """,
+            (payload["request_id"], fixture_text),
+        )
+        connection.commit()
+
+    restored = store.get(payload["request_id"])
+    assert restored is not None
+    assert restored.status is ApprovalStatus.PENDING
+    assert restored.request.action_digest is None
+    assert restored.request.to_dict() == {**payload, "action_digest": None}
 
 
 def test_v05_idempotency_fixture_survives_store_restart(tmp_path) -> None:

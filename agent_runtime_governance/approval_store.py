@@ -12,6 +12,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Protocol
 
+from ._canonical import legacy_storage_json_text
 from ._sqlite import connect_sqlite, initialize_sqlite
 from .decisions import (
     ApprovalRequest,
@@ -652,7 +653,7 @@ def _validate_request(stored: ApprovalRequest, request: ApprovalRequest) -> Deci
 
 
 def _dump(value: dict[str, object]) -> str:
-    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return legacy_storage_json_text(value)
 
 
 def _utc_now() -> str:
