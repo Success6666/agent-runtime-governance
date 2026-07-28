@@ -12,6 +12,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+import agent_runtime_governance.verify as verifier_module
 from agent_runtime_governance import (
     ActionContract,
     Ed25519EvidenceSigner,
@@ -116,7 +117,7 @@ def _write_json(path: Path, value: object) -> Path:
 
 
 def _run_cli(
-    tmp_path: Path, bundle_path: Path, *arguments: str
+    bundle_path: Path, *arguments: str
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
@@ -250,11 +251,128 @@ def test_main_fails_closed_for_usage_unreadable_and_invalid_sidecars(
     assert missing_exit == EXIT_VERIFICATION_FAILURE
     assert missing_report["integrity"]["reasons"] == ["bundle_unreadable"]
     assert sidecar_exit == EXIT_VERIFICATION_FAILURE
+    assert sidecar_report["integrity"]["ok"] is False
+    assert sidecar_report["integrity"]["reasons"] == [
+        "signature_attachment_invalid",
+    ]
+    assert sidecar_report["integrity"]["commitment"] == {
+        "ok": False,
+        "reasons": ["signature_attachment_invalid"],
+        "state": "failed",
+    }
     assert sidecar_report["authenticity"] == {
         "ok": False,
         "reasons": ["signature_attachment_invalid", "trust_roots_invalid"],
         "state": "failed",
     }
+
+
+@pytest.mark.parametrize(
+    ("option", "filename", "document", "reason", "integrity_fails"),
+    (
+        pytest.param(
+            "--signature",
+            "signature.json",
+            {"not": "valid"},
+            "signature_attachment_invalid",
+            True,
+            id="signature",
+        ),
+        pytest.param(
+            "--trust-roots",
+            "roots.json",
+            {"not": "valid"},
+            "trust_roots_invalid",
+            False,
+            id="trust-roots",
+        ),
+    ),
+)
+def test_main_fails_closed_for_malformed_requested_sidecars(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    option: str,
+    filename: str,
+    document: dict[str, str],
+    reason: str,
+    integrity_fails: bool,
+) -> None:
+    bundle_path = _write_json(tmp_path / "bundle.json", _bundle().to_dict())
+    sidecar_path = _write_json(tmp_path / filename, document)
+
+    exit_code = main([str(bundle_path), option, str(sidecar_path)])
+    report = json.loads(capsys.readouterr().out)
+
+    assert exit_code == EXIT_VERIFICATION_FAILURE
+    if integrity_fails:
+        assert report["integrity"]["reasons"] == [reason]
+        assert report["integrity"]["commitment"] == {
+            "ok": False,
+            "reasons": [reason],
+            "state": "failed",
+        }
+    else:
+        assert report["integrity"]["ok"] is True
+        assert report["integrity"]["reasons"] == []
+        assert report["integrity"]["commitment"] == {
+            "ok": None,
+            "reasons": [],
+            "state": "unanchored",
+        }
+    assert report["authenticity"] == {
+        "ok": False,
+        "reasons": [reason],
+        "state": "failed",
+    }
+
+
+def test_main_keeps_signature_commitment_separate_from_invalid_trust_roots(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    bundle, bundle_path, signature_path, _ = _signed_inputs(tmp_path)
+    invalid_roots = _write_json(tmp_path / "roots.json", {"not": "valid"})
+
+    exit_code = main(
+        [
+            str(bundle_path),
+            "--signature",
+            str(signature_path),
+            "--trust-roots",
+            str(invalid_roots),
+        ]
+    )
+    report = json.loads(capsys.readouterr().out)
+
+    assert exit_code == EXIT_VERIFICATION_FAILURE
+    assert report["integrity"]["ok"] is True
+    assert report["integrity"]["commitment"] == {
+        "ok": True,
+        "reasons": [],
+        "state": "passed",
+    }
+    assert report["authenticity"] == {
+        "ok": False,
+        "reasons": ["trust_roots_invalid"],
+        "state": "failed",
+    }
+
+
+def test_run_emits_at_most_one_json_report_when_stdout_breaks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    emitted: list[str] = []
+
+    def broken_print(value: str) -> None:
+        emitted.append(value)
+        raise BrokenPipeError
+
+    monkeypatch.setattr(verifier_module, "print", broken_print, raising=False)
+    monkeypatch.setattr(sys, "argv", ["verify"])
+
+    assert verifier_module._run() == EXIT_VERIFICATION_FAILURE
+    assert len(emitted) == 1
+    assert '"cli_usage_invalid"' in emitted[0]
 
 
 def test_library_verifier_fails_closed_for_bindings_and_incomplete_authentication() -> None:
@@ -308,7 +426,6 @@ def test_cli_verifies_signed_bundle_and_never_claims_an_external_outcome(
     bundle, bundle_path, signature_path, trust_roots_path = _signed_inputs(tmp_path)
 
     completed = _run_cli(
-        tmp_path,
         bundle_path,
         "--signature",
         str(signature_path),
@@ -346,7 +463,7 @@ def test_cli_marks_unsigned_bundle_as_unanchored_and_outcome_as_unsupported(
     bundle = _bundle()
     bundle_path = _write_json(tmp_path / "bundle.json", bundle.to_dict())
 
-    completed = _run_cli(tmp_path, bundle_path)
+    completed = _run_cli(bundle_path)
     report = _report(completed)
 
     assert completed.returncode == EXIT_SUCCESS
@@ -368,7 +485,7 @@ def test_cli_returns_unsupported_exit_code_when_outcome_is_requested(
 ) -> None:
     bundle_path = _write_json(tmp_path / "unsigned-bundle.json", _bundle().to_dict())
 
-    completed = _run_cli(tmp_path, bundle_path, "--require-outcome")
+    completed = _run_cli(bundle_path, "--require-outcome")
     report = _report(completed)
 
     assert completed.returncode == EXIT_UNSUPPORTED
@@ -385,7 +502,6 @@ def test_cli_detects_mutation_against_detached_signature_and_expected_digest(
     _write_json(bundle_path, mutated)
 
     signed = _run_cli(
-        tmp_path,
         bundle_path,
         "--signature",
         str(signature_path),
@@ -395,7 +511,6 @@ def test_cli_detects_mutation_against_detached_signature_and_expected_digest(
         "2026-07-03T00:00:00Z",
     )
     expected_digest = _run_cli(
-        tmp_path,
         bundle_path,
         "--expected-bundle-digest",
         bundle.bundle_digest,
@@ -428,7 +543,7 @@ def test_cli_detects_cross_tenant_and_stale_binding_substitution(
 ) -> None:
     bundle_path = _write_json(tmp_path / "bundle.json", _bundle().to_dict())
 
-    completed = _run_cli(tmp_path, bundle_path, option, value)
+    completed = _run_cli(bundle_path, option, value)
     report = _report(completed)
 
     assert completed.returncode == EXIT_VERIFICATION_FAILURE
@@ -465,7 +580,7 @@ def test_cli_rejects_broken_reconciliation_lineage(
         reconciliation[1]["seq"] = 3
     bundle_path = _write_json(tmp_path / "bundle.json", document)
 
-    completed = _run_cli(tmp_path, bundle_path)
+    completed = _run_cli(bundle_path)
     report = _report(completed)
 
     assert completed.returncode == EXIT_VERIFICATION_FAILURE
@@ -483,7 +598,7 @@ def test_cli_rejects_duplicate_json_keys_without_a_traceback(tmp_path: Path) -> 
     bundle_path = tmp_path / "bundle.json"
     bundle_path.write_text(duplicate, encoding="utf-8")
 
-    completed = _run_cli(tmp_path, bundle_path)
+    completed = _run_cli(bundle_path)
     report = _report(completed)
 
     assert completed.returncode == EXIT_VERIFICATION_FAILURE
@@ -508,7 +623,7 @@ def test_cli_rejects_nonfinite_json_without_a_traceback(
         encoding="utf-8",
     )
 
-    completed = _run_cli(tmp_path, bundle_path)
+    completed = _run_cli(bundle_path)
     report = _report(completed)
 
     assert completed.returncode == EXIT_VERIFICATION_FAILURE
@@ -538,7 +653,6 @@ def test_cli_honors_expired_trust_root_at_requested_time(tmp_path: Path) -> None
     roots_path = _write_json(tmp_path / "expired-roots.json", expired_roots.to_dict())
 
     completed = _run_cli(
-        tmp_path,
         bundle_path,
         "--signature",
         str(signature_path),

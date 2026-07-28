@@ -15,7 +15,7 @@ import re
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from .evidence import EvidenceBundle, EvidenceBundleValidationError
 from .evidence_signing import (
@@ -48,7 +48,7 @@ class _JsonInputError(ValueError):
 
 
 class _ArgumentParser(argparse.ArgumentParser):
-    def error(self, message: str) -> None:
+    def error(self, message: str) -> NoReturn:
         raise _CliUsageError(message)
 
 
@@ -57,6 +57,8 @@ def verify_evidence_bundle_document(
     *,
     signature: EvidenceSignatureAttachment | None = None,
     trust_roots: EvidenceTrustRoots | None = None,
+    input_reasons: Sequence[str] = (),
+    authentication_requested: bool | None = None,
     expected_bundle_digest: str | None = None,
     expected_tenant_digest: str | None = None,
     expected_policy_version: str | None = None,
@@ -68,12 +70,18 @@ def verify_evidence_bundle_document(
 ) -> dict[str, Any]:
     """Verify one decoded evidence document without network or host state.
 
-    The result is directly JSON serializable.  A false integrity result is a
+    The result is directly JSON serializable. A false integrity result is a
     verification failure; an unsupported authenticity result means the
-    optional Ed25519 verifier dependency is unavailable.
+    optional Ed25519 verifier dependency is unavailable. Callers that parse a
+    detached signature attachment before invoking this function can pass its
+    failure reasons and requested state explicitly so a requested commitment
+    never appears unanchored.
     """
 
-    authentication_requested = signature is not None or trust_roots is not None
+    if authentication_requested is None:
+        authentication_requested = (
+            signature is not None or trust_roots is not None or bool(input_reasons)
+        )
     try:
         bundle = EvidenceBundle.from_dict(document)
     except (EvidenceBundleValidationError, TypeError, ValueError):
@@ -90,6 +98,7 @@ def verify_evidence_bundle_document(
         bundle.bundle_digest,
         signature=signature,
         expected_bundle_digest=expected_bundle_digest,
+        input_reasons=input_reasons,
     )
     integrity_reasons = [
         *commitment["reasons"],
@@ -148,6 +157,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         document,
         signature=signature,
         trust_roots=trust_roots,
+        input_reasons=signature_reasons,
+        authentication_requested=(
+            arguments.signature is not None or arguments.trust_roots is not None
+        ),
         expected_bundle_digest=arguments.expected_bundle_digest,
         expected_tenant_digest=arguments.expected_tenant_digest,
         expected_policy_version=arguments.expected_policy_version,
@@ -320,8 +333,9 @@ def _commitment_level(
     *,
     signature: EvidenceSignatureAttachment | None,
     expected_bundle_digest: str | None,
+    input_reasons: Sequence[str] = (),
 ) -> dict[str, Any]:
-    reasons: list[str] = []
+    reasons = list(input_reasons)
     if signature is not None and signature.bundle_digest != bundle_digest:
         reasons.append("signature_bundle_digest_mismatch")
     if expected_bundle_digest is not None:
@@ -460,14 +474,19 @@ def _not_evaluated_level(reason: str) -> dict[str, Any]:
 
 
 def _emit_and_exit(report: dict[str, Any], *, require_outcome: bool = False) -> int:
-    print(json.dumps(report, sort_keys=True, separators=(",", ":"), allow_nan=False))
     integrity = report["integrity"]
     authenticity = report["authenticity"]
+    exit_code = EXIT_SUCCESS
     if integrity["ok"] is False or authenticity["state"] == "failed":
+        exit_code = EXIT_VERIFICATION_FAILURE
+    elif authenticity["state"] == "unsupported" or require_outcome:
+        exit_code = EXIT_UNSUPPORTED
+    encoded = json.dumps(report, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    try:
+        print(encoded)
+    except OSError:
         return EXIT_VERIFICATION_FAILURE
-    if authenticity["state"] == "unsupported" or require_outcome:
-        return EXIT_UNSUPPORTED
-    return EXIT_SUCCESS
+    return exit_code
 
 
 def _run() -> int:

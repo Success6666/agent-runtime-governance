@@ -162,6 +162,20 @@ def test_evidence_bundle_from_dict_restores_v1_golden_fixture() -> None:
     assert restored.bundle_digest == fixture["bundle_digest"]
 
 
+def test_evidence_bundle_from_dict_rejects_noncanonical_timestamp() -> None:
+    fixture = json.loads(_FIXTURE.read_text(encoding="utf-8"))
+    document = {
+        **fixture["document"],
+        "created_at": fixture["document"]["created_at"].replace("Z", "+00:00"),
+    }
+
+    with pytest.raises(
+        EvidenceBundleValidationError,
+        match="canonical v1 representation",
+    ):
+        EvidenceBundle.from_dict(document)
+
+
 def test_bundle_projects_only_allowlisted_values_and_never_serializes_secrets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
