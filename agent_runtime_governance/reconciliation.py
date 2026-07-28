@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 import rfc8785
 
+from ._canonical import CanonicalJsonError, rfc8785_json_bytes, rfc8785_json_text
 from ._serialization import freeze_mapping, thaw
 from ._sqlite import (
     connect_sqlite,
@@ -4186,8 +4187,8 @@ def _bounded_value(value: Any, *, label: str, max_bytes: int) -> Any:
             active=set(),
             budget=[_MAX_VALUE_NODES],
         )
-        encoded = rfc8785.dumps(normalized)
-    except (rfc8785.CanonicalizationError, UnicodeError) as exc:
+        encoded = rfc8785_json_bytes(normalized, encoder=rfc8785.dumps)
+    except CanonicalJsonError as exc:
         raise ReconciliationValidationError(str(exc)) from exc
     if len(encoded) > max_bytes:
         raise ReconciliationValidationError(f"{label} exceeds {max_bytes} bytes")
@@ -4384,8 +4385,8 @@ def _dump(value: Any) -> str:
             active=set(),
             budget=[_MAX_VALUE_NODES],
         )
-        return rfc8785.dumps(normalized).decode("utf-8")
-    except (rfc8785.CanonicalizationError, UnicodeError) as exc:
+        return rfc8785_json_text(normalized, encoder=rfc8785.dumps)
+    except CanonicalJsonError as exc:
         raise ReconciliationValidationError(str(exc)) from exc
 
 

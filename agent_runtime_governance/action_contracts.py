@@ -12,6 +12,7 @@ from typing import Any
 import rfc8785
 from jsonschema import Draft202012Validator
 
+from ._canonical import CanonicalJsonError, rfc8785_json_bytes
 from ._serialization import freeze_mapping as _freeze_mapping
 from ._serialization import thaw as _thaw
 from .context import ExecutionMode
@@ -761,8 +762,8 @@ def _normalize_container(
 
 def _canonical_bytes(value: Any, *, label: str) -> bytes:
     try:
-        return rfc8785.dumps(value)
-    except (rfc8785.CanonicalizationError, UnicodeError) as exc:
+        return rfc8785_json_bytes(value, encoder=rfc8785.dumps)
+    except CanonicalJsonError as exc:
         raise ContractValidationError(label, str(exc)) from exc
 
 

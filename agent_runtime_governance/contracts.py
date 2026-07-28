@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import inspect
-import json
 import math
 from collections.abc import Mapping
 from enum import Enum
@@ -10,6 +9,7 @@ from typing import Any, Callable
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError
 
+from ._canonical import legacy_contract_json_bytes
 from .errors import ContractValidationError, RegistryError
 
 
@@ -73,13 +73,7 @@ def validate_instance(
 
 def canonical_json_bytes(value: Any, *, label: str) -> bytes:
     normalized = normalize_json(value, path=label)
-    return json.dumps(
-        normalized,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
+    return legacy_contract_json_bytes(normalized)
 
 
 def normalize_json(value: Any, *, path: str = "$", depth: int = 0) -> Any:

@@ -15,6 +15,7 @@ from typing import Any, Awaitable, Protocol
 
 from filelock import FileLock
 
+from ._canonical import legacy_audit_json_text
 from ._serialization import json_safe as _json_safe
 from ._sqlite import connect_sqlite, initialize_sqlite
 from .context import ExecutionContext
@@ -842,13 +843,7 @@ def _source_payload_digest(codec: _AuditCodec, event: Mapping[str, Any]) -> str:
 
 
 def _canonical_json(value: Mapping[str, Any]) -> str:
-    return json.dumps(
-        value,
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
+    return legacy_audit_json_text(value)
 
 
 def redact_sensitive_data(

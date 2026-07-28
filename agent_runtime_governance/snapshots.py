@@ -16,6 +16,7 @@ from typing import Any, Awaitable, Mapping, Protocol, runtime_checkable
 from filelock import FileLock
 
 from ._blocking import invoke_extension
+from ._canonical import legacy_audit_json_bytes, legacy_storage_json_text
 from ._sqlite import connect_sqlite, initialize_sqlite
 from .audit import DEFAULT_SENSITIVE_KEYS, redact_sensitive_data
 from .context import ExecutionContext, ExecutionStatus, HistoryEntry
@@ -261,12 +262,7 @@ class JSONLSnapshotStore:
         return tuple(sorted(snapshots, key=lambda item: item.sequence))
 
     def _append_unlocked(self, snapshot: ContextSnapshot) -> int:
-        line = json.dumps(
-            self._codec.encode(snapshot),
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+        line = legacy_storage_json_text(self._codec.encode(snapshot))
         with self.path.open("a", encoding="utf-8", newline="\n") as stream:
             stream.write(line + "\n")
             stream.flush()
@@ -360,15 +356,7 @@ class JSONLSnapshotStore:
         )
         try:
             with temporary.open("w", encoding="utf-8", newline="\n") as stream:
-                stream.write(
-                    json.dumps(
-                        payload,
-                        ensure_ascii=True,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    )
-                    + "\n"
-                )
+                stream.write(legacy_storage_json_text(payload) + "\n")
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, self._state_path)
@@ -511,12 +499,7 @@ class SQLiteSnapshotStore:
             (
                 snapshot.trace_id,
                 snapshot.sequence,
-                json.dumps(
-                    self._codec.encode(snapshot),
-                    ensure_ascii=True,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
+                legacy_storage_json_text(self._codec.encode(snapshot)),
             ),
         )
 
@@ -633,25 +616,11 @@ def _context_with_sequence(
 
 
 def _snapshot_hash(payload: Mapping[str, Any]) -> str:
-    encoded = json.dumps(
-        payload,
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return hashlib.sha256(legacy_audit_json_bytes(payload)).hexdigest()
 
 
 def _snapshot_signature(payload: Mapping[str, Any], key: bytes) -> str:
-    encoded = json.dumps(
-        payload,
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-    return hmac.new(key, encoded, hashlib.sha256).hexdigest()
+    return hmac.new(key, legacy_audit_json_bytes(payload), hashlib.sha256).hexdigest()
 
 
 def _fsync_directory(path: Path) -> None:
