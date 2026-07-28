@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Protocol
 
 from ._internal.runtime.blocking import (
+    current_extension_shutdown_signal,
     extension_lifecycle_scope,
     invoke_extension,
     schedule_extension_cleanup,
@@ -191,6 +192,7 @@ class _SpanEntry:
     ready: asyncio.Future[_SpanHandle] | None = None
     legacy_terminal: asyncio.Future[None] | None = None
     legacy_terminal_signal: threading.Event | None = None
+    legacy_shutdown_signal: threading.Event | None = None
     native_start: bool = False
     start_result_awaitable: bool = False
     handle: _SpanHandle | None = None
@@ -371,6 +373,10 @@ class OpenTelemetryMiddleware(ObservingMiddleware):
             entry = _SpanEntry(
                 owner_loop=asyncio.get_running_loop(),
                 owner_context=copy_context(),
+                legacy_shutdown_signal=(
+                    current_extension_shutdown_signal()
+                    or self._extension_shutdown_signal
+                ),
             )
             start_span = getattr(self._tracer, "start_span", None)
             if callable(start_span):
@@ -1015,7 +1021,7 @@ class OpenTelemetryMiddleware(ObservingMiddleware):
         """Wait for terminal work, waking promptly when runtime shutdown begins."""
 
         while not signal.wait(timeout=0.1):
-            shutdown = self._extension_shutdown_signal
+            shutdown = entry.legacy_shutdown_signal
             if shutdown is not None and shutdown.is_set():
                 self._signal_legacy_terminal(
                     entry, description="runtime shutdown interrupted legacy telemetry"

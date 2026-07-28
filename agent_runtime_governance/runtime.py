@@ -26,11 +26,13 @@ from ._internal.runtime.blocking import (
     install_blocking_runner,
     install_extension_cleanup_scheduler,
     install_extension_runner,
+    install_extension_shutdown_signal,
     is_extension_cleanup_active,
     is_extension_lifecycle_active,
     reset_blocking_runner,
     reset_extension_cleanup_scheduler,
     reset_extension_runner,
+    reset_extension_shutdown_signal,
 )
 from ._internal.runtime.context_boundaries import validate_middleware_transition
 from ._internal.runtime.daemon_executor import DaemonThreadPoolExecutor
@@ -220,6 +222,7 @@ class _ActiveOperation:
     cleanup_scheduler_token: Token[ExtensionCleanupScheduler | None]
     extension_runner_token: Token[ExtensionRunner | None]
     blocking_runner_token: Token[BlockingRunner | None]
+    shutdown_signal_token: Token[Event | None]
 
 
 class _ActionBindingError(RuntimeError):
@@ -765,6 +768,9 @@ class Runtime:
         blocking_runner_token = install_blocking_runner(
             partial(extension_scope.invoke, self._run_blocking_extension)
         )
+        shutdown_signal_token = install_extension_shutdown_signal(
+            self._extension_dispatcher.shutdown_signal
+        )
         return _ActiveOperation(
             task,
             reconciliation,
@@ -773,6 +779,7 @@ class Runtime:
             cleanup_scheduler_token,
             extension_runner_token,
             blocking_runner_token,
+            shutdown_signal_token,
         )
 
     def _end_active_operation(
@@ -783,6 +790,7 @@ class Runtime:
         reset_blocking_runner(operation.blocking_runner_token)
         reset_extension_runner(operation.extension_runner_token)
         reset_extension_cleanup_scheduler(operation.cleanup_scheduler_token)
+        reset_extension_shutdown_signal(operation.shutdown_signal_token)
         _ACTIVE_RUNTIME_IDS.reset(operation.context_token)
         task = operation.task
         if task is None:

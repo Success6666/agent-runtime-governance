@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
+from threading import Event
 from typing import Any, Awaitable, Callable, Iterator, TypeVar, cast
 
 T = TypeVar("T")
@@ -43,6 +44,10 @@ _EXTENSION_LIFECYCLE_TASK: ContextVar[asyncio.Task[Any] | None] = ContextVar(
 _MANAGED_BLOCKING_WORKER: ContextVar[bool] = ContextVar(
     "agent_runtime_governance_managed_blocking_worker",
     default=False,
+)
+_EXTENSION_SHUTDOWN_SIGNAL: ContextVar[Event | None] = ContextVar(
+    "agent_runtime_governance_extension_shutdown_signal",
+    default=None,
 )
 _STANDALONE_CLEANUP_TASKS: set[asyncio.Task[Any]] = set()
 
@@ -95,6 +100,24 @@ def reset_extension_runner(token: Token[ExtensionRunner | None]) -> None:
     """Restore the extension-runner binding for the current operation."""
 
     _EXTENSION_RUNNER.reset(token)
+
+
+def install_extension_shutdown_signal(signal: Event) -> Token[Event | None]:
+    """Bind the owning Runtime shutdown signal to one public operation."""
+
+    return _EXTENSION_SHUTDOWN_SIGNAL.set(signal)
+
+
+def reset_extension_shutdown_signal(token: Token[Event | None]) -> None:
+    """Restore the operation-local Runtime shutdown signal."""
+
+    _EXTENSION_SHUTDOWN_SIGNAL.reset(token)
+
+
+def current_extension_shutdown_signal() -> Event | None:
+    """Return the shutdown signal associated with the active Runtime operation."""
+
+    return _EXTENSION_SHUTDOWN_SIGNAL.get()
 
 
 def install_extension_cleanup_scheduler(

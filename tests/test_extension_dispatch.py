@@ -917,7 +917,14 @@ async def test_legacy_otel_manager_releases_on_runtime_shutdown_signal() -> None
 
 
 @pytest.mark.asyncio
-async def test_pipeline_replacement_rebinds_shared_legacy_otel_shutdown() -> None:
+@pytest.mark.parametrize(
+    ("owner_name", "rebinder_name"),
+    [("first", "second"), ("second", "first")],
+)
+async def test_shared_legacy_otel_worker_uses_its_runtime_shutdown_signal(
+    owner_name: str,
+    rebinder_name: str,
+) -> None:
     exited = threading.Event()
 
     class Span:
@@ -941,24 +948,33 @@ async def test_pipeline_replacement_rebinds_shared_legacy_otel_shutdown() -> Non
     middleware = OpenTelemetryMiddleware(LegacyTracer(), terminal_wait_seconds=1.0)
     first = Runtime([middleware])
     second = Runtime([middleware])
-    context = ExecutionContext.create(ToolCall("work"))
+    runtimes = {"first": first, "second": second}
+    owner = runtimes[owner_name]
+    rebinder = runtimes[rebinder_name]
+
+    @owner.tool()
+    def work() -> str:
+        return "ok"
 
     try:
-        first.pipeline = [middleware]
+        rebinder.pipeline = [middleware]
         assert (
             middleware._extension_shutdown_signal
-            is first._extension_dispatcher.shutdown_signal
+            is rebinder._extension_dispatcher.shutdown_signal
         )
         assert (
             middleware._extension_shutdown_signal
-            is not second._extension_dispatcher.shutdown_signal
+            is not owner._extension_dispatcher.shutdown_signal
         )
-        await middleware.process(context)
+        preview = await owner.apreview("work", replayable_only=False)
+        assert preview.status is ExecutionStatus.ALLOWED
+        assert middleware.active_span_count == 1
 
-        await first.aclose()
+        await asyncio.wait_for(owner.aclose(), timeout=1)
 
         assert await asyncio.wait_for(asyncio.to_thread(exited.wait, 1), timeout=1.1)
         await _wait_until(lambda: middleware.active_span_count == 0)
+        assert not rebinder._extension_dispatcher.shutdown_signal.is_set()
     finally:
         if not first._closed:
             await first.aclose()
