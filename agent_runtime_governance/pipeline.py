@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Iterator
 
+from ._pipeline_runner import MiddlewareRegistry
 from .middleware.base import Middleware
 
 
@@ -13,12 +14,11 @@ class Pipeline:
     middlewares: tuple[Middleware, ...] = ()
 
     def __init__(self, middlewares: Iterable[Middleware] = ()) -> None:
-        items = tuple(middlewares)
-        names = [item.name for item in items]
-        duplicates = sorted({name for name in names if names.count(name) > 1})
-        if duplicates:
-            raise ValueError(f"duplicate middleware names: {', '.join(duplicates)}")
-        object.__setattr__(self, "middlewares", items)
+        object.__setattr__(
+            self,
+            "middlewares",
+            MiddlewareRegistry(middlewares).middlewares,
+        )
 
     def __iter__(self) -> Iterator[Middleware]:
         return iter(self.middlewares)

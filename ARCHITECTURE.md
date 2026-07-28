@@ -11,6 +11,29 @@ Runtime = immutable ExecutionContext + ordered Pipeline + explicit Decision
 The runtime owns governance around tool execution. It does not own agent
 planning, model selection, prompts, or framework state.
 
+## v0.8 service boundaries
+
+`Runtime` is the stable public lifecycle facade. It owns sealing, public
+methods, deadlines, cancellation, and admission of potentially blocking work.
+Its internal services have one dependency direction:
+
+```text
+Runtime facade -> pipeline/lifecycle/durable services -> protocol-facing adapters
+```
+
+`Pipeline` remains an immutable public value whose explicit registration order
+is preserved. The internal `MiddlewareRegistry` validates middleware metadata
+and offers a deterministic priority view without silently reordering an
+existing Pipeline; `PipelineRunner` composes selected middleware through
+Runtime-owned callbacks. Extension dispatch is likewise internal and
+async-first. Concrete SQLite adapters are construction-boundary dependencies,
+not dependencies of reusable runtime services.
+
+Stable modules and public imports remain compatible through v0.8. Internal
+modules are prefixed with `_`; consumers must not depend on them. Any later
+audit, codec, protocol, or event extraction preserves its current public import
+paths and serialized compatibility contract. See [ADR 0006](docs/adr/0006-v08-runtime-service-boundaries.md).
+
 ## Invariants
 
 1. Identity and trace fields cannot be rewritten by middleware.

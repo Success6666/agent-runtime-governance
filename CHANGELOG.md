@@ -6,6 +6,10 @@ All notable changes are documented here.
 
 ### Added
 
+- Internal middleware registration and pipeline-composition seams. Public
+  `Pipeline` remains immutable and explicitly ordered; the v0.8 internal
+  registry validates metadata and exposes deterministic priority views without
+  changing public ordering semantics.
 - A Runtime-owned async-first extension dispatcher. Native async hooks, LLM
   reviewers, human-decision callbacks, audit/snapshot adapters,
   identity/precondition providers, and OPA/Slack adapters execute on the

@@ -36,6 +36,7 @@ from ._context_boundaries import validate_middleware_transition
 from ._daemon_executor import DaemonThreadPoolExecutor
 from ._extensions import ExtensionDispatchSnapshot, _ExtensionDispatcher
 from ._metadata import metadata_text as _metadata_text
+from ._pipeline_runner import PipelineRunner
 from ._serialization import thaw as _thaw
 from .action_contracts import ActionContract, BoundAction
 from .audit import reconciliation_event
@@ -269,6 +270,7 @@ class Runtime:
         self._pipeline = (
             pipeline if isinstance(pipeline, Pipeline) else Pipeline(pipeline)
         )
+        self._pipeline_runner = PipelineRunner(self._pipeline)
         self._hooks = hooks or HookRegistry()
         self._registry = ToolRegistry()
         self._idempotency_store = idempotency_store or InMemoryIdempotencyStore()
@@ -1020,9 +1022,11 @@ class Runtime:
     def pipeline(self, value: Pipeline | Iterable[Middleware]) -> None:
         with self._production_seal_lock:
             self._guard_sealed_mutation("pipeline")
-            self._pipeline = (
+            pipeline = (
                 value if isinstance(value, Pipeline) else Pipeline(value)
             )
+            self._pipeline = pipeline
+            self._pipeline_runner = PipelineRunner(pipeline)
 
     @property
     def hooks(self) -> HookRegistry:
@@ -3919,21 +3923,24 @@ class Runtime:
     async def _run_pre_pipeline(
         self, context: ExecutionContext, *, replayable_only: bool = False
     ) -> ExecutionContext:
-        for middleware in self.pipeline:
+        def include(middleware: Middleware, current: ExecutionContext) -> bool:
             if middleware.kind is MiddlewareKind.EXECUTION:
-                continue
+                return False
             if replayable_only and not middleware.metadata.replayable:
-                continue
-            if context.denied and middleware.kind is MiddlewareKind.GATING:
-                continue
+                return False
+            return not (current.denied and middleware.kind is MiddlewareKind.GATING)
+
+        async def invoke(
+            middleware: Middleware, current: ExecutionContext
+        ) -> ExecutionContext:
             try:
-                context = await self._emit_middleware_hook(
-                    middleware.name, context, before=True
+                current = await self._emit_middleware_hook(
+                    middleware.name, current, before=True
                 )
-                if context.denied and middleware.kind is MiddlewareKind.GATING:
-                    continue
+                if current.denied and middleware.kind is MiddlewareKind.GATING:
+                    return current
                 timeout = self._bounded_timeout(
-                    context.deadline,
+                    current.deadline,
                     (
                         self.limits.observer_timeout_seconds
                         if middleware.kind is MiddlewareKind.OBSERVING
@@ -3942,43 +3949,46 @@ class Runtime:
                     f"middleware:{middleware.name}",
                 )
                 candidate = await self._await_runtime_stage(
-                    middleware.process(context),
+                    middleware.process(current),
                     stage=f"middleware:{middleware.name}",
                     timeout_seconds=timeout,
                     cancellation_grace_seconds=self.limits.cancellation_grace_seconds,
                 )
-                context = validate_middleware_transition(
-                    context, candidate, middleware.kind
+                current = validate_middleware_transition(
+                    current, candidate, middleware.kind
                 )
-                context = await self._emit_middleware_hook(
-                    middleware.name, context, before=False
+                return await self._emit_middleware_hook(
+                    middleware.name, current, before=False
                 )
             except Exception as exc:
                 if middleware.kind is MiddlewareKind.OBSERVING:
-                    if self._is_critical_observer(middleware, context):
+                    if self._is_critical_observer(middleware, current):
                         decision = DecisionRecord(
                             DecisionOutcome.DENY,
                             f"critical observer {middleware.name!r} failed closed",
                             f"observer:{middleware.name}",
                         )
-                        context = context.with_decision(decision).append_history(
+                        return current.with_decision(decision).append_history(
                             HistoryEntry(middleware.name, "error", str(exc))
                         )
-                        continue
-                    context = context.append_history(
+                    return current.append_history(
                         HistoryEntry(
                             middleware.name, "error", f"observer ignored: {exc}"
                         )
                     )
-                    continue
                 decision = DecisionRecord(
                     DecisionOutcome.DENY,
                     f"gating middleware {middleware.name!r} failed closed",
                     "runtime",
                 )
-                context = context.with_decision(decision).append_history(
+                return current.with_decision(decision).append_history(
                     HistoryEntry(middleware.name, "error", str(exc))
                 )
+        context = await self._pipeline_runner.run(
+            context,
+            invoke=invoke,
+            include=include,
+        )
         if not context.denied:
             context = context.evolve(status=ExecutionStatus.ALLOWED)
         return context
