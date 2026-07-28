@@ -4,7 +4,7 @@ import inspect
 from threading import Event
 
 import pytest
-from prometheus_client import CollectorRegistry
+from prometheus_client import CollectorRegistry, generate_latest
 
 from agent_runtime_governance import Pipeline as PublicPipeline
 from agent_runtime_governance._pipeline_runner import MiddlewareRegistry, PipelineRunner
@@ -85,10 +85,12 @@ def test_pipeline_replacement_rebinds_current_extension_integrations() -> None:
         runtime.pipeline = [metrics, telemetry]
         runtime.pipeline = [metrics, telemetry]
 
-        assert runtime._extension_dispatcher._observers == [metrics]
+        assert len(runtime._extension_dispatcher._observers) == 1
+        assert runtime._extension_dispatcher._observers[0] is not metrics
         assert metrics._extension_snapshot().worker_capacity == (
             runtime.extension_dispatch_snapshot.worker_capacity
         )
+        assert removed_metrics._extension_snapshot().worker_capacity == 0
         assert telemetry.shutdown_signals == [
             runtime._extension_dispatcher.shutdown_signal
         ] * 2
@@ -116,6 +118,25 @@ def test_runtime_accepts_unhashable_opentelemetry_subclasses() -> None:
         )
     finally:
         runtime.close()
+
+
+def test_runtime_close_detaches_prometheus_dispatch_snapshot() -> None:
+    registry = CollectorRegistry()
+    metrics = PrometheusMiddleware(
+        registry=registry,
+        prefix="closed_pipeline_rebind",
+    )
+    runtime = Runtime([metrics])
+
+    runtime.close()
+
+    snapshot = metrics._extension_snapshot()
+    assert snapshot.worker_capacity == 0
+    assert snapshot.in_flight_capacity == 0
+    assert (
+        'closed_pipeline_rebind_extension_dispatch_workers{state="capacity"} 0.0'
+        in generate_latest(registry).decode()
+    )
 
 
 def test_registry_preserves_public_pipeline_registration_order() -> None:

@@ -967,6 +967,135 @@ async def test_pipeline_replacement_rebinds_shared_legacy_otel_shutdown() -> Non
 
 
 @pytest.mark.asyncio
+async def test_pipeline_removal_detaches_prometheus_live_dispatch_metrics() -> None:
+    removed_registry = CollectorRegistry()
+    current_registry = CollectorRegistry()
+    removed = PrometheusMiddleware(
+        registry=removed_registry,
+        prefix="removed_dispatch_binding",
+    )
+    current = PrometheusMiddleware(
+        registry=current_registry,
+        prefix="current_dispatch_binding",
+    )
+    runtime = Runtime(
+        [removed],
+        limits=RuntimeLimits(
+            max_blocking_extension_workers=1,
+            max_blocking_extension_in_flight=1,
+        ),
+    )
+    entered = threading.Event()
+    release = threading.Event()
+
+    def block() -> None:
+        entered.set()
+        assert release.wait(timeout=1)
+
+    async def native() -> None:
+        return None
+
+    task = asyncio.create_task(runtime._run_blocking_extension(block))
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 1), timeout=1.1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await _wait_until(
+            lambda: runtime.extension_dispatch_snapshot.detached_sync_work == 1
+        )
+        assert "removed_dispatch_binding_extension_dispatch_detached_work 1.0" in (
+            generate_latest(removed_registry).decode()
+        )
+
+        runtime.pipeline = [current]
+        runtime.pipeline = [current]
+
+        removed_snapshot = removed._extension_snapshot()
+        assert removed_snapshot.worker_capacity == 0
+        assert removed_snapshot.in_flight_capacity == 0
+        assert removed_snapshot.detached_sync_work == 0
+        removed_output = generate_latest(removed_registry).decode()
+        assert "removed_dispatch_binding_extension_dispatch_detached_work 0.0" in (
+            removed_output
+        )
+
+        await runtime._invoke_extension(native)
+
+        current_output = generate_latest(current_registry).decode()
+        removed_output = generate_latest(removed_registry).decode()
+        assert (
+            'current_dispatch_binding_extension_dispatch_execution_seconds_count{mode="async"} 1.0'
+            in current_output
+        )
+        assert (
+            'removed_dispatch_binding_extension_dispatch_execution_seconds_count{mode="async"}'
+            not in removed_output
+        )
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        if not runtime._closed:
+            await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_shared_prometheus_middleware_aggregates_active_runtime_snapshots() -> None:
+    registry = CollectorRegistry()
+    metrics = PrometheusMiddleware(
+        registry=registry,
+        prefix="shared_dispatch_binding",
+    )
+    first = Runtime(
+        [metrics],
+        limits=RuntimeLimits(
+            max_blocking_extension_workers=2,
+            max_blocking_extension_in_flight=2,
+        ),
+    )
+    second = Runtime(
+        [metrics],
+        limits=RuntimeLimits(
+            max_blocking_extension_workers=1,
+            max_blocking_extension_in_flight=1,
+        ),
+    )
+    entered = threading.Event()
+    release = threading.Event()
+
+    def block() -> None:
+        entered.set()
+        assert release.wait(timeout=1)
+
+    task = asyncio.create_task(second._run_blocking_extension(block))
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 1), timeout=1.1)
+
+        combined = metrics._extension_snapshot()
+        assert combined.worker_capacity == 3
+        assert combined.in_flight_capacity == 3
+        assert combined.active_workers == 1
+
+        first.close()
+
+        remaining = metrics._extension_snapshot()
+        assert remaining.worker_capacity == 1
+        assert remaining.in_flight_capacity == 1
+        assert remaining.active_workers == 1
+        assert (
+            'shared_dispatch_binding_extension_dispatch_workers{state="capacity"} 1.0'
+            in generate_latest(registry).decode()
+        )
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        if not first._closed:
+            await first.aclose()
+        if not second._closed:
+            await second.aclose()
+
+
+@pytest.mark.asyncio
 async def test_cancelled_sync_extension_remains_visible_until_aclose_waits_for_it() -> None:
     runtime = Runtime(
         limits=RuntimeLimits(

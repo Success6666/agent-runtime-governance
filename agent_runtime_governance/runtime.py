@@ -301,6 +301,7 @@ class Runtime:
             admission_lock=self._lifecycle_lock,
             is_accepting=self._is_extension_dispatch_accepting,
         )
+        self._extension_dispatch_metrics_bindings: dict[int, tuple[Any, Any]] = {}
         self._bind_extension_dispatch_metrics()
         self._bind_extension_dispatch_lifecycle()
         self._owns_idempotency_executor = idempotency_executor is None
@@ -895,6 +896,7 @@ class Runtime:
                 raise RuntimeError("runtime is closed")
 
     def _shutdown_executors(self, *, wait: bool) -> None:
+        self._detach_extension_dispatch_metrics()
         if self._owns_reconciliation_audit_executor:
             # A synchronous third-party sink cannot be force-cancelled once it
             # has entered a blocking write. This dedicated executor has daemon
@@ -952,14 +954,51 @@ class Runtime:
 
         from .plugins.prometheus import PrometheusMiddleware
 
-        observers = []
+        current: dict[int, PrometheusMiddleware] = {}
         for middleware in self._pipeline:
             if isinstance(middleware, PrometheusMiddleware):
+                current.setdefault(id(middleware), middleware)
+
+        next_bindings: dict[int, tuple[Any, Any]] = {}
+        observers = []
+        for middleware_id, middleware in current.items():
+            previous = self._extension_dispatch_metrics_bindings.get(middleware_id)
+            if previous is not None and previous[0] is middleware:
+                observer = previous[1]
+            else:
+                if previous is not None:
+                    previous[0]._unbind_extension_dispatch_snapshot(
+                        owner=self._extension_dispatcher
+                    )
                 middleware._bind_extension_dispatch_snapshot(
-                    self._extension_dispatcher.snapshot
+                    self._extension_dispatcher.snapshot,
+                    owner=self._extension_dispatcher,
                 )
-                observers.append(middleware)
+                observer = middleware._extension_dispatch_observer(
+                    owner=self._extension_dispatcher
+                )
+            next_bindings[middleware_id] = (middleware, observer)
+            observers.append(observer)
+
         self._extension_dispatcher.replace_observers(observers)
+        for middleware_id, (middleware, _observer) in (
+            self._extension_dispatch_metrics_bindings.items()
+        ):
+            if middleware_id not in next_bindings:
+                middleware._unbind_extension_dispatch_snapshot(
+                    owner=self._extension_dispatcher
+                )
+        self._extension_dispatch_metrics_bindings = next_bindings
+
+    def _detach_extension_dispatch_metrics(self) -> None:
+        """Drop live metrics bindings before this Runtime's dispatcher closes."""
+
+        self._extension_dispatcher.replace_observers(())
+        for middleware, _observer in self._extension_dispatch_metrics_bindings.values():
+            middleware._unbind_extension_dispatch_snapshot(
+                owner=self._extension_dispatcher
+            )
+        self._extension_dispatch_metrics_bindings = {}
 
     def _bind_extension_dispatch_lifecycle(self) -> None:
         """Expose Runtime shutdown only to the built-in legacy OTel bridge."""

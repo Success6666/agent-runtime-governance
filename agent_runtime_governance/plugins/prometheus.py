@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import weakref
 from collections.abc import Callable, Iterator
+from threading import Lock
 from typing import Any
 
 from .._extensions import ExtensionDispatchSnapshot
@@ -57,6 +58,41 @@ class _ExtensionDispatchSnapshotCollector:
 
     def describe(self) -> Iterator[Any]:
         return iter(())
+
+
+class _ExtensionDispatchMetricsObserver:
+    """Route one Runtime's dispatcher callbacks to shared Prometheus metrics."""
+
+    def __init__(self, middleware: "PrometheusMiddleware", owner: object) -> None:
+        self._middleware = weakref.ref(middleware)
+        self._owner = weakref.ref(owner)
+
+    def record_queue_wait(self, *, mode: str, seconds: float) -> None:
+        binding = self._binding()
+        if binding is not None:
+            binding[0]._record_extension_queue_wait(binding[1], mode, seconds)
+
+    def record_execution(self, *, mode: str, seconds: float) -> None:
+        binding = self._binding()
+        if binding is not None:
+            binding[0]._record_extension_execution(binding[1], mode, seconds)
+
+    def record_saturation(self, *, mode: str) -> None:
+        binding = self._binding()
+        if binding is not None:
+            binding[0]._record_extension_saturation(binding[1], mode)
+
+    def record_detached_work(self, *, count: int) -> None:
+        binding = self._binding()
+        if binding is not None:
+            binding[0]._record_extension_detached_work(binding[1], count)
+
+    def _binding(self) -> tuple["PrometheusMiddleware", object] | None:
+        middleware = self._middleware()
+        owner = self._owner()
+        if middleware is None or owner is None:
+            return None
+        return middleware, owner
 
 
 class PrometheusMiddleware(ObservingMiddleware):
@@ -119,7 +155,14 @@ class PrometheusMiddleware(ObservingMiddleware):
             "Synchronous extension calls still running after caller cancellation.",
             registry=target_registry,
         )
+        self._extension_binding_lock = Lock()
         self._extension_snapshot_provider: weakref.WeakMethod[Any] | None = None
+        self._extension_snapshot_providers: weakref.WeakKeyDictionary[
+            object, weakref.WeakMethod[Any]
+        ] = weakref.WeakKeyDictionary()
+        self._extension_detached_counts: weakref.WeakKeyDictionary[object, int] = (
+            weakref.WeakKeyDictionary()
+        )
         self._extension_dispatch_collector = _ExtensionDispatchSnapshotCollector(
             middleware=self,
             prefix=prefix,
@@ -166,10 +209,32 @@ class PrometheusMiddleware(ObservingMiddleware):
     def _bind_extension_dispatch_snapshot(
         self,
         snapshot_provider: Callable[[], ExtensionDispatchSnapshot],
+        *,
+        owner: object | None = None,
     ) -> None:
         """Receive only a weak, observation-only view of dispatcher capacity."""
 
-        self._extension_snapshot_provider = weakref.WeakMethod(snapshot_provider)
+        provider = weakref.WeakMethod(snapshot_provider)
+        with self._extension_binding_lock:
+            if owner is None:
+                self._extension_snapshot_provider = provider
+            else:
+                self._extension_snapshot_providers[owner] = provider
+
+    def _unbind_extension_dispatch_snapshot(self, *, owner: object) -> None:
+        """Remove one Runtime's live capacity view and detached-work state."""
+
+        with self._extension_binding_lock:
+            self._extension_snapshot_providers.pop(owner, None)
+            self._extension_detached_counts.pop(owner, None)
+            self._refresh_detached_work_gauge()
+
+    def _extension_dispatch_observer(
+        self, *, owner: object
+    ) -> _ExtensionDispatchMetricsObserver:
+        """Create an owner-scoped observer without retaining the Runtime."""
+
+        return _ExtensionDispatchMetricsObserver(self, owner)
 
     def record_queue_wait(self, *, mode: str, seconds: float) -> None:
         self.extension_dispatch_queue_wait.labels(mode).observe(seconds)
@@ -184,12 +249,46 @@ class PrometheusMiddleware(ObservingMiddleware):
         self.extension_dispatch_detached_work.set(count)
 
     def _extension_snapshot(self) -> ExtensionDispatchSnapshot:
-        provider = (
-            None
-            if self._extension_snapshot_provider is None
-            else self._extension_snapshot_provider()
+        with self._extension_binding_lock:
+            providers = [self._extension_snapshot_provider]
+            providers.extend(self._extension_snapshot_providers.values())
+            snapshots = []
+            for provider_ref in providers:
+                provider = None if provider_ref is None else provider_ref()
+                if provider is not None:
+                    snapshots.append(provider())
+        return _merge_extension_snapshots(snapshots)
+
+    def _record_extension_queue_wait(
+        self, owner: object, mode: str, seconds: float
+    ) -> None:
+        with self._extension_binding_lock:
+            if owner in self._extension_snapshot_providers:
+                self.extension_dispatch_queue_wait.labels(mode).observe(seconds)
+
+    def _record_extension_execution(
+        self, owner: object, mode: str, seconds: float
+    ) -> None:
+        with self._extension_binding_lock:
+            if owner in self._extension_snapshot_providers:
+                self.extension_dispatch_execution.labels(mode).observe(seconds)
+
+    def _record_extension_saturation(self, owner: object, mode: str) -> None:
+        with self._extension_binding_lock:
+            if owner in self._extension_snapshot_providers:
+                self.extension_dispatch_saturation.labels(mode).inc()
+
+    def _record_extension_detached_work(self, owner: object, count: int) -> None:
+        with self._extension_binding_lock:
+            if owner not in self._extension_snapshot_providers:
+                return
+            self._extension_detached_counts[owner] = count
+            self._refresh_detached_work_gauge()
+
+    def _refresh_detached_work_gauge(self) -> None:
+        self.extension_dispatch_detached_work.set(
+            sum(self._extension_detached_counts.values())
         )
-        return _EMPTY_EXTENSION_SNAPSHOT if provider is None else provider()
 
     def _record_external_failures(self, context: ExecutionContext) -> None:
         for entry in context.history:
@@ -222,3 +321,24 @@ class PrometheusPlugin:
 def _safe_label(value: str) -> str:
     cleaned = "_".join(str(value).strip().lower().split())[:64]
     return cleaned or "unknown"
+
+
+def _merge_extension_snapshots(
+    snapshots: list[ExtensionDispatchSnapshot],
+) -> ExtensionDispatchSnapshot:
+    if not snapshots:
+        return _EMPTY_EXTENSION_SNAPSHOT
+    return ExtensionDispatchSnapshot(
+        worker_capacity=sum(snapshot.worker_capacity for snapshot in snapshots),
+        in_flight_capacity=sum(
+            snapshot.in_flight_capacity for snapshot in snapshots
+        ),
+        active_workers=sum(snapshot.active_workers for snapshot in snapshots),
+        in_flight=sum(snapshot.in_flight for snapshot in snapshots),
+        executor_queued=sum(snapshot.executor_queued for snapshot in snapshots),
+        admission_waiters=sum(snapshot.admission_waiters for snapshot in snapshots),
+        detached_sync_work=sum(
+            snapshot.detached_sync_work for snapshot in snapshots
+        ),
+        saturated=any(snapshot.saturated for snapshot in snapshots),
+    )
