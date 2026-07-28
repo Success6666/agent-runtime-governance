@@ -167,6 +167,44 @@ async def test_extension_dispatcher_isolates_metrics_observer_errors() -> None:
         dispatcher.shutdown(wait=True)
 
 
+def test_extension_dispatcher_replaces_observers_by_identity() -> None:
+    class Observer:
+        def __init__(self) -> None:
+            self.queue_wait_calls = 0
+
+        def record_queue_wait(self, **_kwargs: object) -> None:
+            self.queue_wait_calls += 1
+
+        def record_execution(self, **_kwargs: object) -> None:
+            pass
+
+        def record_saturation(self, **_kwargs: object) -> None:
+            pass
+
+        def record_detached_work(self, **_kwargs: object) -> None:
+            pass
+
+    dispatcher = _ExtensionDispatcher(
+        max_workers=1,
+        max_in_flight=1,
+        capacity_timeout_seconds=1.0,
+        admission_lock=threading.Lock(),
+        is_accepting=lambda: True,
+    )
+    removed = Observer()
+    current = Observer()
+    try:
+        dispatcher.add_observer(removed)  # type: ignore[arg-type]
+        dispatcher.replace_observers([current, current])  # type: ignore[list-item]
+        dispatcher._notify("record_queue_wait", mode="sync", seconds=0.0)
+
+        assert dispatcher._observers == [current]
+        assert removed.queue_wait_calls == 0
+        assert current.queue_wait_calls == 1
+    finally:
+        dispatcher.shutdown(wait=True)
+
+
 @pytest.mark.asyncio
 async def test_extension_dispatcher_rejects_new_work_after_shutdown() -> None:
     dispatcher = _ExtensionDispatcher(

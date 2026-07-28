@@ -15,6 +15,7 @@ from threading import Event, Lock, Thread, current_thread
 from time import perf_counter
 from typing import Any, Awaitable, Callable, Iterable, Mapping, ParamSpec, TypeVar
 from uuid import uuid4
+from weakref import WeakSet
 
 from ._blocking import (
     BlockingRunner,
@@ -301,6 +302,7 @@ class Runtime:
             admission_lock=self._lifecycle_lock,
             is_accepting=self._is_extension_dispatch_accepting,
         )
+        self._extension_dispatch_lifecycle_bindings: WeakSet[Any] = WeakSet()
         self._bind_extension_dispatch_metrics()
         self._bind_extension_dispatch_lifecycle()
         self._owns_idempotency_executor = idempotency_executor is None
@@ -952,12 +954,14 @@ class Runtime:
 
         from .plugins.prometheus import PrometheusMiddleware
 
+        observers = []
         for middleware in self._pipeline:
             if isinstance(middleware, PrometheusMiddleware):
                 middleware._bind_extension_dispatch_snapshot(
                     self._extension_dispatcher.snapshot
                 )
-                self._extension_dispatcher.add_observer(middleware)
+                observers.append(middleware)
+        self._extension_dispatcher.replace_observers(observers)
 
     def _bind_extension_dispatch_lifecycle(self) -> None:
         """Expose Runtime shutdown only to the built-in legacy OTel bridge."""
@@ -966,9 +970,12 @@ class Runtime:
 
         for middleware in self._pipeline:
             if isinstance(middleware, OpenTelemetryMiddleware):
+                if middleware in self._extension_dispatch_lifecycle_bindings:
+                    continue
                 middleware._bind_extension_shutdown_signal(
                     self._extension_dispatcher.shutdown_signal
                 )
+                self._extension_dispatch_lifecycle_bindings.add(middleware)
 
     @property
     def reconciliation_ledger_healthy(self) -> bool:
@@ -1027,6 +1034,8 @@ class Runtime:
             )
             self._pipeline = pipeline
             self._pipeline_runner = PipelineRunner(pipeline)
+            self._bind_extension_dispatch_metrics()
+            self._bind_extension_dispatch_lifecycle()
 
     @property
     def hooks(self) -> HookRegistry:

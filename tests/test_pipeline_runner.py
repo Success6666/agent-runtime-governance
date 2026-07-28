@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import inspect
+from threading import Event
 
 import pytest
+from prometheus_client import CollectorRegistry
 
 from agent_runtime_governance import Pipeline as PublicPipeline
 from agent_runtime_governance._pipeline_runner import MiddlewareRegistry, PipelineRunner
@@ -15,7 +17,9 @@ from agent_runtime_governance.middleware.base import (
 )
 from agent_runtime_governance.middleware.llm import LLMMiddleware
 from agent_runtime_governance.pipeline import Pipeline
+from agent_runtime_governance.plugins.prometheus import PrometheusMiddleware
 from agent_runtime_governance.runtime import Runtime
+from agent_runtime_governance.telemetry import OpenTelemetryMiddleware
 
 
 class NamedMiddleware(Middleware):
@@ -49,6 +53,47 @@ def test_pipeline_public_api_signature_snapshot_is_preserved() -> None:
         for name in expected_signatures
     } == expected_signatures
     assert tuple(inspect.signature(Runtime.pipeline.fset).parameters) == ("self", "value")
+
+
+def test_pipeline_replacement_rebinds_current_extension_integrations() -> None:
+    class Tracer:
+        def start_span(self, name: str, *, attributes: dict[str, object]) -> object:
+            raise AssertionError(f"unexpected span: {name} {attributes}")
+
+    removed_metrics = PrometheusMiddleware(
+        registry=CollectorRegistry(),
+        prefix="pipeline_removed",
+    )
+    metrics = PrometheusMiddleware(
+        registry=CollectorRegistry(),
+        prefix="pipeline_rebind",
+    )
+
+    class TrackingOpenTelemetryMiddleware(OpenTelemetryMiddleware):
+        def __init__(self) -> None:
+            super().__init__(Tracer())
+            self.shutdown_signals: list[Event] = []
+
+        def _bind_extension_shutdown_signal(self, signal: Event) -> None:
+            self.shutdown_signals.append(signal)
+            super()._bind_extension_shutdown_signal(signal)
+
+    telemetry = TrackingOpenTelemetryMiddleware()
+    runtime = Runtime([removed_metrics])
+
+    try:
+        runtime.pipeline = [metrics, telemetry]
+        runtime.pipeline = [metrics, telemetry]
+
+        assert runtime._extension_dispatcher._observers == [metrics]
+        assert metrics._extension_snapshot().worker_capacity == (
+            runtime.extension_dispatch_snapshot.worker_capacity
+        )
+        assert telemetry.shutdown_signals == [
+            runtime._extension_dispatcher.shutdown_signal
+        ]
+    finally:
+        runtime.close()
 
 
 def test_registry_preserves_public_pipeline_registration_order() -> None:
