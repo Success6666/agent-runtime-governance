@@ -42,6 +42,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "build>=1.2",
+  "cryptography>=46,<50",
   "PyYAML>=6.0",
   "prometheus-client>=0.20",
   "hypothesis>=6.100",
@@ -52,6 +53,7 @@ dev = [
   "pytest-timeout>=2.3",
   "ruff>=0.12",
 ]
+evidence = ["cryptography>=46,<50"]
 langgraph = ["langgraph>=0.2"]
 openai-agents = ["openai-agents>=0.2"]
 otel = [

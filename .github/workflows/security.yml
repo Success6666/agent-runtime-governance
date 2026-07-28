@@ -31,7 +31,7 @@ jobs:
         run: |
           python -m venv /tmp/dependency-audit
           /tmp/dependency-audit/bin/python -m pip install --upgrade "pip>=26.1.2"
-          /tmp/dependency-audit/bin/python -m pip install ".[otel,yaml,prometheus]" "pip-audit==2.10.1"
+          /tmp/dependency-audit/bin/python -m pip install ".[evidence,otel,yaml,prometheus]" "pip-audit==2.10.1"
           /tmp/dependency-audit/bin/python -m pip_audit
 
   codeql:
