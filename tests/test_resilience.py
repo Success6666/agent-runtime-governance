@@ -36,6 +36,8 @@ def test_runtime_limits_reject_invalid_values() -> None:
         RuntimeLimits(max_reconciliation_audit_delivery_in_flight=0)
     with pytest.raises(ValueError):
         RuntimeLimits(max_blocking_extension_in_flight=0)
+    with pytest.raises(ValueError):
+        RuntimeLimits(max_blocking_extension_workers=0)
 
 
 def test_runtime_limits_preserve_v06_positional_argument_order() -> None:
@@ -72,6 +74,7 @@ def test_runtime_limits_preserve_v07_appended_positional_argument_order() -> Non
         14,
         15,
         16,
+        17.0,
     )
 
     assert (
@@ -84,7 +87,7 @@ def test_runtime_limits_preserve_v07_appended_positional_argument_order() -> Non
         limits.max_blocking_extension_in_flight,
         limits.max_blocking_extension_workers,
     ) == (9.0, 10.0, 11.0, 12.0, 13, 14, 15, 16)
-    assert limits.sync_loop_startup_timeout_seconds == 5.0
+    assert limits.sync_loop_startup_timeout_seconds == 17.0
 
 
 @pytest.mark.asyncio
@@ -243,4 +246,15 @@ async def test_circuit_breaker_releases_cancelled_async_recovery_probe(
         await probe
 
     assert await breaker.acall(lambda: "recovered") == "recovered"
+    assert breaker.state is CircuitState.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_records_success_after_an_async_result() -> None:
+    breaker = CircuitBreaker(failure_threshold=1)
+
+    async def succeed() -> str:
+        return "ok"
+
+    assert await breaker.acall(succeed) == "ok"
     assert breaker.state is CircuitState.CLOSED

@@ -65,6 +65,18 @@ def test_prometheus_records_unknown_mutating_outcome() -> None:
     assert 'unknown_arg_tool_calls_total{risk_tier="LOW",status="unknown",tool="work"} 1.0' in output
 
 
+def test_prometheus_records_extension_dispatch_pressure() -> None:
+    registry = CollectorRegistry()
+    middleware = PrometheusMiddleware(registry=registry, prefix="dispatch_arg")
+
+    middleware.record_saturation(mode="sync")
+    middleware.record_detached_work(count=2)
+
+    output = generate_latest(registry).decode()
+    assert 'dispatch_arg_extension_dispatch_saturation_total{mode="sync"} 1.0' in output
+    assert "dispatch_arg_extension_dispatch_detached_work 2.0" in output
+
+
 @pytest.mark.parametrize(
     "url",
     [
