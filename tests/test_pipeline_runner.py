@@ -4,11 +4,13 @@ import pytest
 
 from agent_runtime_governance._pipeline_runner import MiddlewareRegistry, PipelineRunner
 from agent_runtime_governance.context import ExecutionContext, ToolCall
+from agent_runtime_governance.decisions import DecisionOutcome, DecisionRecord
 from agent_runtime_governance.middleware.base import (
     Middleware,
     MiddlewareKind,
     MiddlewareMetadata,
 )
+from agent_runtime_governance.middleware.llm import LLMMiddleware
 from agent_runtime_governance.pipeline import Pipeline
 from agent_runtime_governance.runtime import Runtime
 
@@ -50,6 +52,30 @@ def test_registry_rejects_duplicate_names_after_metadata_validation() -> None:
         MiddlewareRegistry([NamedMiddleware("duplicate"), NamedMiddleware("duplicate")])
 
 
+def test_registry_rejects_non_middleware_entries() -> None:
+    with pytest.raises(TypeError, match="pipeline entries"):
+        MiddlewareRegistry([object()])  # type: ignore[list-item]
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value", "message"),
+    [
+        ("name", "", "name"),
+        ("kind", "observing", "kind"),
+        ("priority", True, "priority"),
+        ("replayable", "yes", "replayable"),
+    ],
+)
+def test_registry_rejects_invalid_public_middleware_state(
+    attribute: str, value: object, message: str
+) -> None:
+    middleware = NamedMiddleware("valid")
+    setattr(middleware, attribute, value)
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        MiddlewareRegistry([middleware])
+
+
 def test_registry_rejects_malformed_metadata() -> None:
     class InvalidMiddleware(NamedMiddleware):
         @property
@@ -62,6 +88,43 @@ def test_registry_rejects_malformed_metadata() -> None:
 
     with pytest.raises(TypeError, match="priority"):
         MiddlewareRegistry([InvalidMiddleware("invalid")])
+
+
+@pytest.mark.parametrize(
+    ("metadata", "message"),
+    [
+        (object(), "MiddlewareMetadata"),
+        (MiddlewareMetadata("", MiddlewareKind.OBSERVING), "name"),
+        (
+            MiddlewareMetadata("valid", "observing"),  # type: ignore[arg-type]
+            "kind",
+        ),
+        (
+            MiddlewareMetadata("valid", MiddlewareKind.OBSERVING, priority=True),
+            "priority",
+        ),
+        (
+            MiddlewareMetadata(
+                "valid", MiddlewareKind.OBSERVING, replayable="yes"
+            ),  # type: ignore[arg-type]
+            "replayable",
+        ),
+        (
+            MiddlewareMetadata("valid", MiddlewareKind.OBSERVING, version=""),
+            "version",
+        ),
+    ],
+)
+def test_registry_rejects_invalid_metadata_values(
+    metadata: object, message: str
+) -> None:
+    class InvalidMetadataMiddleware(NamedMiddleware):
+        @property
+        def metadata(self) -> MiddlewareMetadata:
+            return metadata  # type: ignore[return-value]
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        MiddlewareRegistry([InvalidMetadataMiddleware("valid")])
 
 
 @pytest.mark.parametrize(
@@ -122,6 +185,28 @@ async def test_runner_uses_runtime_owned_callback_and_selection() -> None:
 
 
 @pytest.mark.asyncio
+async def test_runner_accepts_a_prevalidated_registry_and_defaults_to_all_entries() -> None:
+    first = NamedMiddleware("first")
+    second = NamedMiddleware("second")
+    registry = MiddlewareRegistry([first, second])
+    runner = PipelineRunner(registry)
+    context = ExecutionContext.create(ToolCall("work"))
+    calls: list[str] = []
+
+    async def invoke(
+        middleware: Middleware, current: ExecutionContext
+    ) -> ExecutionContext:
+        calls.append(middleware.name)
+        return current
+
+    assert await runner.run(context, invoke=invoke) is context
+    assert runner.registry is registry
+    assert registry.of_kind(MiddlewareKind.OBSERVING) == (first, second)
+    with pytest.raises(TypeError, match="MiddlewareKind"):
+        registry.of_kind("observing")  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
 async def test_runtime_runner_tracks_replaced_pipeline_and_public_order() -> None:
     calls: list[str] = []
 
@@ -145,3 +230,75 @@ async def test_runtime_runner_tracks_replaced_pipeline_and_public_order() -> Non
     assert calls == ["first", "second"]
     assert runtime.pipeline.names == ("first", "second")
     assert runtime._pipeline_runner.registry.middlewares == (first, second)
+
+
+@pytest.mark.asyncio
+async def test_runtime_runner_filters_replay_only() -> None:
+    calls: list[str] = []
+
+    class RecordingGate(NamedMiddleware):
+        kind = MiddlewareKind.GATING
+
+        def __init__(self, name: str, *, replayable: bool = True) -> None:
+            super().__init__(name)
+            self.replayable = replayable
+
+        async def process(self, context: ExecutionContext) -> ExecutionContext:
+            calls.append(self.name)
+            return context
+
+    runtime = Runtime(
+        [
+            RecordingGate("replayable"),
+            RecordingGate("non_replayable", replayable=False),
+        ]
+    )
+    context = ExecutionContext.create(ToolCall("work"))
+
+    result = await runtime._run_pre_pipeline(context, replayable_only=True)
+
+    assert calls == ["replayable"]
+    assert result is not context
+
+
+@pytest.mark.asyncio
+async def test_runtime_runner_skips_later_gates_after_denial() -> None:
+    calls: list[str] = []
+
+    class DenyingGate(NamedMiddleware):
+        kind = MiddlewareKind.GATING
+
+        async def process(self, context: ExecutionContext) -> ExecutionContext:
+            calls.append(self.name)
+            return context.with_decision(
+                DecisionRecord(DecisionOutcome.DENY, "blocked", self.name)
+            )
+
+    class RecordingGate(NamedMiddleware):
+        kind = MiddlewareKind.GATING
+
+        async def process(self, context: ExecutionContext) -> ExecutionContext:
+            calls.append(self.name)
+            return context
+
+    runtime = Runtime([DenyingGate("deny"), RecordingGate("must_not_run")])
+
+    result = await runtime._run_pre_pipeline(ExecutionContext.create(ToolCall("work")))
+
+    assert result.denied
+    assert calls == ["deny"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_runner_stops_a_gate_denied_by_its_before_hook() -> None:
+    reviewer_calls: list[ExecutionContext] = []
+    runtime = Runtime([LLMMiddleware(lambda context: reviewer_calls.append(context))])
+
+    @runtime.before_llm(critical=True)
+    def deny_before_llm(_context: ExecutionContext) -> None:
+        raise RuntimeError("required hook unavailable")
+
+    result = await runtime._run_pre_pipeline(ExecutionContext.create(ToolCall("work")))
+
+    assert result.denied
+    assert reviewer_calls == []
