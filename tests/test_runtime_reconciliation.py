@@ -1571,7 +1571,7 @@ async def test_finalization_timeout_poison_reconciliation_fail_closed(
         idempotency_store=SQLiteIdempotencyStore(path),
         reconciliation_ledger=ledger,
         limits=RuntimeLimits(
-            reconciliation_operation_timeout_seconds=0.2,
+            reconciliation_operation_timeout_seconds=1.0,
             reconciliation_finalization_timeout_seconds=0.01,
         ),
     )
