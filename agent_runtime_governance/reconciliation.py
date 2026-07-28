@@ -19,8 +19,12 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 import rfc8785
 
-from ._canonical import CanonicalJsonError, rfc8785_json_bytes, rfc8785_json_text
-from ._serialization import freeze_mapping, thaw
+from ._internal.serialization.canonical import (
+    CanonicalJsonError,
+    rfc8785_json_bytes,
+    rfc8785_json_text,
+)
+from ._internal.serialization.values import freeze_mapping, thaw
 from ._sqlite import (
     connect_sqlite,
     initialize_sqlite,

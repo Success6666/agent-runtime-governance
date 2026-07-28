@@ -6,7 +6,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Awaitable, Iterable, Mapping, Protocol
 
-from ._serialization import thaw as _thaw
+from ._internal.serialization.values import thaw as _thaw
 from .action_contracts import ActionContract
 from .context import ExecutionMode
 from .middleware.audit import AuditMiddleware

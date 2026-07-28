@@ -15,7 +15,7 @@ from pathlib import Path
 from time import perf_counter, sleep
 from typing import Any, Iterable
 
-from agent_runtime_governance._blocking import invoke_extension
+from agent_runtime_governance._internal.runtime.blocking import invoke_extension
 from agent_runtime_governance.action_contracts import ActionContract
 from agent_runtime_governance.audit import AuditSink
 from agent_runtime_governance.context import ExecutionMode

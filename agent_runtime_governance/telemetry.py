@@ -11,12 +11,15 @@ from contextvars import Context, copy_context
 from dataclasses import dataclass
 from typing import Any, Awaitable, Protocol
 
-from ._blocking import (
+from ._internal.runtime.blocking import (
     extension_lifecycle_scope,
     invoke_extension,
     schedule_extension_cleanup,
 )
-from ._extensions import is_native_async_callable, resolve_extension_result
+from ._internal.runtime.extensions import (
+    is_native_async_callable,
+    resolve_extension_result,
+)
 from .context import ExecutionContext, ExecutionStatus, HistoryEntry
 from .middleware.base import ObservingMiddleware
 

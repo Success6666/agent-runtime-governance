@@ -8,8 +8,8 @@ from typing import Any, Awaitable
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
-from .._blocking import invoke_extension
-from .._extensions import is_native_async_callable
+from .._internal.runtime.blocking import invoke_extension
+from .._internal.runtime.extensions import is_native_async_callable
 from ..context import ExecutionContext, ExecutionStatus, HistoryEntry
 from ..middleware.base import ObservingMiddleware
 from ..resilience import CircuitBreaker

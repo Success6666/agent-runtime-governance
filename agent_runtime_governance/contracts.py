@@ -9,7 +9,7 @@ from typing import Any, Callable
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError
 
-from ._canonical import legacy_contract_json_bytes
+from ._internal.serialization.canonical import legacy_contract_json_bytes
 from .errors import ContractValidationError, RegistryError
 
 

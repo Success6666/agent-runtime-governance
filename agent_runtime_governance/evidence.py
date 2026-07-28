@@ -17,7 +17,7 @@ from typing import Any, Mapping, Sequence
 
 from jsonschema import Draft202012Validator
 
-from ._canonical import CanonicalJsonError, rfc8785_json_bytes
+from ._internal.serialization.canonical import CanonicalJsonError, rfc8785_json_bytes
 from .action_contracts import BoundAction
 from .decisions import ApprovalRequest, DecisionOutcome, DecisionRecord
 
