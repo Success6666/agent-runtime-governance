@@ -4,7 +4,37 @@ All notable changes are documented here.
 
 ## [Unreleased]
 
-## [0.7.0] - Pending publication
+### Added
+
+- A Runtime-owned async-first extension dispatcher. Native async hooks, LLM
+  reviewers, human-decision callbacks, audit/snapshot adapters,
+  identity/precondition providers, and OPA/Slack adapters execute on the
+  caller event loop; synchronous adapters retain a managed worker fallback.
+- Read-only extension-dispatch capacity snapshots and optional low-cardinality
+  Prometheus metrics for queue wait, execution duration, saturation, detached
+  work, worker capacity/activity, and queue depth.
+- Cancellation-safe OpenTelemetry span admission and terminal cleanup. A span
+  started by a timed-out observer remains Runtime-owned until it is ended.
+- `Runtime.invoke()` now uses a Runtime-owned event loop while the Runtime is
+  open, so terminal cleanup admitted by a synchronous call survives after the
+  tool result returns and is coordinated by `aclose()`.
+
+### Changed
+
+- `RuntimeLimits.max_blocking_extension_workers` (default `4`) now controls
+  extension worker count independently from
+  `max_blocking_extension_in_flight` (default `16`), which bounds admitted
+  synchronous running and queued work. Timed-out synchronous work still holds
+  its permit until it exits, and `aclose()` still waits for it.
+- Audit, snapshot, identity, precondition, OPA, and Slack extension protocols
+  now accept awaitable adapter results without changing the synchronous durable
+  approval, idempotency, or reconciliation storage contracts.
+- Runtime shutdown now drains admitted extension terminal-cleanup tasks before
+  releasing extension workers; that narrow cleanup path cannot admit new work.
+- Synchronous `close()` now rejects both running and detached extension work;
+  `aclose()` remains the graceful path that waits for it.
+
+## [0.7.0] - 2026-07-27
 
 ### Added
 

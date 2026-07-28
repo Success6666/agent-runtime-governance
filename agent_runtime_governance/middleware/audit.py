@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .._blocking import run_blocking
+from .._blocking import invoke_extension
 from ..audit import AuditSink, context_event
 from ..context import ExecutionContext, ExecutionStatus, HistoryEntry, RiskTier
 from .base import ObservingMiddleware
@@ -59,7 +59,7 @@ class AuditMiddleware(ObservingMiddleware):
             )
         )
         try:
-            await run_blocking(
+            await invoke_extension(
                 self.sink.write, context_event(updated, stage=stage)
             )
         except Exception:

@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import inspect
 import json
 import re
 import ssl
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Awaitable, Protocol
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
-from .._blocking import run_blocking
+from .._blocking import invoke_extension
+from .._extensions import is_native_async_callable
 from ..context import ExecutionContext, HistoryEntry
 from ..decisions import DecisionOutcome, DecisionRecord
 from ..middleware.base import GatingMiddleware
@@ -23,6 +25,19 @@ class OPADecision:
     reason: str
 
 
+OPATransport = Callable[
+    [dict[str, Any]], Mapping[str, Any] | Awaitable[Mapping[str, Any]]
+]
+
+
+class OPAEvaluator(Protocol):
+    """The narrow policy-client capability used by the middleware."""
+
+    def evaluate(
+        self, context: ExecutionContext
+    ) -> OPADecision | Awaitable[OPADecision]: ...
+
+
 class OPAClient:
     def __init__(
         self,
@@ -30,7 +45,7 @@ class OPAClient:
         policy_path: str,
         *,
         timeout_seconds: float = 3.0,
-        transport: Callable[[dict[str, Any]], Mapping[str, Any]] | None = None,
+        transport: OPATransport | None = None,
         headers: Mapping[str, str] | None = None,
         ssl_context: ssl.SSLContext | None = None,
         max_request_bytes: int = 64 * 1024,
@@ -78,7 +93,53 @@ class OPAClient:
             failure_threshold, recovery_seconds=recovery_timeout
         )
 
-    def evaluate(self, context: ExecutionContext) -> OPADecision:
+    def evaluate(
+        self, context: ExecutionContext
+    ) -> OPADecision | Awaitable[OPADecision]:
+        """Evaluate synchronously when possible, or return an awaitable result.
+
+        The established direct API remains synchronous for legacy transports.
+        An async transport cannot be driven safely from this method, so its
+        result is returned for an async caller to await.  Runtime middleware
+        uses :meth:`aevaluate` to keep that transport on the caller event loop.
+        """
+
+        if self.transport is not None and is_native_async_callable(self.transport):
+            return self.aevaluate(context)
+        payload, encoded = self._request_payload(context)
+        if self.transport is not None:
+            response = self._circuit_breaker.call(self.transport, payload)
+        else:
+            response = self._circuit_breaker.call(self._post, encoded)
+        if inspect.isawaitable(response):
+            return self._parse_async_response(response)
+        return self._parse_response(response)
+
+    async def aevaluate(self, context: ExecutionContext) -> OPADecision:
+        """Evaluate through the async-first extension boundary.
+
+        Native async transports execute on the active caller loop.  Existing
+        synchronous transports are delegated to the Runtime-owned fallback
+        when a Runtime operation is active.
+        """
+
+        payload, encoded = self._request_payload(context)
+        callback: Callable[..., Any]
+        argument: dict[str, Any] | bytes
+        if self.transport is not None:
+            callback = self.transport
+            argument = payload
+        else:
+            callback = self._post
+            argument = encoded
+        response = await self._circuit_breaker.acall(
+            invoke_extension, callback, argument
+        )
+        return self._parse_response(response)
+
+    def _request_payload(
+        self, context: ExecutionContext
+    ) -> tuple[dict[str, Any], bytes]:
         payload = {
             "input": {
                 "trace_id": context.trace_id,
@@ -92,11 +153,17 @@ class OPAClient:
             }
         }
         encoded = _encode_json(payload, self.max_request_bytes)
-        def request() -> Mapping[str, Any]:
-            response = self.transport(payload) if self.transport else self._post(encoded)
-            return response
+        return payload, encoded
 
-        response = self._circuit_breaker.call(request)
+    async def _parse_async_response(
+        self, response: Awaitable[Mapping[str, Any]]
+    ) -> OPADecision:
+        return self._parse_response(await response)
+
+    @staticmethod
+    def _parse_response(response: Mapping[str, Any]) -> OPADecision:
+        if not isinstance(response, Mapping):
+            raise ValueError("OPA response must be a JSON object")
         result = response.get("result")
         if isinstance(result, bool):
             return OPADecision(result, "OPA boolean decision")
@@ -140,7 +207,7 @@ class OPAMiddleware(GatingMiddleware):
 
     def __init__(
         self,
-        client: OPAClient,
+        client: OPAEvaluator,
         *,
         fail_closed: bool = True,
         policy_version: str | None = None,
@@ -170,7 +237,12 @@ class OPAMiddleware(GatingMiddleware):
 
     async def process(self, context: ExecutionContext) -> ExecutionContext:
         try:
-            decision = await run_blocking(self.client.evaluate, context)
+            evaluator = (
+                self.client.aevaluate
+                if isinstance(self.client, OPAClient)
+                else self.client.evaluate
+            )
+            decision = await invoke_extension(evaluator, context)
         except Exception as exc:
             if self.fail_closed:
                 raise
@@ -198,7 +270,7 @@ class OPAPlugin:
 
     def __init__(
         self,
-        client: OPAClient,
+        client: OPAEvaluator,
         *,
         fail_closed: bool = True,
         policy_version: str | None = None,

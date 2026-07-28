@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import inspect
 import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -9,7 +8,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Protocol, TypeAlias
 from uuid import uuid4
 
-from ._blocking import run_blocking
+from ._blocking import invoke_extension
 from ._serialization import freeze_mapping as _freeze_mapping
 from ._serialization import thaw as _thaw
 from .contracts import canonical_json_bytes
@@ -295,12 +294,7 @@ class HumanDecisionProvider:
     async def decide(
         self, context: "ExecutionContext", request: ApprovalRequest
     ) -> DecisionRecord:
-        if inspect.iscoroutinefunction(self._callback):
-            value = await self._callback(context, request)
-        else:
-            value = await run_blocking(self._callback, context, request)
-        if inspect.isawaitable(value):
-            value = await value
+        value = await invoke_extension(self._callback, context, request)
         if isinstance(value, DecisionRecord):
             return value if value.approver else replace(value, approver=self._approver)
         if isinstance(value, bool):

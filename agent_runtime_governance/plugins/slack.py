@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import inspect
 import json
 import ssl
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import Any, Awaitable
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
-from .._blocking import run_blocking
+from .._blocking import invoke_extension
+from .._extensions import is_native_async_callable
 from ..context import ExecutionContext, ExecutionStatus, HistoryEntry
 from ..middleware.base import ObservingMiddleware
 from ..resilience import CircuitBreaker
 from .core import RuntimeBuilder
+
+SlackTransport = Callable[[dict[str, Any]], None | Awaitable[None]]
 
 
 class SlackWebhookNotifier:
@@ -27,6 +31,7 @@ class SlackWebhookNotifier:
         max_request_bytes: int = 16 * 1024,
         failure_threshold: int = 0,
         recovery_timeout: float = 30.0,
+        transport: SlackTransport | None = None,
     ) -> None:
         parsed = urlsplit(webhook_url)
         if (
@@ -49,34 +54,76 @@ class SlackWebhookNotifier:
         self.headers = _safe_headers(headers or {})
         self.ssl_context = ssl_context
         self.max_request_bytes = max_request_bytes
+        self.transport = transport
         self._circuit_breaker = CircuitBreaker(
             failure_threshold, recovery_seconds=recovery_timeout
         )
 
-    def send(self, payload: dict[str, Any]) -> None:
+    def send(self, payload: dict[str, Any]) -> None | Awaitable[None]:
+        """Send synchronously when possible, or return an awaitable result.
+
+        Existing synchronous webhook callers retain their ``None`` result.
+        Runtime middleware uses :meth:`asend` for native async transports so
+        their I/O remains on the caller's event loop.
+        """
+
+        if self.transport is not None and is_native_async_callable(self.transport):
+            return self.asend(payload)
+        encoded = self._encode_payload(payload)
+        callback: Callable[..., Any]
+        argument: dict[str, Any] | bytes
+        if self.transport is not None:
+            callback = self.transport
+            argument = payload
+        else:
+            callback = self._post
+            argument = encoded
+        result = self._circuit_breaker.call(callback, argument)
+        if inspect.isawaitable(result):
+            return self._complete_async_send(result)
+        return None
+
+    async def asend(self, payload: dict[str, Any]) -> None:
+        """Send through the async-first extension boundary."""
+
+        encoded = self._encode_payload(payload)
+        callback: Callable[..., Any]
+        argument: dict[str, Any] | bytes
+        if self.transport is not None:
+            callback = self.transport
+            argument = payload
+        else:
+            callback = self._post
+            argument = encoded
+        await self._circuit_breaker.acall(invoke_extension, callback, argument)
+
+    def _encode_payload(self, payload: dict[str, Any]) -> bytes:
         encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
         if len(encoded) > self.max_request_bytes:
             raise ValueError("Slack request exceeded byte limit")
-        def post() -> None:
-            request = Request(
-                self._webhook_url,
-                data=encoded,
-                headers={
-                    "Content-Type": "application/json",
-                    "User-Agent": "agent-runtime-governance/0.5",
-                    **self.headers,
-                },
-                method="POST",
-            )
-            opener = build_opener(
-                _RejectRedirects(),
-                HTTPSHandler(context=self.ssl_context),
-            )
-            with opener.open(request, timeout=self.timeout_seconds) as response:
-                if not 200 <= response.status < 300:
-                    raise RuntimeError(f"Slack webhook returned HTTP {response.status}")
+        return encoded
 
-        self._circuit_breaker.call(post)
+    async def _complete_async_send(self, result: Awaitable[Any]) -> None:
+        await result
+
+    def _post(self, encoded: bytes) -> None:
+        request = Request(
+            self._webhook_url,
+            data=encoded,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "agent-runtime-governance/0.5",
+                **self.headers,
+            },
+            method="POST",
+        )
+        opener = build_opener(
+            _RejectRedirects(),
+            HTTPSHandler(context=self.ssl_context),
+        )
+        with opener.open(request, timeout=self.timeout_seconds) as response:
+            if not 200 <= response.status < 300:
+                raise RuntimeError(f"Slack webhook returned HTTP {response.status}")
 
 
 class _RejectRedirects(HTTPRedirectHandler):
@@ -91,7 +138,7 @@ class SlackNotificationMiddleware(ObservingMiddleware):
 
     def __init__(
         self,
-        sender: Callable[[dict[str, Any]], None],
+        sender: Callable[[dict[str, Any]], None | Awaitable[None]],
         *,
         statuses: frozenset[ExecutionStatus] = frozenset(
             {
@@ -121,7 +168,8 @@ class SlackNotificationMiddleware(ObservingMiddleware):
                 f"trace={context.trace_id}, reason={reason})"
             )
         }
-        await run_blocking(self.sender, payload)
+        sender = _runtime_sender(self.sender)
+        await invoke_extension(sender, payload)
         return context.append_history(
             HistoryEntry(self.name, "sent", "Slack notification sent")
         )
@@ -141,6 +189,7 @@ class SlackPlugin:
         max_request_bytes: int = 16 * 1024,
         failure_threshold: int = 0,
         recovery_timeout: float = 30.0,
+        transport: SlackTransport | None = None,
     ) -> None:
         self.notifier = SlackWebhookNotifier(
             webhook_url,
@@ -150,6 +199,7 @@ class SlackPlugin:
             max_request_bytes=max_request_bytes,
             failure_threshold=failure_threshold,
             recovery_timeout=recovery_timeout,
+            transport=transport,
         )
 
     def register(self, builder: RuntimeBuilder) -> None:
@@ -168,3 +218,14 @@ def _safe_headers(headers: Mapping[str, str]) -> dict[str, str]:
             raise ValueError("invalid header value")
         safe[str(key)] = str(value)
     return safe
+
+
+def _runtime_sender(
+    sender: Callable[[dict[str, Any]], None | Awaitable[None]],
+) -> Callable[[dict[str, Any]], None | Awaitable[None]]:
+    """Prefer the notifier's explicit async entry point inside a Runtime."""
+
+    owner = getattr(sender, "__self__", None)
+    if isinstance(owner, SlackWebhookNotifier):
+        return owner.asend
+    return sender

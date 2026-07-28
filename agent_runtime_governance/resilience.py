@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import threading
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import Enum
 from time import monotonic
-from typing import Any, AsyncIterator, Awaitable, Callable, TypeVar
+from typing import Any, AsyncIterator, Awaitable, Callable, TypeVar, cast
 
 T = TypeVar("T")
 
@@ -36,7 +37,7 @@ class CircuitState(str, Enum):
 
 
 class CircuitBreaker:
-    """Small synchronous circuit breaker for blocking integration clients."""
+    """Thread-safe circuit breaker for synchronous and asynchronous clients."""
 
     def __init__(self, failure_threshold: int = 5, recovery_seconds: float = 30.0) -> None:
         if failure_threshold < 0:
@@ -59,7 +60,20 @@ class CircuitBreaker:
                 return CircuitState.HALF_OPEN
             return CircuitState.OPEN
 
-    def call(self, function: Callable[..., T], *args: object, **kwargs: object) -> T:
+    def call(
+        self,
+        function: Callable[..., T | Awaitable[T]],
+        *args: object,
+        **kwargs: object,
+    ) -> T | Awaitable[T]:
+        """Call ``function`` and defer accounting for an awaitable result.
+
+        Existing synchronous callers keep their immediate result.  When a
+        legacy callback returns an awaitable, the returned wrapper records the
+        outcome only after that awaitable settles instead of treating coroutine
+        construction as a successful dependency call.
+        """
+
         if self.failure_threshold == 0:
             return function(*args, **kwargs)
         self._before_call()
@@ -68,8 +82,38 @@ class CircuitBreaker:
         except Exception:
             self._record_failure()
             raise
+        if inspect.isawaitable(result):
+            return self._await_result(result)
         self._record_success()
         return result
+
+    async def acall(
+        self,
+        function: Callable[..., T | Awaitable[T]],
+        *args: object,
+        **kwargs: object,
+    ) -> T:
+        """Await a dependency call while retaining the same circuit policy."""
+
+        result = self.call(function, *args, **kwargs)
+        if inspect.isawaitable(result):
+            return await result
+        return cast(T, result)
+
+    async def _await_result(self, result: Awaitable[T]) -> T:
+        try:
+            value = await result
+        except asyncio.CancelledError:
+            # Cancellation is caller control flow, not evidence that the
+            # dependency failed.  A half-open probe must nevertheless be
+            # released so the circuit cannot remain permanently wedged.
+            self._record_cancelled()
+            raise
+        except Exception:
+            self._record_failure()
+            raise
+        self._record_success()
+        return value
 
     def _before_call(self) -> None:
         with self._lock:
@@ -96,6 +140,10 @@ class CircuitBreaker:
             if self._failures >= self.failure_threshold:
                 self._opened_at = monotonic()
 
+    def _record_cancelled(self) -> None:
+        with self._lock:
+            self._probe_in_flight = False
+
 
 @dataclass(frozen=True, slots=True)
 class RuntimeLimits:
@@ -118,6 +166,7 @@ class RuntimeLimits:
     max_reconciliation_in_flight: int = 16
     max_reconciliation_audit_delivery_in_flight: int = 8
     max_blocking_extension_in_flight: int = 16
+    max_blocking_extension_workers: int = 4
 
     def __post_init__(self) -> None:
         for name in (
@@ -147,6 +196,8 @@ class RuntimeLimits:
             raise ValueError(
                 "max_blocking_extension_in_flight must be at least one"
             )
+        if self.max_blocking_extension_workers < 1:
+            raise ValueError("max_blocking_extension_workers must be at least one")
 
 
 class RuntimeBulkhead:
@@ -183,6 +234,14 @@ class RuntimeBulkhead:
             self._withdraw(waiter, state="cancelled")
             raise
         return BulkheadLease(self._release)
+
+    def snapshot(self) -> tuple[int, int, int]:
+        """Return ``(capacity, available, waiters)`` without exposing internals."""
+
+        with self._lock:
+            return self._capacity, self._available, sum(
+                waiter.state == "waiting" for waiter in self._waiters
+            )
 
     def _acquire_or_enqueue(self, waiter: "_BulkheadWaiter") -> bool:
         with self._lock:

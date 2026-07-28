@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import inspect
 from dataclasses import dataclass
 from typing import Awaitable, Callable, TypeAlias
 
-from .._blocking import run_blocking
+from .._blocking import invoke_extension
 from ..context import ExecutionContext, HistoryEntry
 from ..decisions import DecisionOutcome, DecisionRecord
 from .base import GatingMiddleware
@@ -33,12 +32,7 @@ class LLMMiddleware(GatingMiddleware):
         self._reviewer = reviewer
 
     async def process(self, context: ExecutionContext) -> ExecutionContext:
-        if inspect.iscoroutinefunction(self._reviewer):
-            value = await self._reviewer(context)
-        else:
-            value = await run_blocking(self._reviewer, context)
-        if inspect.isawaitable(value):
-            value = await value
+        value = await invoke_extension(self._reviewer, context)
         if isinstance(value, SemanticReview):
             review = value
         elif isinstance(value, bool):

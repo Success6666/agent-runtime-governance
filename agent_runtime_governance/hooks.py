@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import inspect
 from dataclasses import dataclass
 from enum import Enum
 from typing import Awaitable, Callable, TypeAlias
 
-from ._blocking import run_blocking
+from ._blocking import invoke_extension
 from .context import ExecutionContext, HistoryEntry
 
 
@@ -65,12 +64,7 @@ class HookRegistry:
         current = context
         for registration in self._hooks[point]:
             try:
-                if inspect.iscoroutinefunction(registration.callback):
-                    value = await registration.callback(current)
-                else:
-                    value = await run_blocking(registration.callback, current)
-                if inspect.isawaitable(value):
-                    value = await value
+                value = await invoke_extension(registration.callback, current)
                 if value is not None:
                     if not isinstance(value, ExecutionContext):
                         raise TypeError("hook must return ExecutionContext or None")

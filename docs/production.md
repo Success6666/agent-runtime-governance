@@ -1,8 +1,10 @@
 # Production Operations
 
-This guide covers the operational contract through the v0.7 implementation.
-Applications remain responsible for tool-specific authorization, business
-rollback, downstream idempotency, and data-retention requirements.
+This guide covers the released v0.7 operational contract and the current v0.8
+development baseline. The unreleased v0.8 material is not a production claim
+until its own release verification is recorded. Applications remain responsible
+for tool-specific authorization, business rollback, downstream idempotency,
+and data-retention requirements.
 
 The v0.6 strict profile adds an explicit registration and sealing lifecycle;
 v0.7 adds deterministic reconciliation requirements for idempotent tools.
@@ -119,8 +121,9 @@ do not delete a durable record to force a retry.
 
 `Runtime.close()` is a synchronous, fail-closed shutdown operation. It succeeds
 only when no public invocation, reconciliation workflow, durable finalizer, or
-submitted synchronous tool is still active; on refusal it keeps the runtime
-open so the caller can drain or await the existing work. Strict-production
+submitted synchronous tool or extension callback is still active; on refusal it
+keeps the runtime open so the caller can drain or await the existing work.
+Strict-production
 runtimes reject `close(wait=False)` because a non-waiting close cannot prove
 that a thread-backed effect has stopped.
 
@@ -129,13 +132,39 @@ that a thread-backed effect has stopped.
 reconciliation finalization, provider tasks, submitted synchronous tools, and
 any coroutine that remained live after the configured cancellation grace period
 before owned authoritative executors are released. When invoked through
-`Runtime`, synchronous hooks, middleware callbacks, identity/precondition
-providers, approval stores, audit sinks, snapshot stores, and built-in
-OPA/Slack adapters run through a runtime-owned bounded extension executor. Its
-queue is limited by
-`RuntimeLimits.max_blocking_extension_in_flight` (default `16`); a timed-out
-thread retains its permit until the underlying call actually finishes, and
-`aclose()` waits for that call rather than reporting a false clean shutdown.
+`Runtime`, hooks, middleware callbacks, identity/precondition providers,
+audit/snapshot adapters, and built-in OPA/Slack adapters use one async-first
+extension boundary. Native async adapters remain on the caller's event loop,
+so they do not queue behind synchronous workers. The synchronous fallback is a
+Runtime-owned executor with
+`RuntimeLimits.max_blocking_extension_workers` workers (default `4`), while
+`RuntimeLimits.max_blocking_extension_in_flight` (default `16`) bounds admitted
+synchronous running and executor-queued work. A timed-out thread retains its
+permit until the underlying call actually finishes, and `aclose()` waits for
+that call rather than reporting a false clean shutdown.
+
+An admitted extension resource that needs terminal cleanup, including an
+OpenTelemetry span whose synchronous `start_span` completed after an observer
+timeout, remains owned until cleanup ends it. During `aclose()` this narrowly
+scoped cleanup can use the already-owned dispatcher after new ordinary work has
+been rejected; it cannot admit new application extension work. Ordinary OTel
+`start_span` lifecycle methods follow the async-first boundary. A tracer that
+only provides `start_as_current_span` remains a same-thread compatibility path
+so its context-manager token is never moved through a worker.
+
+`Runtime.invoke()` keeps a private Runtime-owned event loop alive until the
+Runtime closes. This allows a synchronous invocation to return after a
+non-critical observer timeout without cancelling already-admitted terminal
+cleanup. Calling `aclose()` from another event loop delegates lifecycle work
+back to that owner loop, then stops it after cleanup and executor shutdown.
+
+The optional Prometheus middleware exposes only low-cardinality extension
+dispatch metrics: queue wait and execution duration by `sync` or `async` mode,
+saturation count, detached synchronous work, worker capacity/activity, and
+executor/admission queue depth. Callback names, tool names, trace identifiers,
+and endpoint values are never metric labels. Approval, idempotency, and
+reconciliation stores remain synchronous authoritative adapters; this boundary
+does not introduce asynchronous durable state stores.
 
 Do not submit nested blocking work from a synchronous extension callback. The
 runtime fails that pattern closed instead of escaping to an untracked global
