@@ -211,10 +211,13 @@ async def test_runtime_event_subscriber_failure_cannot_change_tool_result() -> N
     async def broken(_event: RuntimeEvent) -> None:
         raise RuntimeError("debugger consumer failed")
 
+    async def cancelled_consumer(_event: RuntimeEvent) -> None:
+        raise asyncio.CancelledError("debugger consumer cancelled")
+
     def capture(event: RuntimeEvent) -> None:
         observed.append(event)
 
-    runtime = Runtime(event_subscribers=(broken, capture))
+    runtime = Runtime(event_subscribers=(broken, cancelled_consumer, capture))
     denied = Runtime(
         [RuleMiddleware([Rule("blocked", r"blocked", "blocked by policy")])],
         event_subscribers=(broken,),

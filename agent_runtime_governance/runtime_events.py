@@ -7,6 +7,7 @@ reach a live ``Runtime`` or ``ExecutionContext`` through this boundary.
 from __future__ import annotations
 
 import hashlib
+from asyncio import CancelledError
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from threading import Lock
@@ -215,8 +216,10 @@ class _RuntimeEventHub:
         for subscriber in subscribers:
             try:
                 await dispatcher(subscriber, event)
-            except Exception:
+            except (Exception, CancelledError):
                 # Debugger and replay consumers cannot alter governance state.
+                # This includes cancellation raised by an untrusted consumer;
+                # delivery to independent consumers must continue.
                 continue
 
     def subscribers(self) -> tuple[RuntimeEventSubscriber, ...]:
