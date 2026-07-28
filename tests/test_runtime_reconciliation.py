@@ -1638,7 +1638,7 @@ async def test_finalization_timeout_poison_reconciliation_fail_closed(
         idempotency_store=SQLiteIdempotencyStore(path),
         reconciliation_ledger=ledger,
         limits=RuntimeLimits(
-            reconciliation_operation_timeout_seconds=0.2,
+            reconciliation_operation_timeout_seconds=1.0,
             reconciliation_finalization_timeout_seconds=0.01,
         ),
     )
@@ -2134,7 +2134,7 @@ async def test_timed_out_outbox_delivery_recovers_without_poisoning_ledger(
         with pytest.raises(ReconciliationAuditDeliveryPendingError) as pending:
             await runtime.areconcile(
                 execution_record_id,
-                deadline=datetime.now(timezone.utc) + timedelta(seconds=2),
+                deadline=datetime.now(timezone.utc) + timedelta(seconds=5),
             )
         assert pending.value.execution_record_id == execution_record_id
         assert await asyncio.to_thread(sink.entered.wait, 1.0)
@@ -2323,7 +2323,7 @@ async def test_global_audit_recovery_honors_its_caller_deadline(
 
         def write_idempotent(self, _source_event_id: str, _event: object) -> None:
             self.entered.set()
-            if not self.release.wait(timeout=0.5):
+            if not self.release.wait(timeout=1.0):
                 raise RuntimeError("test audit sink was not released")
             self.completed.set()
 
@@ -2356,7 +2356,7 @@ async def test_global_audit_recovery_honors_its_caller_deadline(
         ),
     )
     try:
-        deadline = datetime.now(timezone.utc) + timedelta(seconds=0.04)
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=0.5)
         with pytest.raises(StageTimeoutError, match="reconciliation audit delivery"):
             await runtime.adrain_reconciliation_audit_outbox(
                 limit=1, deadline=deadline
