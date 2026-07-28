@@ -63,10 +63,12 @@ jobs:
 
       - name: Run release verification
         run: |
+          mkdir -p release-evidence
           ruff check .
           node --test .github/scripts/*.test.cjs
-          pytest --cov=agent_runtime_governance --cov-report=term-missing
+          pytest --junitxml=release-evidence/pytest.xml --cov=agent_runtime_governance --cov-report=json:release-evidence/coverage.json --cov-report=term-missing
           python integration/production_smoke.py --skip-kind
+          python scripts/release_manifest.py record-integration --command "python integration/production_smoke.py --skip-kind"
 
       - name: Audit isolated production dependencies
         run: |
@@ -76,7 +78,7 @@ jobs:
           python -m venv /tmp/release-audit-tool
           /tmp/release-audit-tool/bin/python -m pip install --disable-pip-version-check "pip-audit==2.10.1"
           audit_path="$(/tmp/release-audit/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
-          /tmp/release-audit-tool/bin/pip-audit --path "$audit_path"
+          /tmp/release-audit-tool/bin/pip-audit --path "$audit_path" -f json -o release-evidence/dependency-audit.json
 
       - name: Verify tag and package version match
         run: |
@@ -142,11 +144,27 @@ jobs:
           upload-artifact: false
           upload-release-assets: false
 
+      - name: Generate release verification manifest
+        env:
+          SOURCE_COMMIT: ${{ steps.release.outputs.source_sha }}
+        run: >-
+          python scripts/release_manifest.py generate
+          --release-tag "$RELEASE_TAG" --source-commit "$SOURCE_COMMIT"
+
       - name: Generate SHA256 checksums
-        run: sha256sum dist/*.whl dist/*.tar.gz dist/sbom.spdx.json > dist/SHA256SUMS
+        run: >-
+          sha256sum dist/*.whl dist/*.tar.gz dist/sbom.spdx.json
+          dist/release-manifest.json > dist/SHA256SUMS
 
       - name: Verify checksums
         run: sha256sum --check dist/SHA256SUMS
+
+      - name: Validate release verification manifest
+        env:
+          SOURCE_COMMIT: ${{ steps.release.outputs.source_sha }}
+        run: >-
+          python scripts/release_manifest.py validate --release-tag "$RELEASE_TAG"
+          --source-commit "$SOURCE_COMMIT"
 
       - name: Attest release artifacts
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
@@ -156,11 +174,12 @@ jobs:
             dist/*.tar.gz
             dist/SHA256SUMS
             dist/sbom.spdx.json
+            dist/release-manifest.json
 
       - name: Upload verified artifacts to release
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
           gh release upload "$RELEASE_TAG"
-          dist/*.whl dist/*.tar.gz dist/SHA256SUMS dist/sbom.spdx.json
+          dist/*.whl dist/*.tar.gz dist/SHA256SUMS dist/sbom.spdx.json dist/release-manifest.json
           --repo "$GITHUB_REPOSITORY"

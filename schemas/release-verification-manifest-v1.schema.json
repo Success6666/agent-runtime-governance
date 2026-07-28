@@ -1,0 +1,319 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Success6666/agent-runtime-governance/blob/main/schemas/release-verification-manifest-v1.schema.json",
+  "title": "Agent Runtime Governance Release Verification Manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "generated_at",
+    "release",
+    "tests",
+    "coverage",
+    "integration",
+    "dependency_audit",
+    "artifacts",
+    "service_images",
+    "checksums",
+    "provenance"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1"
+    },
+    "generated_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "release": {
+      "$ref": "#/$defs/release"
+    },
+    "tests": {
+      "$ref": "#/$defs/tests"
+    },
+    "coverage": {
+      "$ref": "#/$defs/coverage"
+    },
+    "integration": {
+      "$ref": "#/$defs/integration"
+    },
+    "dependency_audit": {
+      "$ref": "#/$defs/dependency_audit"
+    },
+    "artifacts": {
+      "$ref": "#/$defs/artifacts"
+    },
+    "service_images": {
+      "$ref": "#/$defs/service_images"
+    },
+    "checksums": {
+      "$ref": "#/$defs/checksums"
+    },
+    "provenance": {
+      "$ref": "#/$defs/provenance"
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "release_tag": {
+      "type": "string",
+      "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "package_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "source_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "dist_path": {
+      "type": "string",
+      "pattern": "^dist/(?:[A-Za-z0-9][A-Za-z0-9._-]*/)*[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "evidence_path": {
+      "type": "string",
+      "pattern": "^release-evidence/(?:[A-Za-z0-9][A-Za-z0-9._-]*/)*[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/dist_path"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tag",
+        "package_version",
+        "source_commit"
+      ],
+      "properties": {
+        "tag": {
+          "$ref": "#/$defs/release_tag"
+        },
+        "package_version": {
+          "$ref": "#/$defs/package_version"
+        },
+        "source_commit": {
+          "$ref": "#/$defs/source_commit"
+        }
+      }
+    },
+    "tests": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "report_path",
+        "total",
+        "passed",
+        "failed",
+        "errors",
+        "skipped"
+      ],
+      "properties": {
+        "report_path": {
+          "const": "release-evidence/pytest.xml"
+        },
+        "total": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "passed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "errors": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "skipped": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "report_path",
+        "percent",
+        "minimum",
+        "status"
+      ],
+      "properties": {
+        "report_path": {
+          "const": "release-evidence/coverage.json"
+        },
+        "percent": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "minimum": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "status": {
+          "const": "passed"
+        }
+      }
+    },
+    "integration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "report_path",
+        "command",
+        "status"
+      ],
+      "properties": {
+        "report_path": {
+          "const": "release-evidence/integration.json"
+        },
+        "command": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "const": "passed"
+        }
+      }
+    },
+    "dependency_audit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "report_path",
+        "vulnerability_count",
+        "status"
+      ],
+      "properties": {
+        "report_path": {
+          "const": "release-evidence/dependency-audit.json"
+        },
+        "vulnerability_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "status": {
+          "const": "passed"
+        }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "wheel",
+        "sdist",
+        "sbom"
+      ],
+      "properties": {
+        "wheel": {
+          "$ref": "#/$defs/artifact"
+        },
+        "sdist": {
+          "$ref": "#/$defs/artifact"
+        },
+        "sbom": {
+          "$ref": "#/$defs/artifact"
+        }
+      }
+    },
+    "service_image": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[0-9a-f]{64}$"
+    },
+    "service_images": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "opa",
+        "otel"
+      ],
+      "properties": {
+        "opa": {
+          "$ref": "#/$defs/service_image"
+        },
+        "otel": {
+          "$ref": "#/$defs/service_image"
+        }
+      }
+    },
+    "checksums": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "subjects"
+      ],
+      "properties": {
+        "path": {
+          "const": "dist/SHA256SUMS"
+        },
+        "subjects": {
+          "type": "array",
+          "minItems": 4,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/dist_path"
+          }
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workflow_path",
+        "source_ref",
+        "source_commit",
+        "subject_paths"
+      ],
+      "properties": {
+        "workflow_path": {
+          "const": ".github/workflows/release.yml"
+        },
+        "source_ref": {
+          "type": "string",
+          "pattern": "^refs/tags/v[0-9]+\\.[0-9]+\\.[0-9]+$"
+        },
+        "source_commit": {
+          "$ref": "#/$defs/source_commit"
+        },
+        "subject_paths": {
+          "type": "array",
+          "minItems": 5,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/dist_path"
+          }
+        }
+      }
+    }
+  }
+}

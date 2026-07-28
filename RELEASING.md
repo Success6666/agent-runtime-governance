@@ -31,8 +31,9 @@ PyPI Trusted Publishing.
 4. Create a non-prerelease GitHub release for the matching `vX.Y.Z` tag, with
    `main` as the target.
 5. Wait for `Release artifacts` to verify that the tag belongs to `main`, rerun
-   lint, tests, dependency audit, and Docker integration smoke, then attach the
-   wheel, source distribution, SPDX SBOM, checksums, and GitHub provenance.
+   lint, tests, dependency audit, and Docker integration smoke, then generate
+   and validate the Release Verification Manifest before attaching the wheel,
+   source distribution, SPDX SBOM, manifest, checksums, and GitHub provenance.
 6. Dispatch `Publish to PyPI` with the exact release tag. It verifies checksums
    and GitHub provenance before using Trusted Publishing.
 7. Install the published version in a fresh environment and verify
