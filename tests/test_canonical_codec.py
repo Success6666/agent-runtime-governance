@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -13,6 +14,7 @@ from agent_runtime_governance._canonical import (
     legacy_audit_json_bytes,
     legacy_audit_json_text,
     legacy_contract_json_bytes,
+    legacy_policy_json_bytes,
     legacy_storage_json_text,
     rfc8785_json_bytes,
     rfc8785_json_text,
@@ -29,6 +31,7 @@ from agent_runtime_governance.audit import (
 from agent_runtime_governance.context import ExecutionContext, ToolCall
 from agent_runtime_governance.contracts import canonical_json_bytes
 from agent_runtime_governance.decisions import ApprovalRequest
+from agent_runtime_governance.errors import AuditIntegrityError
 from agent_runtime_governance.reconciliation import ReconciliationValidationError, _dump
 from agent_runtime_governance.snapshots import (
     ContextSnapshot,
@@ -37,10 +40,14 @@ from agent_runtime_governance.snapshots import (
     _snapshot_hash,
     _snapshot_signature,
 )
+from agent_runtime_governance.yaml_policy import YAMLPolicyLoader
 
 _FIXTURE = Path(__file__).parent / "fixtures" / "v0.7" / "canonical-codec.json"
 _PERSISTENCE_FIXTURE = (
     Path(__file__).parent / "fixtures" / "v0.7" / "persistence-codec.json"
+)
+_POLICY_DIGEST_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "v0.7" / "policy-digest.json"
 )
 _SIGNING_KEY = b"fixture-signing-key"
 _APPROVAL_KEY = b"approval-fixture-signing-key-32byte"
@@ -55,6 +62,13 @@ def _fixture() -> dict[str, object]:
 def _persistence_fixture() -> dict[str, str]:
     raw = json.loads(_PERSISTENCE_FIXTURE.read_text(encoding="utf-8"))
     assert raw.pop("source_version") == "0.7.0"
+    return raw
+
+
+def _policy_digest_fixture() -> dict[str, str]:
+    raw = json.loads(_POLICY_DIGEST_FIXTURE.read_text(encoding="utf-8"))
+    assert raw.pop("source_version") == "0.7.0"
+    assert raw.pop("source_commit") == "3998c975f88737c9e009b9d85c073122431ddb94"
     return raw
 
 
@@ -126,6 +140,21 @@ def test_codec_profiles_match_v07_golden_bytes() -> None:
     )
     assert rfc8785_json_bytes(payload) == fixture["rfc8785_json"].encode("utf-8")
     assert rfc8785_json_text(payload) == fixture["rfc8785_json"]
+
+
+def test_policy_semantic_digest_matches_v07_golden_bytes() -> None:
+    fixture = _policy_digest_fixture()
+    canonical = json.loads(fixture["canonical_json"])
+
+    assert legacy_policy_json_bytes(canonical) == fixture["canonical_json"].encode(
+        "utf-8"
+    )
+    assert hashlib.sha256(legacy_policy_json_bytes(canonical)).hexdigest() == fixture[
+        "semantic_digest"
+    ]
+    assert YAMLPolicyLoader.loads(fixture["input_yaml"]).digest == fixture[
+        "semantic_digest"
+    ]
 
 
 def test_existing_contract_and_rfc8785_callers_match_golden_bytes() -> None:
@@ -225,6 +254,21 @@ def test_v07_approval_sqlite_payload_and_integrity_tag_remain_compatible(
     assert restored is not None
     assert restored.request.to_dict() == request.to_dict()
 
+    with sqlite3.connect(legacy_path) as connection:
+        request_json = connection.execute(
+            "SELECT request_json FROM approvals WHERE request_id = ?",
+            (request.request_id,),
+        ).fetchone()[0]
+        assert request_json.count("fixture-user") == 1
+        connection.execute(
+            "UPDATE approvals SET request_json = ? WHERE request_id = ?",
+            (request_json.replace("fixture-user", "fixture-usar"), request.request_id),
+        )
+        connection.commit()
+
+    with pytest.raises(ValueError, match="approval record integrity verification failed"):
+        legacy_store.get(request.request_id)
+
 
 def test_v07_audit_jsonl_and_sqlite_payloads_remain_compatible(
     tmp_path: Path,
@@ -266,6 +310,38 @@ def test_v07_audit_jsonl_and_sqlite_payloads_remain_compatible(
     assert legacy_sink.read_verified()[0]["event_hash"] == json.loads(
         fixture["audit_jsonl"]
     )["event_hash"]
+
+
+def test_signed_audit_jsonl_rejects_single_byte_event_and_state_tampering(
+    tmp_path: Path,
+) -> None:
+    fixture = _persistence_fixture()
+
+    event_path = tmp_path / "tampered-audit-event.jsonl"
+    tampered_event = fixture["audit_jsonl"].replace('"amount":1.0', '"amount":2.0')
+    assert tampered_event != fixture["audit_jsonl"]
+    event_path.write_bytes((tampered_event + "\n").encode("utf-8"))
+    Path(str(event_path) + ".state").write_bytes(
+        (fixture["audit_state"] + "\n").encode("utf-8")
+    )
+
+    with pytest.raises(AuditIntegrityError, match="invalid audit signature"):
+        JSONLAuditSink(event_path, sign_key=_AUDIT_KEY).read_verified()
+    with pytest.raises(AuditIntegrityError, match="invalid audit event hash"):
+        JSONLAuditSink(event_path).read_verified()
+
+    state_path = tmp_path / "tampered-audit-state.jsonl"
+    state_path.write_bytes((fixture["audit_jsonl"] + "\n").encode("utf-8"))
+    tampered_state = fixture["audit_state"].replace(
+        '"last_sequence":0', '"last_sequence":1'
+    )
+    assert tampered_state != fixture["audit_state"]
+    Path(str(state_path) + ".state").write_bytes(
+        (tampered_state + "\n").encode("utf-8")
+    )
+
+    with pytest.raises(AuditIntegrityError, match="invalid audit state signature"):
+        JSONLAuditSink(state_path, sign_key=_AUDIT_KEY).read_verified()
 
 
 def test_v07_snapshot_jsonl_and_sqlite_payloads_remain_compatible(
@@ -317,3 +393,23 @@ def test_v07_snapshot_jsonl_and_sqlite_payloads_remain_compatible(
         redact_sensitive=False,
     )
     assert legacy_store.read_trace(snapshot.trace_id) == (snapshot,)
+
+
+def test_signed_snapshot_jsonl_rejects_single_byte_tampering(tmp_path: Path) -> None:
+    fixture = _persistence_fixture()
+    path = tmp_path / "tampered-snapshot.jsonl"
+    tampered_snapshot = fixture["snapshot_jsonl"].replace(
+        '"amount":1.0', '"amount":2.0'
+    )
+    assert tampered_snapshot != fixture["snapshot_jsonl"]
+    path.write_bytes((tampered_snapshot + "\n").encode("utf-8"))
+    Path(str(path) + ".state").write_bytes(
+        (fixture["snapshot_state"] + "\n").encode("utf-8")
+    )
+
+    with pytest.raises(AuditIntegrityError, match="invalid snapshot signature"):
+        JSONLSnapshotStore(
+            path,
+            sign_key=_SNAPSHOT_KEY,
+            redact_sensitive=False,
+        ).read_trace("snapshot-trace-\u00e9")
