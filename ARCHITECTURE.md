@@ -43,6 +43,11 @@ contracts, reconciliation, and new portable evidence use RFC 8785. A caller
 never substitutes one profile for another merely because both produce sorted
 JSON. See [ADR 0007](docs/adr/0007-v08-canonical-codec-compatibility.md).
 
+Audit and snapshot redaction share a dependency-neutral private boundary.
+`audit` retains its long-standing public redaction imports, while snapshot
+persistence imports the private implementation directly. Redaction still runs
+before audit hashing, HMACs, source-idempotency digests, and snapshot signatures.
+
 ## Invariants
 
 1. Identity and trace fields cannot be rewritten by middleware.
