@@ -38,6 +38,12 @@ All notable changes are documented here.
   algorithm, and unsigned bundle digest without changing the bundle; unknown,
   rotated, revoked, expired, malformed, or unavailable signing material fails
   closed. The core installation remains free of the cryptography dependency.
+- An offline `python -m agent_runtime_governance.verify` command for strict v1
+  evidence parsing, canonical digest commitments, detached signature/trust-root
+  validation, requested tenant/policy/contract bindings, and reconciliation
+  lineage. It reports integrity, authenticity, and outcome verification as
+  independent JSON levels; anchors and receipt verification remain explicitly
+  unsupported.
 
 ### Changed
 

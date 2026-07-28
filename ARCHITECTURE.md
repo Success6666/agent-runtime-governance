@@ -55,8 +55,12 @@ an explicit allowlist from a `BoundAction`; it never accepts a live
 record. Its RFC 8785 digest establishes integrity only. The optional
 `evidence` extra can attach a detached Ed25519 signature bound to the bundle
 digest and a closed, explicitly configured trust-root set; it never changes
-the unsigned bundle or treats a signature as an external outcome. External
-anchors, receipts, and outcome verification remain later v0.8 capabilities.
+the unsigned bundle or treats a signature as an external outcome. The offline
+verifier reconstructs only the strict canonical v1 model, reports integrity
+and configured signer authenticity independently, and labels a bundle without
+a detached or caller-supplied digest commitment as unanchored. External
+anchors, receipts, and external outcome verification remain later v0.8
+capabilities.
 
 ## Invariants
 
