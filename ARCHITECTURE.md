@@ -34,6 +34,14 @@ modules are prefixed with `_`; consumers must not depend on them. Any later
 audit, codec, protocol, or event extraction preserves its current public import
 paths and serialized compatibility contract. See [ADR 0006](docs/adr/0006-v08-runtime-service-boundaries.md).
 
+Canonical JSON is an internal compatibility boundary with explicit profiles,
+not a format migration. Audit event/state integrity uses the legacy ASCII
+sorted-JSON profile; snapshot and approval storage retain their legacy ASCII
+storage profile; the public contract helper retains its UTF-8 sorted-JSON
+profile; action contracts, reconciliation, and new portable evidence use RFC
+8785. A caller never substitutes one profile for another merely because both
+produce sorted JSON. See [ADR 0007](docs/adr/0007-v08-canonical-codec-compatibility.md).
+
 ## Invariants
 
 1. Identity and trace fields cannot be rewritten by middleware.
