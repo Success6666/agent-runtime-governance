@@ -218,7 +218,7 @@ class EvidenceSignatureAttachment:
             "signature attachment",
             EvidenceSignatureValidationError,
         )
-        self.signature_bytes
+        _ = self.signature_bytes
         return document
 
 
@@ -317,7 +317,7 @@ class EvidenceTrustRoot:
             "trust root",
             EvidenceTrustRootValidationError,
         )
-        self.public_key_bytes
+        _ = self.public_key_bytes
         return document
 
 

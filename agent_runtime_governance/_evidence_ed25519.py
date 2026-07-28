@@ -45,10 +45,10 @@ def verify(public_key: bytes, payload: bytes, signature: bytes) -> bool:
     if type(signature) is not bytes:
         raise TypeError("Ed25519 signature must be bytes")
     _, public_key_type, invalid_signature_type = _ed25519_types()
-    verifier = public_key_type.from_public_bytes(public_key)
     try:
+        verifier = public_key_type.from_public_bytes(public_key)
         verifier.verify(signature, payload)
-    except invalid_signature_type:
+    except (invalid_signature_type, ValueError):
         return False
     return True
 

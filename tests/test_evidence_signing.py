@@ -4,6 +4,7 @@ import base64
 import json
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +14,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from jsonschema import Draft202012Validator
 
+import agent_runtime_governance._evidence_ed25519 as ed25519_module
 from agent_runtime_governance import (
     EVIDENCE_SIGNATURE_ATTACHMENT_SCHEMA_V1,
     EVIDENCE_TRUST_ROOTS_SCHEMA_V1,
@@ -250,62 +252,124 @@ def test_verification_rejects_tampered_signature_and_bundle_binding() -> None:
         )
 
 
-def test_signature_and_trust_root_documents_fail_closed() -> None:
+def test_ed25519_verifier_fails_closed_for_an_unusable_public_key() -> None:
+    assert ed25519_module.verify(b"short", b"payload", b"\x00" * 64) is False
+
+
+@pytest.mark.parametrize(
+    ("factory", "error_type", "match"),
+    (
+        pytest.param(
+            lambda bundle, attachment, root: EvidenceSignatureAttachment(
+                key_id=attachment.key_id,
+                algorithm="ed25519",
+                bundle_digest=bundle.bundle_digest,
+                value="not-base64",
+            ),
+            EvidenceSignatureValidationError,
+            "canonical base64",
+            id="signature-noncanonical-base64",
+        ),
+        pytest.param(
+            lambda bundle, attachment, root: EvidenceSignatureAttachment(
+                key_id=attachment.key_id,
+                algorithm="rsa",
+                bundle_digest=bundle.bundle_digest,
+                value=attachment.value,
+            ),
+            EvidenceSignatureValidationError,
+            "only the ed25519",
+            id="signature-unsupported-algorithm",
+        ),
+        pytest.param(
+            lambda bundle, attachment, root: EvidenceTrustRoot(
+                key_id=root.key_id,
+                algorithm=root.algorithm,
+                public_key=base64.b64encode(b"short").decode("ascii"),
+                not_before=root.not_before,
+                not_after=root.not_after,
+                revoked=False,
+            ),
+            EvidenceTrustRootValidationError,
+            "exactly 32 bytes",
+            id="trust-root-short-public-key",
+        ),
+        pytest.param(
+            lambda bundle, attachment, root: EvidenceTrustRoot(
+                key_id=root.key_id,
+                algorithm="rsa",
+                public_key=root.public_key,
+                not_before=root.not_before,
+                not_after=root.not_after,
+                revoked=False,
+            ),
+            EvidenceTrustRootValidationError,
+            "only the ed25519",
+            id="trust-root-unsupported-algorithm",
+        ),
+        pytest.param(
+            lambda bundle, attachment, root: _root(not_before=_at(3), not_after=_at(3)),
+            EvidenceTrustRootValidationError,
+            "not_after",
+            id="trust-root-invalid-validity-window",
+        ),
+        pytest.param(
+            lambda bundle, attachment, root: EvidenceTrustRoots(keys=(root, root)),
+            EvidenceTrustRootValidationError,
+            "repeat key_id",
+            id="trust-roots-duplicate-key-id",
+        ),
+        pytest.param(
+            lambda bundle, attachment, root: Ed25519EvidenceSigner.from_private_key_bytes(
+                "evidence-key-1", b"short"
+            ),
+            EvidenceSignatureValidationError,
+            "private_key",
+            id="signer-short-private-key",
+        ),
+        pytest.param(
+            lambda bundle, attachment, root: EvidenceSignatureAttachment.from_dict(
+                {**attachment.to_dict(), "unexpected": "not-allowed"}
+            ),
+            EvidenceSignatureValidationError,
+            "Additional properties",
+            id="signature-unknown-property",
+        ),
+        pytest.param(
+            lambda bundle, attachment, root: EvidenceTrustRoots.from_dict(
+                {"keys": [{**root.to_dict(), "revoked": 1}]}
+            ),
+            EvidenceTrustRootValidationError,
+            "boolean",
+            id="trust-root-nonboolean-revocation",
+        ),
+        pytest.param(
+            lambda bundle, attachment, root: EvidenceTrustRoots.from_dict(
+                {
+                    "keys": [
+                        {
+                            **root.to_dict(),
+                            "not_before": "2026-07-01 00:00:00Z",
+                        }
+                    ]
+                }
+            ),
+            EvidenceTrustRootValidationError,
+            "date-time",
+            id="trust-root-invalid-timestamp",
+        ),
+    ),
+)
+def test_signature_and_trust_root_documents_fail_closed(
+    factory: Callable[[EvidenceBundle, EvidenceSignatureAttachment, EvidenceTrustRoot], object],
+    error_type: type[Exception],
+    match: str,
+) -> None:
     bundle, attachment = _signed_attachment()
     root = _root()
 
-    with pytest.raises(EvidenceSignatureValidationError, match="canonical base64"):
-        EvidenceSignatureAttachment(
-            key_id=attachment.key_id,
-            algorithm="ed25519",
-            bundle_digest=bundle.bundle_digest,
-            value="not-base64",
-        )
-    with pytest.raises(EvidenceSignatureValidationError, match="only the ed25519"):
-        EvidenceSignatureAttachment(
-            key_id=attachment.key_id,
-            algorithm="rsa",
-            bundle_digest=bundle.bundle_digest,
-            value=attachment.value,
-        )
-    with pytest.raises(EvidenceTrustRootValidationError, match="exactly 32 bytes"):
-        EvidenceTrustRoot(
-            key_id=root.key_id,
-            algorithm=root.algorithm,
-            public_key=base64.b64encode(b"short").decode("ascii"),
-            not_before=root.not_before,
-            not_after=root.not_after,
-            revoked=False,
-        )
-    with pytest.raises(EvidenceTrustRootValidationError, match="only the ed25519"):
-        EvidenceTrustRoot(
-            key_id=root.key_id,
-            algorithm="rsa",
-            public_key=root.public_key,
-            not_before=root.not_before,
-            not_after=root.not_after,
-            revoked=False,
-        )
-    with pytest.raises(EvidenceTrustRootValidationError, match="not_after"):
-        _root(not_before=_at(3), not_after=_at(3))
-    with pytest.raises(EvidenceTrustRootValidationError, match="repeat key_id"):
-        EvidenceTrustRoots(keys=(root, root))
-    with pytest.raises(EvidenceSignatureValidationError, match="private_key"):
-        Ed25519EvidenceSigner.from_private_key_bytes("evidence-key-1", b"short")
-
-    attachment_document = attachment.to_dict()
-    attachment_document["unexpected"] = "not-allowed"
-    with pytest.raises(EvidenceSignatureValidationError, match="Additional properties"):
-        EvidenceSignatureAttachment.from_dict(attachment_document)
-
-    roots_document = EvidenceTrustRoots(keys=(root,)).to_dict()
-    roots_document["keys"][0]["revoked"] = 1
-    with pytest.raises(EvidenceTrustRootValidationError, match="boolean"):
-        EvidenceTrustRoots.from_dict(roots_document)
-    roots_document["keys"][0]["revoked"] = False
-    roots_document["keys"][0]["not_before"] = "2026-07-01 00:00:00Z"
-    with pytest.raises(EvidenceTrustRootValidationError, match="date-time"):
-        EvidenceTrustRoots.from_dict(roots_document)
+    with pytest.raises(error_type, match=match):
+        factory(bundle, attachment, root)
 
 
 def test_signature_and_trust_root_schemas_are_closed() -> None:
@@ -398,6 +462,7 @@ def test_core_import_and_optional_signing_fail_cleanly_without_cryptography() ->
         capture_output=True,
         text=True,
         check=False,
+        timeout=60,
     )
 
     assert completed.returncode == 0, completed.stderr
