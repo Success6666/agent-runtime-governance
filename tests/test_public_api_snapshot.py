@@ -330,7 +330,6 @@ def test_v070_wheel_and_sdist_expose_stable_imports(tmp_path: Path) -> None:
                 "-m",
                 "pip",
                 "install",
-                "--no-deps",
                 "--target",
                 str(target),
                 str(artifact),

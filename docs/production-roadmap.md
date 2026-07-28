@@ -311,17 +311,25 @@ Make the integrity and configured signer authenticity of action-governance
 evidence independently verifiable, verify supported external receipts, and prove
 that supported framework adapters preserve identical governance semantics.
 
-### Planned model
+### Unreleased implementation
 
-- Define a versioned Governance Evidence Bundle containing normalized request
-  digests, trusted identity, policy and contract digests, approval lease,
-  execution receipt, terminal outcome, and reconciliation lineage.
-- Add an offline verifier and JSON Schema with explicit compatibility rules.
-- Report three separate verification levels: bundle `integrity`, signer
-  `authenticity`, and `outcome_verified`. Integrity alone never asserts an
-  external real-world result.
-- Support a pluggable asymmetric signer with key identifiers, trust roots,
-  rotation, revocation, and verifier policy.
+- A versioned Governance Evidence Bundle contains normalized action, identity,
+  policy, approval, execution, reconciliation, audit-anchor, and redaction
+  commitments without raw parameters, prompts, or identity values.
+- The offline verifier validates strict JSON/schema input, canonical digest
+  commitments, requested tenant/policy/contract bindings, reconciliation
+  sequence and legal transitions, plus detached Ed25519 signatures against
+  explicit trust roots.
+- Its machine-readable report keeps bundle `integrity`, signer `authenticity`,
+  and `outcome_verified` separate. Integrity alone never asserts an external
+  real-world result; an unsigned bundle without an expected digest is reported
+  as unanchored.
+- The optional `evidence` extra supplies the default Ed25519 signer and verifier
+  with key identifiers, trust roots, rotation, and revocation. It remains out
+  of the core installation.
+
+### Remaining planned model
+
 - Support external sequence anchors or equivalent continuity evidence when a
   deployment needs deletion and gap detection.
 - Allow tool-specific receipt verifiers to establish supported external outcome

@@ -20,52 +20,8 @@ final execution boundary - the moment a proposed tool call is about to touch the
 world within the configured storage guarantees. It runs inside the agent stack
 you already use rather than replacing it. The default in-memory idempotency
 store has bounded TTL/LRU retention and does not survive restarts; longer-lived
-protection requires a durable store. The current v0.7 implementation adds
-durable, deterministic reconciliation for `UNKNOWN` outcomes; it remains under
-release verification until the required CI, integration, release-artifact, and
-publication evidence is recorded.
-
-Every shipped guarantee links to its regression test:
-
-| Shipped in v0.5.1 | Evidence |
-| --- | --- |
-| Approval is bound to request ID, tool name, argument digest, risk tier, policy version/digest, subject, tenant, identity issuer, and request expiry. A mismatch or expired request/decision is rejected before the tool body runs | [`test_decision_binding_rejects_wrong_request_or_arguments`](tests/test_approval_identity_hardening.py) |
-| Caller-supplied metadata cannot forge approval, policy, or identity state | [`test_caller_metadata_cannot_forge_required_approval`](tests/test_approval_identity_hardening.py) |
-| A mutating call with an uncertain outcome is recorded as `UNKNOWN` instead of being retried | [`test_cancellation_propagates_and_marks_context_unknown`](tests/test_production_reliability.py) |
-| Idempotency keys are mandatory for idempotent mutating tools and bound to the parameter fingerprint | [`test_idempotency_key_is_bound_to_parameter_fingerprint`](tests/test_execution_hardening.py) |
-| JSONL audit is hash-chained and signable; deletion and tampering are detected | [`test_jsonl_audit_hash_chain_detects_deletion_and_tamper`](tests/test_audit_otel_hardening.py) |
-
-v0.6 binds one immutable action across the final execution boundary. Every
-claim below is covered by a regression test or recorded benchmark:
-
-| Shipped in v0.6.0 | Evidence |
-| --- | --- |
-| The exact frozen parameter snapshot covered by `action_digest` reaches the tool body and cannot be replaced by middleware or hooks | [`test_exact_bound_snapshot_reaches_tool_and_audit`](tests/test_bound_action_runtime.py), [`test_middleware_cannot_replace_or_mutate_bound_action`](tests/test_bound_action_runtime.py) |
-| Key, policy, and external-precondition drift fail before tool entry | [`test_key_rotation_fails_before_tool_entry`](tests/test_bound_action_runtime.py), [`test_policy_identity_mismatch_fails_closed`](tests/test_bound_action_runtime.py), [`test_precondition_change_fails_before_tool_entry`](tests/test_bound_action_runtime.py) |
-| Approval and idempotency consume `action_digest`; v0.5 records remain readable but cannot authorize or satisfy a contracted v0.6 action | [`test_approval_is_bound_to_action_digest`](tests/test_bound_action_runtime.py), [`test_v05_approval_fails_closed_for_contracted_tool`](tests/test_bound_action_runtime.py), [`test_v05_compatibility.py`](tests/test_v05_compatibility.py) |
-| Success and terminal exception/timeout/cancellation paths retain the same action identity | [`test_exact_bound_snapshot_reaches_tool_and_audit`](tests/test_bound_action_runtime.py), [`test_exception_and_timeout_keep_bound_action_in_audit`](tests/test_bound_action_runtime.py), [`test_cancellation_keeps_bound_action_in_audit`](tests/test_bound_action_runtime.py) |
-| Audit evidence carries the action identity without duplicating raw parameters, and OpenTelemetry exports the same contract/action attributes | [`test_audit_bound_action_never_duplicates_raw_parameters`](tests/test_bound_action_runtime.py), [`test_opentelemetry_exports_bound_action_identity`](tests/test_audit_otel_hardening.py) |
-| At 1,000 requests and concurrency 100 on the recorded Windows/Python 3.12 host, the median of three alternating paired runs measured action bind plus verification at 1.553x mean, 1.720x p95, 1.850x p99, and 1.040x peak traced memory versus its strict baseline | [`v0.6.0-windows-python312.json`](benchmarks/results/v0.6.0-windows-python312.json), [`v0.6.0 budget`](benchmarks/budgets/v0.6.0.json) |
-
-The current v0.7 implementation keeps `UNKNOWN` recovery on a durable,
-compare-and-set ledger. The following behaviors are implemented and covered by
-regression tests; they are not a claim that an external side effect is
-exactly-once unless the downstream system independently supports that property.
-
-| Implemented for v0.7 release verification | Evidence |
-| --- | --- |
-| Before an idempotent side effect can be dispatched, the SQLite claim and bounded recovery descriptor (excluding raw caller key and tool parameters) are created in one transaction; an expired prepared lease materializes an `UNKNOWN` head instead of becoming retryable | [`test_runtime_atomically_prepares_recovery_descriptor_before_dispatch`](tests/test_runtime_reconciliation.py), [`test_expired_atomically_prepared_lease_materializes_reconciliation_head`](tests/test_reconciliation.py) |
-| Reconciliation records are append-only and revision-checked. The provider identity, protocol version, and supported evidence kinds persisted with the action must still match after restart | [`test_reconciliation_rejects_provider_drift_after_restart`](tests/test_runtime_reconciliation.py) |
-| Reconciliation head/event lineage intent is committed to a SQLite outbox with the matching mutation. Delivery is ordered per execution, retryable, and deduplicated by a stable source event ID at `SQLiteAuditSink` | [`test_reconciliation_audit_outbox_is_ordered_and_redacted`](tests/test_reconciliation.py), [`test_sqlite_audit_source_id_prevents_duplicate_after_ack_failure`](tests/test_runtime_reconciliation.py) |
-| Strict control-plane operations require separate probe, manual-resolution, and audit-drain permissions, plus tenant binding for per-action access | [`test_strict_reconciliation_denies_cross_tenant_probe_without_attempt`](tests/test_runtime_reconciliation.py), [`test_strict_global_audit_recovery_requires_its_own_permission`](tests/test_runtime_reconciliation.py) |
-| A durable started probe is finalized under an independent budget. An expired unclosed probe is closed with `recovery_required` and moved to `MANUAL_REVIEW`; a second provider probe is not started | [`test_cancellation_during_finish_keeps_finalization_running`](tests/test_runtime_reconciliation.py), [`test_restart_quarantines_an_expired_unfinished_provider_attempt`](tests/test_runtime_reconciliation.py) |
-| Control-plane caller deadlines bound audit recovery and delivery; a stalled sink leaves the durable envelope pending rather than corrupting the ledger or holding the process open after shutdown | [`test_global_audit_recovery_honors_its_caller_deadline`](tests/test_runtime_reconciliation.py), [`test_blocked_reconciliation_audit_sink_cannot_hold_python_process_open`](tests/test_runtime_reconciliation.py) |
-| Shared SQLite migration rejects orphaned staging objects and cannot upgrade idempotency independently of an existing reconciliation authority | [`test_sqlite_idempotency_rejects_orphaned_migration_staging_table`](tests/test_contracts_idempotency.py), [`test_standalone_idempotency_migration_rejects_colocated_reconciliation`](tests/test_contracts_idempotency.py) |
-| Async shutdown rejects self- and cross-loop deadlocks, stops new admission, and waits for already-admitted, cancellation-ignoring, and thread-backed runtime work before releasing executors | [`test_aclose_waits_for_active_public_operation`](tests/test_runtime.py), [`test_aclose_waits_for_detached_uncooperative_async_tool`](tests/test_runtime.py), [`test_aclose_waits_for_timed_out_uncooperative_sync_hook`](tests/test_runtime.py), [`test_aclose_waits_for_timed_out_uncooperative_sync_audit_sink`](tests/test_runtime.py), [`test_aclose_waits_for_timed_out_sync_tool_on_external_executor`](tests/test_runtime.py), [`test_aclose_waits_for_a_cancellation_ignoring_provider`](tests/test_runtime_reconciliation.py), [`test_aclose_rejects_self_shutdown_from_active_operation`](tests/test_runtime.py), [`test_aclose_rejects_cross_loop_shutdown_while_work_is_active`](tests/test_runtime.py) |
-
-The staged v0.8-v1.0 direction and its exit criteria are in
-[`ROADMAP.md`](ROADMAP.md) and [`docs/production-roadmap.md`](docs/production-roadmap.md).
-Planned capabilities are never presented as shipped.
+protection requires a durable store. v0.7 adds durable, deterministic
+reconciliation for `UNKNOWN` outcomes.
 
 ## Quick start
 
@@ -122,6 +78,54 @@ delete_file(
     _governance=InvocationOptions(input_text="remove the old application log"),
 )
 ```
+
+## Shipped guarantees and regression evidence
+
+Every shipped guarantee links to its regression test:
+
+| Shipped in v0.5.1 | Evidence |
+| --- | --- |
+| Approval is bound to request ID, tool name, argument digest, risk tier, policy version/digest, subject, tenant, identity issuer, and request expiry. A mismatch or expired request/decision is rejected before the tool body runs | [`test_decision_binding_rejects_wrong_request_or_arguments`](tests/test_approval_identity_hardening.py) |
+| Caller-supplied metadata cannot forge approval, policy, or identity state | [`test_caller_metadata_cannot_forge_required_approval`](tests/test_approval_identity_hardening.py) |
+| A mutating call with an uncertain outcome is recorded as `UNKNOWN` instead of being retried | [`test_cancellation_propagates_and_marks_context_unknown`](tests/test_production_reliability.py) |
+| Idempotency keys are mandatory for idempotent mutating tools and bound to the parameter fingerprint | [`test_idempotency_key_is_bound_to_parameter_fingerprint`](tests/test_execution_hardening.py) |
+| JSONL audit is hash-chained and signable; deletion and tampering are detected | [`test_jsonl_audit_hash_chain_detects_deletion_and_tamper`](tests/test_audit_otel_hardening.py) |
+
+v0.6 binds one immutable action across the final execution boundary. Every
+claim below is covered by a regression test or recorded benchmark:
+
+| Shipped in v0.6.0 | Evidence |
+| --- | --- |
+| The exact frozen parameter snapshot covered by `action_digest` reaches the tool body and cannot be replaced by middleware or hooks | [`test_exact_bound_snapshot_reaches_tool_and_audit`](tests/test_bound_action_runtime.py), [`test_middleware_cannot_replace_or_mutate_bound_action`](tests/test_bound_action_runtime.py) |
+| Key, policy, and external-precondition drift fail before tool entry | [`test_key_rotation_fails_before_tool_entry`](tests/test_bound_action_runtime.py), [`test_policy_identity_mismatch_fails_closed`](tests/test_bound_action_runtime.py), [`test_precondition_change_fails_before_tool_entry`](tests/test_bound_action_runtime.py) |
+| Approval and idempotency consume `action_digest`; v0.5 records remain readable but cannot authorize or satisfy a contracted v0.6 action | [`test_approval_is_bound_to_action_digest`](tests/test_bound_action_runtime.py), [`test_v05_approval_fails_closed_for_contracted_tool`](tests/test_bound_action_runtime.py), [`test_v05_compatibility.py`](tests/test_v05_compatibility.py) |
+| Success and terminal exception/timeout/cancellation paths retain the same action identity | [`test_exact_bound_snapshot_reaches_tool_and_audit`](tests/test_bound_action_runtime.py), [`test_exception_and_timeout_keep_bound_action_in_audit`](tests/test_bound_action_runtime.py), [`test_cancellation_keeps_bound_action_in_audit`](tests/test_bound_action_runtime.py) |
+| Audit evidence carries the action identity without duplicating raw parameters, and OpenTelemetry exports the same contract/action attributes | [`test_audit_bound_action_never_duplicates_raw_parameters`](tests/test_bound_action_runtime.py), [`test_opentelemetry_exports_bound_action_identity`](tests/test_audit_otel_hardening.py) |
+| At 1,000 requests and concurrency 100 on the recorded Windows/Python 3.12 host, the median of three alternating paired runs measured action bind plus verification at 1.553x mean, 1.720x p95, 1.850x p99, and 1.040x peak traced memory versus its strict baseline | [`v0.6.0-windows-python312.json`](benchmarks/results/v0.6.0-windows-python312.json), [`v0.6.0 budget`](benchmarks/budgets/v0.6.0.json) |
+
+v0.7 keeps `UNKNOWN` recovery on a durable,
+compare-and-set ledger. The following behaviors are implemented and covered by
+regression tests; they are not a claim that an external side effect is
+exactly-once unless the downstream system independently supports that property.
+
+| Shipped in v0.7.0 | Evidence |
+| --- | --- |
+| Before an idempotent side effect can be dispatched, the SQLite claim and bounded recovery descriptor (excluding raw caller key and tool parameters) are created in one transaction; an expired prepared lease materializes an `UNKNOWN` head instead of becoming retryable | [`test_runtime_atomically_prepares_recovery_descriptor_before_dispatch`](tests/test_runtime_reconciliation.py), [`test_expired_atomically_prepared_lease_materializes_reconciliation_head`](tests/test_reconciliation.py) |
+| Reconciliation records are append-only and revision-checked. The provider identity, protocol version, and supported evidence kinds persisted with the action must still match after restart | [`test_reconciliation_rejects_provider_drift_after_restart`](tests/test_runtime_reconciliation.py) |
+| Reconciliation head/event lineage intent is committed to a SQLite outbox with the matching mutation. Delivery is ordered per execution, retryable, and deduplicated by a stable source event ID at `SQLiteAuditSink` | [`test_reconciliation_audit_outbox_is_ordered_and_redacted`](tests/test_reconciliation.py), [`test_sqlite_audit_source_id_prevents_duplicate_after_ack_failure`](tests/test_runtime_reconciliation.py) |
+| Strict control-plane operations require separate probe, manual-resolution, and audit-drain permissions, plus tenant binding for per-action access | [`test_strict_reconciliation_denies_cross_tenant_probe_without_attempt`](tests/test_runtime_reconciliation.py), [`test_strict_global_audit_recovery_requires_its_own_permission`](tests/test_runtime_reconciliation.py) |
+| A durable started probe is finalized under an independent budget. An expired unclosed probe is closed with `recovery_required` and moved to `MANUAL_REVIEW`; a second provider probe is not started | [`test_cancellation_during_finish_keeps_finalization_running`](tests/test_runtime_reconciliation.py), [`test_restart_quarantines_an_expired_unfinished_provider_attempt`](tests/test_runtime_reconciliation.py) |
+| Control-plane caller deadlines bound audit recovery and delivery; a stalled sink leaves the durable envelope pending rather than corrupting the ledger or holding the process open after shutdown | [`test_global_audit_recovery_honors_its_caller_deadline`](tests/test_runtime_reconciliation.py), [`test_blocked_reconciliation_audit_sink_cannot_hold_python_process_open`](tests/test_runtime_reconciliation.py) |
+| Shared SQLite migration rejects orphaned staging objects and cannot upgrade idempotency independently of an existing reconciliation authority | [`test_sqlite_idempotency_rejects_orphaned_migration_staging_table`](tests/test_contracts_idempotency.py), [`test_standalone_idempotency_migration_rejects_colocated_reconciliation`](tests/test_contracts_idempotency.py) |
+| Async shutdown rejects self- and cross-loop deadlocks, stops new admission, and waits for already-admitted, cancellation-ignoring, and thread-backed runtime work before releasing executors | [`test_aclose_waits_for_active_public_operation`](tests/test_runtime.py), [`test_aclose_waits_for_detached_uncooperative_async_tool`](tests/test_runtime.py), [`test_aclose_waits_for_timed_out_uncooperative_sync_hook`](tests/test_runtime.py), [`test_aclose_waits_for_timed_out_uncooperative_sync_audit_sink`](tests/test_runtime.py), [`test_aclose_waits_for_timed_out_sync_tool_on_external_executor`](tests/test_runtime.py), [`test_aclose_waits_for_a_cancellation_ignoring_provider`](tests/test_runtime_reconciliation.py), [`test_aclose_rejects_self_shutdown_from_active_operation`](tests/test_runtime.py), [`test_aclose_rejects_cross_loop_shutdown_while_work_is_active`](tests/test_runtime.py) |
+
+The staged v0.8-v1.0 direction and its exit criteria are in
+[`ROADMAP.md`](ROADMAP.md) and [`docs/production-roadmap.md`](docs/production-roadmap.md).
+Planned capabilities are never presented as shipped.
+
+The unreleased v0.8 offline verifier, its explicit unsupported paths, and its
+input/exit-code contract are documented in
+[`docs/evidence-verification.md`](docs/evidence-verification.md).
 
 ## How it compares
 

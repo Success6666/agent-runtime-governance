@@ -153,6 +153,15 @@ def test_evidence_bundle_matches_v1_golden_fixture() -> None:
     assert EVIDENCE_BUNDLE_SCHEMA_V1 is evidence_module.EVIDENCE_BUNDLE_SCHEMA_V1
 
 
+def test_evidence_bundle_from_dict_restores_v1_golden_fixture() -> None:
+    fixture = json.loads(_FIXTURE.read_text(encoding="utf-8"))
+
+    restored = EvidenceBundle.from_dict(fixture["document"])
+
+    assert restored.to_dict() == fixture["document"]
+    assert restored.bundle_digest == fixture["bundle_digest"]
+
+
 def test_bundle_projects_only_allowlisted_values_and_never_serializes_secrets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -372,6 +381,22 @@ def test_bundle_rejects_invalid_redactions_and_reconciliation_lineage() -> None:
                     prior_state="UNKNOWN",
                     new_state="MANUAL_REVIEW",
                     evidence_kind="receipt",
+                    created_at=_at(2),
+                ),
+            ),
+        )
+    with pytest.raises(EvidenceBundleValidationError, match="begin at UNKNOWN"):
+        EvidenceBundle.from_bound_action(
+            action,
+            bundle_id="truncated-lineage-bundle-1",
+            created_at=_at(3),
+            execution=EvidenceExecution("truncated-lineage-execution-1", "failed", _at(2)),
+            reconciliation=(
+                ReconciliationEvidenceEntry(
+                    seq=1,
+                    prior_state="MANUAL_REVIEW",
+                    new_state="CONFIRMED_SUCCEEDED",
+                    evidence_kind="manual-resolution",
                     created_at=_at(2),
                 ),
             ),

@@ -13,7 +13,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from jsonschema import Draft202012Validator
 
@@ -615,6 +615,81 @@ class EvidenceBundle:
             redactions=redactions,  # type: ignore[arg-type]
         )
 
+    @classmethod
+    def from_dict(cls, document: Mapping[str, Any]) -> "EvidenceBundle":
+        """Restore one strict, portable Evidence Bundle v1 document.
+
+        The parser reconstructs the existing immutable value objects so an
+        offline verifier applies the same schema, timestamp, and
+        reconciliation-lineage invariants as a runtime-produced bundle.
+        """
+
+        if not isinstance(document, Mapping):
+            raise EvidenceBundleValidationError("evidence bundle must be an object")
+        data = dict(document)
+        _validate_document(data)
+
+        action = _require_document_object(data["action"], "action")
+        identity = _require_document_object(data["identity"], "identity")
+        policy = _require_document_object(data["policy"], "policy")
+        execution = _require_document_object(data["execution"], "execution")
+        approval_data = data["approval"]
+        audit_anchor_data = data["audit_anchor"]
+
+        approval = (
+            None
+            if approval_data is None
+            else _approval_from_document(
+                _require_document_object(approval_data, "approval")
+            )
+        )
+        audit_anchor = (
+            None
+            if audit_anchor_data is None
+            else AuditAnchor(
+                **_require_document_object(audit_anchor_data, "audit_anchor")
+            )
+        )
+        reconciliation = tuple(
+            _reconciliation_from_document(
+                _require_document_object(item, "reconciliation")
+            )
+            for item in _require_document_array(
+                data["reconciliation"], "reconciliation"
+            )
+        )
+
+        bundle = cls(
+            bundle_id=data["bundle_id"],
+            created_at=_parse_external_timestamp("created_at", data["created_at"]),
+            action=_ActionEvidence(**action),
+            identity=_IdentityEvidence(**identity),
+            policy=_PolicyEvidence(**policy),
+            execution=EvidenceExecution(
+                execution_record_id=execution["execution_record_id"],
+                status=execution["status"],
+                started_at=_parse_external_timestamp(
+                    "execution started_at", execution["started_at"]
+                ),
+                finished_at=(
+                    None
+                    if execution["finished_at"] is None
+                    else _parse_external_timestamp(
+                        "execution finished_at", execution["finished_at"]
+                    )
+                ),
+            ),
+            approval=approval,
+            reconciliation=reconciliation,
+            audit_anchor=audit_anchor,
+            redactions=tuple(_require_document_array(data["redactions"], "redactions")),
+        )
+        if bundle.to_dict() != data:
+            raise EvidenceBundleValidationError(
+                "evidence bundle must use the canonical v1 representation"
+            )
+        return bundle
+
     @property
     def signature(self) -> None:
         """Evidence bundle v1 intentionally carries no signature material."""
@@ -690,6 +765,40 @@ class EvidenceBundle:
         return document
 
 
+def _approval_from_document(document: dict[str, Any]) -> _ApprovalEvidence:
+    return _ApprovalEvidence(
+        request_id=document["request_id"],
+        decision_id=document["decision_id"],
+        outcome=document["outcome"],
+        arguments_digest=document["arguments_digest"],
+        decided_at=_parse_external_timestamp(
+            "approval decided_at", document["decided_at"]
+        ),
+        expires_at=(
+            None
+            if document["expires_at"] is None
+            else _parse_external_timestamp(
+                "approval expires_at", document["expires_at"]
+            )
+        ),
+    )
+
+
+def _reconciliation_from_document(
+    document: dict[str, Any],
+) -> ReconciliationEvidenceEntry:
+    return ReconciliationEvidenceEntry(
+        seq=document["seq"],
+        prior_state=document["prior_state"],
+        new_state=document["new_state"],
+        provider_id=document["provider_id"],
+        evidence_kind=document["evidence_kind"],
+        created_at=_parse_external_timestamp(
+            "reconciliation created_at", document["created_at"]
+        ),
+    )
+
+
 def _approval_from_records(
     action: BoundAction,
     request: ApprovalRequest,
@@ -759,6 +868,10 @@ def _validate_reconciliation_lineage(
             raise EvidenceBundleValidationError(
                 "reconciliation sequence numbers must start at 1 and be contiguous"
             )
+        if index == 1 and entry.prior_state != "UNKNOWN":
+            raise EvidenceBundleValidationError(
+                "reconciliation lineage must begin at UNKNOWN"
+            )
         if previous_created_at is not None and entry.created_at < previous_created_at:
             raise EvidenceBundleValidationError(
                 "reconciliation lineage timestamps must not move backwards"
@@ -806,6 +919,18 @@ def _validate_document(document: dict[str, Any]) -> None:
         raise EvidenceBundleValidationError(
             f"evidence bundle schema validation failed at {path}: {error.message}"
         )
+
+
+def _require_document_object(value: Any, name: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise EvidenceBundleValidationError(f"evidence {name} must be an object")
+    return dict(value)
+
+
+def _require_document_array(value: Any, name: str) -> list[Any]:
+    if not isinstance(value, list):
+        raise EvidenceBundleValidationError(f"evidence {name} must be an array")
+    return value
 
 
 def _require_identifier(name: str, value: str) -> None:
