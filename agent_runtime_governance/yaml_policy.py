@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from ._canonical import legacy_policy_json_bytes
 from .context import RiskTier
 from .policy import PolicyMiddleware, SimplePolicy
 
@@ -157,9 +157,7 @@ class YAMLPolicyLoader:
             "version": str(version),
             "policies": sorted(canonical_entries, key=lambda item: item["tool"]),
         }
-        digest = hashlib.sha256(
-            json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
+        digest = hashlib.sha256(legacy_policy_json_bytes(canonical)).hexdigest()
         return PolicyDocument(
             version=str(version),
             digest=digest,

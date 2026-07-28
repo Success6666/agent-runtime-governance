@@ -26,6 +26,7 @@ boundaries.
 | --- | --- | --- |
 | `legacy_audit_json_*` | ASCII-escaped, sorted compact JSON; rejects non-finite values | audit event/state hashes and HMACs; snapshot hashes and signatures |
 | `legacy_storage_json_text` | ASCII-escaped, sorted compact JSON; retains historical non-finite behavior | snapshot JSONL/state and SQLite text; approval rows and integrity payloads |
+| `legacy_policy_json_bytes` | ASCII-escaped, sorted compact JSON; retains historical non-finite behavior | YAML policy semantic digest and downstream governance identity |
 | `legacy_contract_json_bytes` | UTF-8 sorted compact JSON; rejects non-finite values | public `contracts.canonical_json_bytes()` |
 | `rfc8785_json_*` | RFC 8785 bytes | bound actions, reconciliation, and new portable evidence |
 
@@ -37,8 +38,8 @@ commitment format.
 ## Consequences
 
 - A profile is selected explicitly at each compatibility boundary.
-- Unicode, floats, audit hashes/HMACs, snapshot signatures, JSONL state, and
-  SQLite text have v0.5/v0.7 regression fixtures.
+- Unicode, floats, policy digests, audit hashes/HMACs, snapshot signatures,
+  JSONL state, and SQLite text have v0.5/v0.7 regression fixtures.
 - A future format migration needs its own compatibility decision, migration
   path, and fixtures; refactoring through this facade is not a migration.
 - The facade imports only standard JSON support and RFC 8785, preventing

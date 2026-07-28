@@ -1,0 +1,7 @@
+{
+  "canonical_json": "{\"policies\":[{\"admin_only\":true,\"approval\":\"required\",\"effect\":\"allow\",\"required_permissions\":[\"a:read\",\"z:write\"],\"risk\":\"HIGH\",\"tool\":\"outil-\\u00e9\"},{\"admin_only\":false,\"approval\":\"none\",\"effect\":\"deny\",\"required_permissions\":[],\"risk\":null,\"tool\":\"\\u03b2\"}],\"version\":\"1\"}",
+  "input_yaml": "version: \"1\"\npolicies:\n  - tool: \"outil-\u00e9\"\n    approval: required\n    admin_only: true\n    required_permissions: [z:write, a:read]\n    risk: high\n  - tool: \"\u03b2\"\n    effect: deny\n",
+  "semantic_digest": "847d3555336194366169e4b736148bd3be3095b22dfe45aa534d0cd8b4f264fb",
+  "source_commit": "3998c975f88737c9e009b9d85c073122431ddb94",
+  "source_version": "0.7.0"
+}

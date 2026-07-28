@@ -22,10 +22,10 @@ All notable changes are documented here.
 - `Runtime.invoke()` now uses a Runtime-owned event loop while the Runtime is
   open, so terminal cleanup admitted by a synchronous call survives after the
   tool result returns and is coordinated by `aclose()`.
-- Named internal canonical JSON profiles preserve legacy audit, storage, and
-  public contract bytes while keeping RFC 8785 for portable action and
-  reconciliation commitments. v0.5/v0.7 JSONL, SQLite, hash, HMAC, Unicode,
-  and float fixtures lock the compatibility boundary.
+- Named internal canonical JSON profiles preserve legacy audit, storage,
+  policy semantic-digest, and public contract bytes while keeping RFC 8785 for
+  portable action and reconciliation commitments. v0.5/v0.7 JSONL, SQLite,
+  hash, HMAC, Unicode, and float fixtures lock the compatibility boundary.
 
 ### Changed
 

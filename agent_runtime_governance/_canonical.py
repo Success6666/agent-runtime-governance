@@ -3,7 +3,8 @@
 Existing durable formats do not all share one byte representation.  New code
 must select a named profile instead of treating every sorted JSON encoding as
 interchangeable: audit-compatible records use ASCII escapes, contracts retain
-their UTF-8 sorted-JSON form, and new portable commitments use RFC 8785.
+their UTF-8 sorted-JSON form, policy identity retains its historical form, and
+new portable commitments use RFC 8785.
 """
 
 from __future__ import annotations
@@ -41,6 +42,12 @@ def legacy_storage_json_text(value: Any) -> str:
     """Return the existing JSONL/SQLite storage form without NaN rejection."""
 
     return _sorted_json_text(value, ensure_ascii=True, allow_nan=True)
+
+
+def legacy_policy_json_bytes(value: Any) -> bytes:
+    """Return the existing ASCII JSON bytes used by policy semantic digests."""
+
+    return _sorted_json_text(value, ensure_ascii=True, allow_nan=True).encode("utf-8")
 
 
 def rfc8785_json_bytes(
