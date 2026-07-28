@@ -122,28 +122,20 @@ def _validate_metadata(middleware: Middleware) -> MiddlewareMetadata:
     if not isinstance(middleware, Middleware):
         raise TypeError("pipeline entries must be Middleware instances")
     name = getattr(middleware, "name", None)
-    if not isinstance(name, str) or not name.strip():
-        raise ValueError("middleware name must be a non-empty string")
     kind = getattr(middleware, "kind", None)
-    if not isinstance(kind, MiddlewareKind):
-        raise TypeError("middleware kind must be a MiddlewareKind")
     priority = getattr(middleware, "priority", None)
-    if isinstance(priority, bool) or not isinstance(priority, int):
-        raise TypeError("middleware priority must be an integer")
     replayable = getattr(middleware, "replayable", None)
-    if not isinstance(replayable, bool):
-        raise TypeError("middleware replayable must be a boolean")
+    _validate_fields("middleware", name, kind, priority, replayable)
     metadata = middleware.metadata
     if not isinstance(metadata, MiddlewareMetadata):
         raise TypeError("middleware metadata must be MiddlewareMetadata")
-    if not isinstance(metadata.name, str) or not metadata.name.strip():
-        raise ValueError("middleware metadata name must be a non-empty string")
-    if not isinstance(metadata.kind, MiddlewareKind):
-        raise TypeError("middleware metadata kind must be a MiddlewareKind")
-    if isinstance(metadata.priority, bool) or not isinstance(metadata.priority, int):
-        raise TypeError("middleware metadata priority must be an integer")
-    if not isinstance(metadata.replayable, bool):
-        raise TypeError("middleware metadata replayable must be a boolean")
+    _validate_fields(
+        "middleware metadata",
+        metadata.name,
+        metadata.kind,
+        metadata.priority,
+        metadata.replayable,
+    )
     if not isinstance(metadata.version, str) or not metadata.version.strip():
         raise ValueError("middleware metadata version must be a non-empty string")
     if metadata.name != name:
@@ -159,3 +151,20 @@ def _validate_metadata(middleware: Middleware) -> MiddlewareMetadata:
             "middleware metadata replayable must match middleware replayable"
         )
     return metadata
+
+
+def _validate_fields(
+    label: str,
+    name: object,
+    kind: object,
+    priority: object,
+    replayable: object,
+) -> None:
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(f"{label} name must be a non-empty string")
+    if not isinstance(kind, MiddlewareKind):
+        raise TypeError(f"{label} kind must be a MiddlewareKind")
+    if isinstance(priority, bool) or not isinstance(priority, int):
+        raise TypeError(f"{label} priority must be an integer")
+    if not isinstance(replayable, bool):
+        raise TypeError(f"{label} replayable must be a boolean")
