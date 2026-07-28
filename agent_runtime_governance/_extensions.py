@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from collections.abc import Iterable
 from concurrent.futures import Future as ConcurrentFuture
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
@@ -123,6 +124,18 @@ class _ExtensionDispatcher:
 
         with self._state_lock:
             self._observers.append(observer)
+
+    def replace_observers(self, observers: Iterable[ExtensionDispatchObserver]) -> None:
+        """Replace Runtime-managed observers without retaining removed middleware."""
+
+        unique: list[ExtensionDispatchObserver] = []
+        observer_ids: set[int] = set()
+        for observer in observers:
+            if id(observer) not in observer_ids:
+                observer_ids.add(id(observer))
+                unique.append(observer)
+        with self._state_lock:
+            self._observers = unique
 
     @property
     def shutdown_signal(self) -> Event:
