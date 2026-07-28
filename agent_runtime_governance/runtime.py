@@ -907,7 +907,8 @@ class Runtime:
                 raise RuntimeError("runtime is closed")
 
     def _shutdown_executors(self, *, wait: bool) -> None:
-        self._detach_extension_dispatch_metrics()
+        with self._production_seal_lock:
+            self._detach_extension_dispatch_metrics()
         if self._owns_reconciliation_audit_executor:
             # A synchronous third-party sink cannot be force-cancelled once it
             # has entered a blocking write. This dedicated executor has daemon
@@ -1073,6 +1074,7 @@ class Runtime:
     @pipeline.setter
     def pipeline(self, value: Pipeline | Iterable[Middleware]) -> None:
         with self._production_seal_lock:
+            self._assert_accepting_work()
             self._guard_sealed_mutation("pipeline")
             pipeline = (
                 value if isinstance(value, Pipeline) else Pipeline(value)
