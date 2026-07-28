@@ -52,6 +52,13 @@ from .evaluation import (
     RegressionReport,
     RegressionResult,
 )
+from .evidence import (
+    AuditAnchor,
+    EvidenceBundle,
+    EvidenceBundleValidationError,
+    EvidenceExecution,
+    ReconciliationEvidenceEntry,
+)
 from .hooks import HookPoint, HookRegistry
 from .identity import (
     HMACClaimsIdentityProvider,
@@ -180,6 +187,7 @@ __all__ = [
     "ApprovalStatus",
     "ApprovalStore",
     "AuditDeliveryError",
+    "AuditAnchor",
     "AuditSink",
     "AuditIntegrityError",
     "AuditMiddleware",
@@ -201,6 +209,9 @@ __all__ = [
     "ExecutionContext",
     "ExecutionMode",
     "ExecutionStatus",
+    "EvidenceBundle",
+    "EvidenceBundleValidationError",
+    "EvidenceExecution",
     "EvaluationSuite",
     "GatingMiddleware",
     "GovernanceDenied",
@@ -266,6 +277,7 @@ __all__ = [
     "ReconciliationConflictError",
     "ReconciliationDisposition",
     "ReconciliationError",
+    "ReconciliationEvidenceEntry",
     "ReconciliationEventKind",
     "ReconciliationFinding",
     "ReconciliationHead",
