@@ -48,6 +48,14 @@ Audit and snapshot redaction share a dependency-neutral private boundary.
 persistence imports the private implementation directly. Redaction still runs
 before audit hashing, HMACs, source-idempotency digests, and snapshot signatures.
 
+Portable evidence schema v1 is a separate, unsigned compatibility boundary.
+`EvidenceBundle` accepts only frozen, receipt-free value objects and projects
+an explicit allowlist from a `BoundAction`; it never accepts a live
+`ExecutionContext`, audit sink, raw reconciliation payload, or raw approval
+record. Its RFC 8785 digest establishes integrity only. Signer authenticity,
+external anchors, receipts, and outcome verification remain later v0.8
+capabilities.
+
 ## Invariants
 
 1. Identity and trace fields cannot be rewritten by middleware.

@@ -28,6 +28,11 @@ All notable changes are documented here.
   hash, HMAC, Unicode, and float fixtures lock the compatibility boundary.
 - A dependency-neutral internal redaction boundary shared by audit and
   snapshots, preserving public audit imports and v0.7 JSONL/SQLite bytes.
+- A privacy-safe, unsigned evidence bundle schema v1. Immutable allowlisted
+  DTOs bind action, pseudonymous identity, policy, optional approval,
+  receipt-free execution, reconciliation lineage, audit-anchor, and redaction
+  commitments through an RFC 8785 domain-separated digest; signing and
+  external-outcome verification remain separate v0.8 work packages.
 
 ### Changed
 
