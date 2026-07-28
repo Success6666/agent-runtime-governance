@@ -2620,6 +2620,11 @@ class Runtime:
         attempt: ReconciliationAttemptContext,
     ) -> ReconciliationFinding:
         self._raise_if_reconciliation_provider_available(provider.provider_id)
+        timeout = self._bounded_timeout(
+            attempt.deadline,
+            self.limits.reconciliation_provider_timeout_seconds,
+            "reconciliation provider",
+        )
         callback = getattr(provider.provider, "reconcile", provider.provider)
         candidate = callback(attempt)
         if not inspect.isawaitable(candidate):
@@ -2633,11 +2638,6 @@ class Runtime:
         with self._lifecycle_lock:
             self._reconciliation_tasks.add(task)
         task.add_done_callback(self._forget_reconciliation_task)
-        timeout = self._bounded_timeout(
-            attempt.deadline,
-            self.limits.reconciliation_provider_timeout_seconds,
-            "reconciliation provider",
-        )
         try:
             done, _ = await asyncio.wait({task}, timeout=timeout)
             if task in done:

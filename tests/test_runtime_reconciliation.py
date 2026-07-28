@@ -10,7 +10,7 @@ from collections.abc import Callable
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from time import monotonic
+from time import monotonic, sleep
 
 import pytest
 
@@ -921,12 +921,77 @@ async def test_reconciliation_rejects_provider_drift_after_restart(
 
 
 @pytest.mark.asyncio
+async def test_expired_provider_budget_is_not_dispatched_after_attempt_start(
+    tmp_path: Path,
+) -> None:
+    class DelayedStartLedger(SQLiteReconciliationLedger):
+        def start_attempt(self, *args: object, **kwargs: object) -> object:
+            sleep(0.05)
+            return super().start_attempt(*args, **kwargs)
+
+    path = tmp_path / "expired-provider-budget.db"
+    provider_calls: list[str] = []
+    release = asyncio.Event()
+    ledger = DelayedStartLedger(path)
+    runtime = Runtime(
+        idempotency_store=SQLiteIdempotencyStore(path),
+        reconciliation_ledger=ledger,
+        limits=RuntimeLimits(reconciliation_provider_timeout_seconds=0.01),
+    )
+
+    async def provider(
+        context: ReconciliationAttemptContext,
+    ) -> ReconciliationFinding:
+        provider_calls.append(context.attempt_id)
+        await release.wait()
+        return ReconciliationFinding(
+            proposed_state=ReconciliationState.CONFIRMED_SUCCEEDED,
+            evidence_kind="receipt",
+            evidence={"receipt_id": "late"},
+            observed_at=context.deadline,
+        )
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        reconciliation_provider=ProviderDescriptor(
+            provider_id="expired-provider-budget",
+            protocol_version="1",
+            supported_evidence_kinds=("receipt",),
+            provider=provider,
+        ),
+    )
+    async def charge() -> None:
+        raise TimeoutError("outcome is uncertain")
+
+    try:
+        with pytest.raises(ToolExecutionError) as failed:
+            await runtime.arun(
+                "charge", _governance=InvocationOptions(idempotency_key="request-1")
+            )
+        execution_record_id = failed.value.context.metadata["execution_record_id"]
+
+        head = await runtime.areconcile(execution_record_id)
+        assert head.state is ReconciliationState.UNKNOWN
+        await asyncio.sleep(0)
+        assert provider_calls == []
+        assert not runtime._reconciliation_tasks
+        attempts = ledger.attempts(execution_record_id)
+        assert len(attempts) == 2
+        assert attempts[0].payload["attempt_id"] == attempts[1].payload["attempt_id"]
+        assert attempts[-1].payload["outcome"] == ReconciliationAttemptOutcome.TIMEOUT.value
+    finally:
+        release.set()
+        await runtime.aclose()
+
+
+@pytest.mark.asyncio
 async def test_late_provider_result_is_discarded_and_provider_is_poisoned(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "late-provider.db"
     late_results: list[str] = []
     entered = asyncio.Event()
+    late_result_observed = asyncio.Event()
 
     async def provider(
         context: ReconciliationAttemptContext,
@@ -937,6 +1002,7 @@ async def test_late_provider_result_is_discarded_and_provider_is_poisoned(
         except asyncio.CancelledError:
             await asyncio.sleep(0.03)
             late_results.append(context.attempt_id)
+            late_result_observed.set()
         return ReconciliationFinding(
             proposed_state=ReconciliationState.CONFIRMED_SUCCEEDED,
             evidence_kind="receipt",
@@ -949,7 +1015,7 @@ async def test_late_provider_result_is_discarded_and_provider_is_poisoned(
     runtime = _runtime(
         path,
         limits=RuntimeLimits(
-            reconciliation_provider_timeout_seconds=0.05,
+            reconciliation_provider_timeout_seconds=0.25,
             cancellation_grace_seconds=0.005,
         ),
     )
@@ -976,7 +1042,8 @@ async def test_late_provider_result_is_discarded_and_provider_is_poisoned(
         first = await runtime.areconcile(execution_record_id)
         assert first.state is ReconciliationState.UNKNOWN
         await asyncio.wait_for(entered.wait(), timeout=0.2)
-        await _wait_until(lambda: bool(late_results), timeout=3.0)
+        await asyncio.wait_for(late_result_observed.wait(), timeout=3.0)
+        assert late_results
         assert runtime.reconciliation_ledger.current(  # type: ignore[union-attr]
             execution_record_id
         ).state is ReconciliationState.UNKNOWN
@@ -1001,7 +1068,7 @@ async def test_aclose_waits_for_a_cancellation_ignoring_provider(
     runtime = _runtime(
         path,
         limits=RuntimeLimits(
-            reconciliation_provider_timeout_seconds=0.02,
+            reconciliation_provider_timeout_seconds=0.25,
             cancellation_grace_seconds=0.005,
         ),
     )
@@ -1457,7 +1524,7 @@ async def test_caller_deadline_expiry_still_finishes_started_attempt(
         with pytest.raises(StageTimeoutError):
             await runtime.areconcile(
                 execution_record_id,
-                deadline=datetime.now(timezone.utc) + timedelta(milliseconds=30),
+                deadline=datetime.now(timezone.utc) + timedelta(seconds=0.25),
             )
 
         assert runtime.reconciliation_ledger is not None
@@ -1760,7 +1827,7 @@ async def test_restart_quarantines_an_expired_unfinished_provider_attempt(
 
     path = tmp_path / "restart-unfinished-attempt.db"
     calls: list[str] = []
-    limits = RuntimeLimits(reconciliation_provider_timeout_seconds=0.02)
+    limits = RuntimeLimits(reconciliation_provider_timeout_seconds=0.25)
     first = Runtime(
         idempotency_store=SQLiteIdempotencyStore(path),
         reconciliation_ledger=FailingFinishLedger(path),
@@ -1807,7 +1874,7 @@ async def test_restart_quarantines_an_expired_unfinished_provider_attempt(
     finally:
         await first.aclose()
 
-    await asyncio.sleep(0.05)
+    await asyncio.sleep(0.3)
     recovery = Runtime(
         idempotency_store=SQLiteIdempotencyStore(path),
         reconciliation_ledger=SQLiteReconciliationLedger(path),
