@@ -6,6 +6,12 @@ All notable changes are documented here.
 
 ### Added
 
+- Extras-gated LangGraph and OpenAI Agents SDK conformance coverage for one
+  real tool-entry path each, including the SDK's native Runner tool loop,
+  compared with the standalone Runtime for
+  successful, policy-denied, and approval-denied governed calls. The suite
+  verifies trusted identity, approval/action binding, and safe action evidence
+  projections without adding framework dependencies to the core package.
 - Internal middleware registration and pipeline-composition seams. Public
   `Pipeline` remains immutable and explicitly ordered; the v0.8 internal
   registry validates metadata and exposes deterministic priority views without

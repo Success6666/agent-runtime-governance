@@ -197,7 +197,12 @@ cannot be overridden by later middleware.
 
 Each framework adapter is intentionally an example rather than a runtime
 dependency. The governed function remains ordinary Python and can be wrapped by
-the framework's native tool interface.
+the framework's native tool interface. The optional LangGraph node and OpenAI
+Agents SDK `FunctionTool` invocation paths have an extras-gated conformance
+suite in [`tests/conformance`](tests/conformance); it compares their governed
+tool boundary with standalone `Runtime` behavior. The OpenAI path uses the
+native Runner with a deterministic in-process Model, makes no provider API
+call, and does not add a general adapter marketplace.
 
 ## Engineering controls
 
