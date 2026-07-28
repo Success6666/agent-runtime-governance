@@ -35,6 +35,7 @@ classifiers = [
 dependencies = [
   "filelock>=3.20.3,<4",
   "jsonschema>=4.23,<5",
+  "rfc3339-validator>=0.1.4,<0.2",
   "rfc8785>=0.1.4,<0.2",
 ]
 
