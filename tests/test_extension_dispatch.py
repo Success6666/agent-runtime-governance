@@ -555,6 +555,46 @@ async def test_sync_tracer_does_not_stall_a_ten_millisecond_ticker() -> None:
 
 
 @pytest.mark.asyncio
+async def test_legacy_sync_tracer_does_not_stall_a_ten_millisecond_ticker() -> None:
+    caller_thread = threading.get_ident()
+    manager_threads: list[int] = []
+
+    class Span:
+        def set_attribute(self, key: str, value: object) -> None:
+            return None
+
+        def end(self) -> None:
+            return None
+
+    class LegacyTracer:
+        def start_as_current_span(self, name: str, **kwargs: object):
+            @contextmanager
+            def manager():
+                manager_threads.append(threading.get_ident())
+                time.sleep(0.15)
+                try:
+                    yield Span()
+                finally:
+                    time.sleep(0.15)
+
+            return manager()
+
+    runtime = Runtime([OpenTelemetryMiddleware(LegacyTracer())])
+
+    @runtime.tool()
+    def work() -> str:
+        return "ok"
+
+    try:
+        assert await _assert_ticker_stays_responsive(runtime.ainvoke("work")) == "ok"
+        assert manager_threads
+        assert manager_threads == [manager_threads[0]]
+        assert manager_threads[0] != caller_thread
+    finally:
+        await runtime.aclose()
+
+
+@pytest.mark.asyncio
 async def test_cancelled_sync_extension_remains_visible_until_aclose_waits_for_it() -> None:
     runtime = Runtime(
         limits=RuntimeLimits(

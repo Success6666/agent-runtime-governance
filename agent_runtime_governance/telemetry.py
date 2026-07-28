@@ -130,6 +130,7 @@ class _SpanEntry:
     owner_context: Context | None = None
     ready: asyncio.Future[_SpanHandle] | None = None
     legacy_terminal: asyncio.Future[None] | None = None
+    legacy_terminal_signal: threading.Event | None = None
     native_start: bool = False
     start_result_awaitable: bool = False
     handle: _SpanHandle | None = None
@@ -237,6 +238,10 @@ class OpenTelemetryMiddleware(ObservingMiddleware):
             entry = self._spans.get(context.trace_id)
         if entry is None:
             return False
+        if entry.legacy_terminal is not None:
+            return await self._request_legacy_terminal_async(
+                context.trace_id, entry, context=context
+            )
         return await self._request_terminal_async(
             context.trace_id, entry, context=context
         )
@@ -271,6 +276,10 @@ class OpenTelemetryMiddleware(ObservingMiddleware):
             entry = self._spans.get(trace_id)
         if entry is None:
             return False
+        if entry.legacy_terminal is not None:
+            return await self._request_legacy_terminal_async(
+                trace_id, entry, description=description
+            )
         return await self._request_terminal_async(
             trace_id, entry, description=description
         )
@@ -297,6 +306,7 @@ class OpenTelemetryMiddleware(ObservingMiddleware):
                 loop = asyncio.get_running_loop()
                 entry.ready = loop.create_future()
                 entry.legacy_terminal = loop.create_future()
+                entry.legacy_terminal_signal = threading.Event()
                 entry.start_task = asyncio.create_task(
                     self._run_current_span_manager(context, entry),
                     name=f"opentelemetry-legacy:{context.trace_id}",
@@ -640,6 +650,41 @@ class OpenTelemetryMiddleware(ObservingMiddleware):
             description=description,
         ) is not None
 
+    async def _request_legacy_terminal_async(
+        self,
+        trace_id: str,
+        entry: _SpanEntry,
+        *,
+        context: ExecutionContext | None = None,
+        description: str | None = None,
+    ) -> bool:
+        """Finish a legacy manager only on the loop that owns its context."""
+
+        if self._runs_on_owner_loop(entry):
+            finalizer = self._request_terminal(
+                trace_id,
+                entry,
+                context=context,
+                description=description,
+            )
+            if finalizer is None:
+                return False
+            await asyncio.shield(finalizer)
+            return True
+
+        terminal = self._submit_terminal_to_owner(
+            trace_id,
+            entry,
+            context=context,
+            description=description,
+        )
+        if terminal is None:
+            # A legacy ``start_as_current_span`` manager owns a ContextVar
+            # token. Its owner loop is the only safe place to close it.
+            return False
+        terminal.add_done_callback(self._consume_terminal_result)
+        return await asyncio.shield(asyncio.wrap_future(terminal))
+
     async def _finalize_entry(self, trace_id: str, entry: _SpanEntry) -> None:
         """End exactly one admitted span, including a late synchronous start."""
 
@@ -651,6 +696,7 @@ class OpenTelemetryMiddleware(ObservingMiddleware):
             if entry.legacy_terminal is not None:
                 if not entry.legacy_terminal.done():
                     entry.legacy_terminal.set_result(None)
+                self._signal_legacy_terminal(entry)
                 assert entry.start_task is not None
                 await asyncio.shield(entry.start_task)
             elif description is not None:
@@ -789,49 +835,109 @@ class OpenTelemetryMiddleware(ObservingMiddleware):
         }
         return {key: value for key, value in attributes.items() if value is not None}
 
-    def _start_current_span(
-        self, context: ExecutionContext, attributes: dict[str, Any]
-    ) -> _SpanHandle:
-        manager = self._current_span_manager(context, attributes)
-        return self._handle(manager.__enter__(), manager=manager)
-
     async def _run_current_span_manager(
         self, context: ExecutionContext, entry: _SpanEntry
     ) -> None:
-        """Own a legacy ContextVar manager until its terminal lifecycle event."""
+        """Dispatch a legacy manager's whole lifecycle to one owned worker."""
 
-        handle: _SpanHandle | None = None
         try:
-            manager = self._current_span_manager(context, self._span_attributes(context))
-            handle = self._handle(manager.__enter__(), manager=manager)
-            with self._lock:
-                entry.handle = handle
-            assert entry.ready is not None
-            entry.ready.set_result(handle)
-            assert entry.legacy_terminal is not None
-            await asyncio.shield(entry.legacy_terminal)
+            with extension_lifecycle_scope():
+                await invoke_extension(
+                    self._run_current_span_manager_in_worker,
+                    context,
+                    entry,
+                )
+        except asyncio.CancelledError:
+            self._signal_legacy_terminal(
+                entry,
+                description="legacy telemetry span owner stopped",
+            )
+            raise
+        except BaseException as exc:
+            if entry.ready is not None and not entry.ready.done():
+                entry.ready.set_exception(exc)
+            raise
+
+    def _run_current_span_manager_in_worker(
+        self,
+        context: ExecutionContext,
+        entry: _SpanEntry,
+    ) -> None:
+        """Run ``__enter__`` and ``__exit__`` in one task on one worker thread."""
+
+        asyncio.run(self._run_current_span_manager_lifecycle(context, entry))
+
+    async def _run_current_span_manager_lifecycle(
+        self,
+        context: ExecutionContext,
+        entry: _SpanEntry,
+    ) -> None:
+        """Keep a legacy ContextVar token local to the extension worker task."""
+
+        manager = self._current_span_manager(context, self._span_attributes(context))
+        with manager as span:
+            handle = self._handle(span)
+            self._publish_legacy_handle(entry, handle)
+            signal = entry.legacy_terminal_signal
+            if signal is None:
+                raise RuntimeError("legacy telemetry span has no terminal signal")
+            while not signal.is_set():
+                await asyncio.sleep(0.001)
             with self._lock:
                 description = entry.abort_description
                 terminal_context = entry.terminal_context
             if description is not None:
-                handle.abort(description)
+                _record_exception(span, RuntimeError(description))
+                _set_status(
+                    span,
+                    "ERROR",
+                    description,
+                    status_cls=handle.status_cls,
+                    status_code_cls=handle.status_code_cls,
+                )
             elif terminal_context is not None:
-                handle.finish(terminal_context)
+                _set_span_terminal_state(
+                    span,
+                    terminal_context,
+                    status_cls=handle.status_cls,
+                    status_code_cls=handle.status_code_cls,
+                )
             else:
-                handle.abort("legacy telemetry span closed without terminal context")
-        except BaseException as exc:
-            if handle is None:
-                if entry.ready is not None and not entry.ready.done():
-                    entry.ready.set_exception(exc)
-            elif not handle.ended:
-                try:
-                    handle.abort("legacy telemetry span owner stopped")
-                except BaseException:
-                    try:
-                        handle._end()
-                    except BaseException:
-                        pass
-            raise
+                _record_exception(
+                    span,
+                    RuntimeError("legacy telemetry span closed without terminal context"),
+                )
+
+    def _publish_legacy_handle(self, entry: _SpanEntry, handle: _SpanHandle) -> None:
+        """Resolve the caller-loop admission future from the owned worker."""
+
+        owner_loop = entry.owner_loop
+        ready = entry.ready
+        if owner_loop is None or ready is None:
+            raise RuntimeError("legacy telemetry span has no owner loop")
+
+        def publish() -> None:
+            with self._lock:
+                entry.handle = handle
+            if not ready.done():
+                ready.set_result(handle)
+
+        owner_loop.call_soon_threadsafe(publish)
+
+    def _signal_legacy_terminal(
+        self,
+        entry: _SpanEntry,
+        *,
+        description: str | None = None,
+    ) -> None:
+        """Release the worker that owns a legacy manager's ContextVar token."""
+
+        with self._lock:
+            if description is not None and entry.abort_description is None:
+                entry.abort_description = description
+            signal = entry.legacy_terminal_signal
+        if signal is not None:
+            signal.set()
 
     def _current_span_manager(
         self, context: ExecutionContext, attributes: dict[str, Any]
