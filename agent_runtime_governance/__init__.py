@@ -199,6 +199,14 @@ from .resilience import (
     StageTimeoutError,
 )
 from .runtime import Harness, InvocationOptions, RunResult, Runtime
+from .runtime_events import (
+    RUNTIME_EVENT_SCHEMA_V1,
+    RuntimeEvent,
+    RuntimeEventAction,
+    RuntimeEventStream,
+    RuntimeEventSubscriber,
+    RuntimeEventSubscription,
+)
 from .snapshots import (
     ContextSnapshot,
     InMemorySnapshotStore,
@@ -361,8 +369,14 @@ __all__ = [
     "RetryMiddleware",
     "RunResult",
     "Runtime",
+    "RuntimeEvent",
+    "RuntimeEventAction",
+    "RuntimeEventStream",
+    "RuntimeEventSubscriber",
+    "RuntimeEventSubscription",
     "RuntimeBuilder",
     "RuntimeLimits",
+    "RUNTIME_EVENT_SCHEMA_V1",
     "SemanticReview",
     "SimplePolicy",
     "SnapshotMiddleware",

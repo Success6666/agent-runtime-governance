@@ -223,6 +223,14 @@ identity-verification metadata and never creates an executor-authoritative
 audit, and telemetry are never invoked by deterministic replay. A fresh bound
 preview uses `apreview()` and the current trusted identity provider.
 
+`Runtime.events` is a separate terminal-event subscription seam for debugger
+and replay consumers. It publishes only frozen, versioned allowlist projections:
+the tool identity, terminal status, approval state, cancellation marker, and
+bound-action digests. It never exposes a live `Runtime` or `ExecutionContext`,
+nor raw user or tenant values, input, parameters, result, approval reason, or
+provider receipt. Consumer delivery is non-authoritative and uses the
+Runtime-owned async-first extension dispatcher.
+
 Policy documents expose a formatting-independent semantic digest and an exact
 artifact-byte digest. Strict production identity uses the artifact digest;
 drift analysis may use semantic identity. Duplicate tool rules are rejected
