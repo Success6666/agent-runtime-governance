@@ -31,8 +31,13 @@ All notable changes are documented here.
 - A privacy-safe, unsigned evidence bundle schema v1. Immutable allowlisted
   DTOs bind action, pseudonymous identity, policy, optional approval,
   receipt-free execution, reconciliation lineage, audit-anchor, and redaction
-  commitments through an RFC 8785 domain-separated digest; signing and
-  external-outcome verification remain separate v0.8 work packages.
+  commitments through an RFC 8785 domain-separated digest; external-outcome
+  verification remains a separate v0.8 work package.
+- Optional detached Ed25519 evidence signatures and closed, explicitly
+  configured trust roots. Signature attachments bind a fixed version, key ID,
+  algorithm, and unsigned bundle digest without changing the bundle; unknown,
+  rotated, revoked, expired, malformed, or unavailable signing material fails
+  closed. The core installation remains free of the cryptography dependency.
 
 ### Changed
 

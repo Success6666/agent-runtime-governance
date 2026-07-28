@@ -48,13 +48,15 @@ Audit and snapshot redaction share a dependency-neutral private boundary.
 persistence imports the private implementation directly. Redaction still runs
 before audit hashing, HMACs, source-idempotency digests, and snapshot signatures.
 
-Portable evidence schema v1 is a separate, unsigned compatibility boundary.
+Portable evidence schema v1 is a separate compatibility boundary.
 `EvidenceBundle` accepts only frozen, receipt-free value objects and projects
 an explicit allowlist from a `BoundAction`; it never accepts a live
 `ExecutionContext`, audit sink, raw reconciliation payload, or raw approval
-record. Its RFC 8785 digest establishes integrity only. Signer authenticity,
-external anchors, receipts, and outcome verification remain later v0.8
-capabilities.
+record. Its RFC 8785 digest establishes integrity only. The optional
+`evidence` extra can attach a detached Ed25519 signature bound to the bundle
+digest and a closed, explicitly configured trust-root set; it never changes
+the unsigned bundle or treats a signature as an external outcome. External
+anchors, receipts, and outcome verification remain later v0.8 capabilities.
 
 ## Invariants
 
