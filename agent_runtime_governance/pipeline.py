@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Iterator
 
-from ._pipeline_runner import MiddlewareRegistry
+from ._internal.runtime.pipeline_runner import MiddlewareRegistry
 from .middleware.base import Middleware
 
 

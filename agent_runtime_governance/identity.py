@@ -10,8 +10,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Mapping, Protocol
 
-from ._serialization import freeze_mapping as _freeze_mapping
-from ._serialization import thaw as _thaw
+from ._internal.serialization.values import freeze_mapping as _freeze_mapping
+from ._internal.serialization.values import thaw as _thaw
 from ._sqlite import connect_sqlite, initialize_sqlite
 from .contracts import canonical_json_bytes
 

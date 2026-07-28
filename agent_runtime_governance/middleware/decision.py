@@ -5,8 +5,8 @@ import threading
 from datetime import datetime, timedelta, timezone
 from time import monotonic
 
-from .._blocking import run_blocking
-from .._metadata import metadata_text as _metadata_text
+from .._internal.runtime.blocking import run_blocking
+from .._internal.runtime.metadata import metadata_text as _metadata_text
 from ..approval_store import ApprovalStore
 from ..context import ExecutionContext, HistoryEntry
 from ..decisions import (

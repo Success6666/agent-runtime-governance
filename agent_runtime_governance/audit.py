@@ -14,8 +14,8 @@ from typing import Any, Awaitable, Protocol
 
 from filelock import FileLock
 
-from . import _redaction
-from ._canonical import legacy_audit_json_text
+from ._internal.audit import redaction as _redaction
+from ._internal.serialization.canonical import legacy_audit_json_text
 from ._sqlite import connect_sqlite, initialize_sqlite
 from .context import ExecutionContext
 from .errors import AuditIntegrityError

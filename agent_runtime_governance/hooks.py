@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Awaitable, Callable, TypeAlias
 
-from ._blocking import invoke_extension
+from ._internal.runtime.blocking import invoke_extension
 from .context import ExecutionContext, HistoryEntry
 
 

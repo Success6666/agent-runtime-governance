@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Awaitable, Callable, TypeAlias
 
-from .._blocking import invoke_extension
+from .._internal.runtime.blocking import invoke_extension
 from ..context import ExecutionContext, HistoryEntry
 from ..decisions import DecisionOutcome, DecisionRecord
 from .base import GatingMiddleware

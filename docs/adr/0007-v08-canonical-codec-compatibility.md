@@ -17,10 +17,11 @@ migrating those historical contracts.
 
 ## Decision
 
-`agent_runtime_governance._canonical` is a private, dependency-neutral facade
-with named profiles. Callers retain normalization, redaction, schema
-validation, and domain-specific exception translation at their existing
-boundaries.
+`agent_runtime_governance._internal.serialization.canonical` is the private,
+dependency-neutral implementation with named profiles. The historical
+`agent_runtime_governance._canonical` path remains a thin compatibility
+re-export. Callers retain normalization, redaction, schema validation, and
+domain-specific exception translation at their existing boundaries.
 
 | Profile | Contract | Current callers |
 | --- | --- | --- |
