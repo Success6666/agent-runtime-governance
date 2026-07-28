@@ -1,23 +1,39 @@
 """Offline, machine-readable verification for Governance Evidence Bundle v1.
 
-The command deliberately performs no network access.  It verifies the
-portable bundle, an optional detached signature attachment, and caller-supplied
-tenant, policy, and contract expectations.  Receipt verification is not part
-of this v0.8 work package, so the outcome level remains explicitly
-unsupported.
+The command deliberately performs no network access itself. It verifies the
+portable bundle, optional detached signature inputs, caller-supplied binding
+expectations, and explicitly selected external anchor or receipt providers.
+Those providers receive only detached, bounded inputs and are never inferred
+from bundle contents.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import inspect
 import json
 import re
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from importlib import metadata
 from pathlib import Path
 from typing import Any, NoReturn
 
 from .evidence import EvidenceBundle, EvidenceBundleValidationError
+from .evidence_external import (
+    ANCHOR_PROVIDER_ENTRY_POINT_GROUP,
+    RECEIPT_VERIFIER_ENTRY_POINT_GROUP,
+    AnchorProvider,
+    AnchorVerificationRequest,
+    AnchorVerificationResult,
+    EvidenceExternalValidationError,
+    ReceiptAttachment,
+    ReceiptVerificationRequest,
+    ReceiptVerificationResult,
+    ReceiptVerifier,
+)
 from .evidence_signing import (
     EvidenceSignatureAttachment,
     EvidenceSignatureValidationError,
@@ -33,10 +49,41 @@ EXIT_VERIFICATION_FAILURE = 1
 EXIT_UNSUPPORTED = 2
 
 _REPORT_SCHEMA_VERSION = "1"
+_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}$")
+_EXTERNAL_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 _RFC3339_TIMESTAMP = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
 )
+_ANCHOR_INPUT_REASONS = frozenset(
+    {
+        "anchor_provider_invalid",
+        "anchor_provider_load_failed",
+        "anchor_provider_unavailable",
+        "anchor_sequence_invalid",
+    }
+)
+_ANCHOR_FAILURE_REASONS = frozenset(
+    {
+        "anchor_sequence_deletion_detected",
+        "anchor_sequence_mismatch",
+        "anchor_sequence_reordered",
+        "anchor_subject_missing",
+    }
+)
+_ANCHOR_UNSUPPORTED_REASONS = frozenset(
+    {"anchor_provider_unsupported", "anchor_sequence_unavailable"}
+)
+_RECEIPT_INPUT_REASONS = frozenset(
+    {
+        "receipt_attachment_invalid",
+        "receipt_verifier_invalid",
+        "receipt_verifier_load_failed",
+        "receipt_verifier_unavailable",
+    }
+)
+_RECEIPT_FAILURE_REASONS = frozenset({"receipt_not_found", "receipt_not_verified"})
+_RECEIPT_UNSUPPORTED_REASONS = frozenset({"receipt_verifier_unsupported"})
 
 
 class _CliUsageError(ValueError):
@@ -52,6 +99,42 @@ class _ArgumentParser(argparse.ArgumentParser):
         raise _CliUsageError(message)
 
 
+class _DiscardingTextStream:
+    """A bounded sink used to preserve the verifier's JSON-only CLI protocol."""
+
+    def write(self, value: str) -> int:
+        return len(value)
+
+    def flush(self) -> None:
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedAnchorProvider:
+    provider_id: str
+    protocol_version: str
+    verify: Any
+
+    def report_details(self) -> dict[str, str]:
+        return {
+            "provider_id": self.provider_id,
+            "provider_protocol_version": self.protocol_version,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedReceiptVerifier:
+    verifier_id: str
+    protocol_version: str
+    verify: Any
+
+    def report_details(self) -> dict[str, str]:
+        return {
+            "verifier_id": self.verifier_id,
+            "verifier_protocol_version": self.protocol_version,
+        }
+
+
 def verify_evidence_bundle_document(
     document: Mapping[str, Any],
     *,
@@ -59,6 +142,15 @@ def verify_evidence_bundle_document(
     trust_roots: EvidenceTrustRoots | None = None,
     input_reasons: Sequence[str] = (),
     authentication_requested: bool | None = None,
+    anchor_provider: AnchorProvider | None = None,
+    anchor_request: AnchorVerificationRequest | None = None,
+    anchor_input_reasons: Sequence[str] = (),
+    anchor_requested: bool | None = None,
+    receipt_verifier: ReceiptVerifier | None = None,
+    receipt: ReceiptAttachment | None = None,
+    receipt_input_reasons: Sequence[str] = (),
+    outcome_requested: bool | None = None,
+    suppress_provider_output: bool = False,
     expected_bundle_digest: str | None = None,
     expected_tenant_digest: str | None = None,
     expected_policy_version: str | None = None,
@@ -82,6 +174,18 @@ def verify_evidence_bundle_document(
         authentication_requested = (
             signature is not None or trust_roots is not None or bool(input_reasons)
         )
+    if anchor_requested is None:
+        anchor_requested = (
+            anchor_provider is not None
+            or anchor_request is not None
+            or bool(anchor_input_reasons)
+        )
+    if outcome_requested is None:
+        outcome_requested = (
+            receipt_verifier is not None
+            or receipt is not None
+            or bool(receipt_input_reasons)
+        )
     try:
         bundle = EvidenceBundle.from_dict(document)
     except (EvidenceBundleValidationError, TypeError, ValueError):
@@ -92,6 +196,11 @@ def verify_evidence_bundle_document(
                 if authentication_requested
                 else _not_requested_level()
             ),
+            outcome_verified=(
+                _not_evaluated_level("integrity_failed")
+                if outcome_requested
+                else None
+            ),
         )
 
     commitment = _commitment_level(
@@ -99,6 +208,14 @@ def verify_evidence_bundle_document(
         signature=signature,
         expected_bundle_digest=expected_bundle_digest,
         input_reasons=input_reasons,
+    )
+    anchor_continuity = _verify_anchor_continuity(
+        bundle,
+        provider=anchor_provider,
+        request=anchor_request,
+        input_reasons=anchor_input_reasons,
+        requested=anchor_requested,
+        suppress_provider_output=suppress_provider_output,
     )
     integrity_reasons = [
         *commitment["reasons"],
@@ -112,13 +229,15 @@ def verify_evidence_bundle_document(
             expected_contract_digest=expected_contract_digest,
         ),
     ]
+    if anchor_continuity["state"] == "failed":
+        integrity_reasons.extend(anchor_continuity["reasons"])
     integrity = _level(
         state="passed" if not integrity_reasons else "failed",
         ok=not integrity_reasons,
         reasons=integrity_reasons,
         bundle_digest=bundle.bundle_digest,
         commitment=commitment,
-        audit_continuity=_unsupported_level("anchor_verifier_unsupported"),
+        audit_continuity=anchor_continuity,
     )
 
     authenticity = _verify_authenticity(
@@ -128,7 +247,19 @@ def verify_evidence_bundle_document(
         requested=authentication_requested,
         verification_time=verification_time,
     )
-    return _report(integrity=integrity, authenticity=authenticity)
+    outcome_verified = _verify_outcome(
+        bundle,
+        verifier=receipt_verifier,
+        receipt=receipt,
+        input_reasons=receipt_input_reasons,
+        requested=outcome_requested,
+        suppress_provider_output=suppress_provider_output,
+    )
+    return _report(
+        integrity=integrity,
+        authenticity=authenticity,
+        outcome_verified=outcome_verified,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -147,12 +278,55 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     signature, signature_reasons = _read_signature(arguments.signature)
     trust_roots, trust_root_reasons = _read_trust_roots(arguments.trust_roots)
+    anchor_request, anchor_input_reasons = _read_anchor_request(
+        arguments.anchor_sequence
+    )
+    receipt, receipt_input_reasons = _read_receipt(arguments.receipt)
+    anchor_requested = (
+        arguments.anchor_provider is not None or arguments.anchor_sequence is not None
+    )
+    outcome_requested = (
+        arguments.require_outcome
+        or arguments.receipt_verifier is not None
+        or arguments.receipt is not None
+    )
     try:
         verification_time = _parse_verification_time(arguments.at)
     except _CliUsageError:
         return _emit_and_exit(
             _report(integrity=_failed_level("verification_time_invalid"))
         )
+    bundle_is_valid = _is_valid_bundle_document(document)
+    anchor_provider: AnchorProvider | None = None
+    if (
+        bundle_is_valid
+        and arguments.anchor_provider is not None
+        and anchor_request is not None
+        and not anchor_input_reasons
+    ):
+        anchor_provider, anchor_provider_reason = _load_anchor_provider(
+            arguments.anchor_provider
+        )
+        if anchor_provider_reason is not None:
+            anchor_input_reasons = [
+                *anchor_input_reasons,
+                anchor_provider_reason,
+            ]
+    receipt_verifier: ReceiptVerifier | None = None
+    if (
+        bundle_is_valid
+        and arguments.receipt_verifier is not None
+        and receipt is not None
+        and not receipt_input_reasons
+    ):
+        receipt_verifier, receipt_provider_reason = _load_receipt_verifier(
+            arguments.receipt_verifier
+        )
+        if receipt_provider_reason is not None:
+            receipt_input_reasons = [
+                *receipt_input_reasons,
+                receipt_provider_reason,
+            ]
     report = verify_evidence_bundle_document(
         document,
         signature=signature,
@@ -161,6 +335,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         authentication_requested=(
             arguments.signature is not None or arguments.trust_roots is not None
         ),
+        anchor_provider=anchor_provider,
+        anchor_request=anchor_request,
+        anchor_input_reasons=anchor_input_reasons,
+        anchor_requested=anchor_requested,
+        receipt_verifier=receipt_verifier,
+        receipt=receipt,
+        receipt_input_reasons=receipt_input_reasons,
+        outcome_requested=outcome_requested,
+        suppress_provider_output=True,
         expected_bundle_digest=arguments.expected_bundle_digest,
         expected_tenant_digest=arguments.expected_tenant_digest,
         expected_policy_version=arguments.expected_policy_version,
@@ -175,7 +358,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             *signature_reasons,
             *trust_root_reasons,
         )
-    return _emit_and_exit(report, require_outcome=arguments.require_outcome)
+    return _emit_and_exit(
+        report,
+        require_anchor=anchor_requested,
+        require_outcome=outcome_requested,
+    )
 
 
 def _argument_parser() -> argparse.ArgumentParser:
@@ -195,6 +382,32 @@ def _argument_parser() -> argparse.ArgumentParser:
         metavar="FILE",
         type=Path,
         help="EvidenceTrustRoots JSON file for detached signature verification",
+    )
+    parser.add_argument(
+        "--anchor-provider",
+        metavar="ENTRYPOINT",
+        help=(
+            "named anchor provider entry point; only this selected provider is loaded"
+        ),
+    )
+    parser.add_argument(
+        "--anchor-sequence",
+        metavar="FILE",
+        type=Path,
+        help="detached AnchorVerificationRequest JSON file",
+    )
+    parser.add_argument(
+        "--receipt-verifier",
+        metavar="ENTRYPOINT",
+        help=(
+            "named receipt verifier entry point; only this selected verifier is loaded"
+        ),
+    )
+    parser.add_argument(
+        "--receipt",
+        metavar="FILE",
+        type=Path,
+        help="detached ReceiptAttachment JSON file",
     )
     parser.add_argument(
         "--expected-bundle-digest",
@@ -235,7 +448,7 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--require-outcome",
         action="store_true",
-        help="require external outcome verification (currently unsupported)",
+        help="require an external receipt verifier to establish the outcome",
     )
     parser.add_argument(
         "--at",
@@ -310,6 +523,50 @@ def _read_trust_roots(
         ValueError,
     ):
         return None, ["trust_roots_invalid"]
+
+
+def _read_anchor_request(
+    path: Path | None,
+) -> tuple[AnchorVerificationRequest | None, list[str]]:
+    if path is None:
+        return None, []
+    try:
+        return AnchorVerificationRequest.from_dict(
+            _read_json_object(path, "anchor_sequence")
+        ), []
+    except (
+        EvidenceExternalValidationError,
+        _JsonInputError,
+        TypeError,
+        ValueError,
+    ):
+        return None, ["anchor_sequence_invalid"]
+
+
+def _read_receipt(
+    path: Path | None,
+) -> tuple[ReceiptAttachment | None, list[str]]:
+    if path is None:
+        return None, []
+    try:
+        return ReceiptAttachment.from_dict(_read_json_object(path, "receipt")), []
+    except (
+        EvidenceExternalValidationError,
+        _JsonInputError,
+        TypeError,
+        ValueError,
+    ):
+        return None, ["receipt_attachment_invalid"]
+
+
+def _is_valid_bundle_document(document: Mapping[str, Any]) -> bool:
+    """Reject malformed bundles before any selected provider can be imported."""
+
+    try:
+        EvidenceBundle.from_dict(document)
+    except (EvidenceBundleValidationError, TypeError, ValueError):
+        return False
+    return True
 
 
 def _parse_verification_time(value: str | None) -> datetime | None:
@@ -425,16 +682,368 @@ def _verify_authenticity(
     return _passed_level()
 
 
+def _verify_anchor_continuity(
+    bundle: EvidenceBundle,
+    *,
+    provider: AnchorProvider | None,
+    request: AnchorVerificationRequest | None,
+    input_reasons: Sequence[str],
+    requested: bool,
+    suppress_provider_output: bool,
+) -> dict[str, Any]:
+    reasons = _stable_reason_codes(
+        input_reasons,
+        allowed=_ANCHOR_INPUT_REASONS,
+        fallback="anchor_input_invalid",
+    )
+    if reasons:
+        if provider is None and reasons == ("anchor_provider_unavailable",):
+            return _unsupported_level(*reasons)
+        return _failed_level(*reasons)
+    if provider is None:
+        if requested:
+            return _unsupported_level("anchor_provider_missing")
+        return _unsupported_level("anchor_verifier_unsupported")
+    if request is None:
+        return _unsupported_level("anchor_sequence_missing")
+    normalized_request = _normalize_anchor_request(request)
+    if normalized_request is None:
+        return _failed_level("anchor_request_invalid")
+    if (
+        normalized_request.subject_bundle_id != bundle.bundle_id
+        or normalized_request.subject_bundle_digest != bundle.bundle_digest
+    ):
+        return _failed_level("anchor_subject_bundle_mismatch")
+    if normalized_request.tenant_digest != bundle.identity.tenant_digest:
+        return _failed_level("anchor_tenant_digest_mismatch")
+    try:
+        prepared = _call_provider(
+            lambda: _prepare_anchor_provider(provider),
+            suppress_output=suppress_provider_output,
+        )
+    except Exception:
+        return _failed_level("anchor_provider_invalid")
+    if prepared is None:
+        return _failed_level("anchor_provider_invalid")
+    details = prepared.report_details()
+    try:
+        result, async_result = _call_provider(
+            lambda: _normalize_anchor_result(prepared.verify(normalized_request)),
+            suppress_output=suppress_provider_output,
+        )
+    except Exception:
+        return _failed_level("anchor_provider_failed", **details)
+    if async_result:
+        return _failed_level("anchor_provider_async_unsupported", **details)
+    if result is None:
+        return _failed_level("anchor_provider_invalid_result", **details)
+    if result.state == "passed":
+        return _passed_level(**details)
+    if result.state == "unsupported":
+        return _unsupported_level(_anchor_unsupported_reason(result.reason), **details)
+    return _failed_level(_anchor_failure_reason(result.reason), **details)
+
+
+def _verify_outcome(
+    bundle: EvidenceBundle,
+    *,
+    verifier: ReceiptVerifier | None,
+    receipt: ReceiptAttachment | None,
+    input_reasons: Sequence[str],
+    requested: bool,
+    suppress_provider_output: bool,
+) -> dict[str, Any]:
+    reasons = _stable_reason_codes(
+        input_reasons,
+        allowed=_RECEIPT_INPUT_REASONS,
+        fallback="receipt_input_invalid",
+    )
+    if reasons:
+        if verifier is None and reasons == ("receipt_verifier_unavailable",):
+            return _unsupported_level(*reasons)
+        return _failed_level(*reasons)
+    if verifier is None:
+        if requested:
+            return _unsupported_level("receipt_verifier_missing")
+        return _unsupported_level("receipt_verifier_unsupported")
+    if receipt is None:
+        return _failed_level("receipt_attachment_missing")
+    try:
+        request = ReceiptVerificationRequest.from_bundle(bundle, receipt)
+    except (EvidenceExternalValidationError, TypeError, ValueError):
+        return _failed_level("receipt_bundle_digest_mismatch")
+    try:
+        prepared = _call_provider(
+            lambda: _prepare_receipt_verifier(verifier),
+            suppress_output=suppress_provider_output,
+        )
+    except Exception:
+        return _failed_level("receipt_verifier_invalid")
+    if prepared is None:
+        return _failed_level("receipt_verifier_invalid")
+    details = prepared.report_details()
+    try:
+        result, async_result = _call_provider(
+            lambda: _normalize_receipt_result(prepared.verify(request)),
+            suppress_output=suppress_provider_output,
+        )
+    except Exception:
+        return _failed_level("receipt_verifier_failed", **details)
+    if async_result:
+        return _failed_level("receipt_verifier_async_unsupported", **details)
+    if result is None:
+        return _failed_level("receipt_verifier_invalid_result", **details)
+    if result.state == "passed":
+        if (
+            bundle.execution.status != "unknown"
+            and result.outcome != bundle.execution.status
+        ):
+            return _failed_level("receipt_outcome_mismatch", **details)
+        outcome_details: dict[str, Any] = {"outcome": result.outcome, **details}
+        if bundle.execution.status == "unknown":
+            outcome_details["recorded_execution_status"] = "unknown"
+        return _passed_level(**outcome_details)
+    if result.state == "unsupported":
+        return _unsupported_level(_receipt_unsupported_reason(result.reason), **details)
+    return _failed_level(_receipt_failure_reason(result.reason), **details)
+
+
+def _load_anchor_provider(
+    name: str,
+) -> tuple[AnchorProvider | None, str | None]:
+    provider, state = _load_named_provider(
+        name,
+        ANCHOR_PROVIDER_ENTRY_POINT_GROUP,
+        _prepare_anchor_provider,
+    )
+    if state == "unavailable":
+        return None, "anchor_provider_unavailable"
+    if state == "load_failed":
+        return None, "anchor_provider_load_failed"
+    return provider, None
+
+
+def _load_receipt_verifier(
+    name: str,
+) -> tuple[ReceiptVerifier | None, str | None]:
+    verifier, state = _load_named_provider(
+        name,
+        RECEIPT_VERIFIER_ENTRY_POINT_GROUP,
+        _prepare_receipt_verifier,
+    )
+    if state == "unavailable":
+        return None, "receipt_verifier_unavailable"
+    if state == "load_failed":
+        return None, "receipt_verifier_load_failed"
+    return verifier, None
+
+
+def _load_named_provider(
+    name: str,
+    group: str,
+    prepare_provider: Any,
+) -> tuple[Any | None, str | None]:
+    if not isinstance(name, str) or not _IDENTIFIER.fullmatch(name):
+        return None, "load_failed"
+    try:
+        discovered = metadata.entry_points()
+        entries = (
+            discovered.select(group=group)
+            if hasattr(discovered, "select")
+            else discovered.get(group, ())
+        )
+        matches = tuple(entry for entry in entries if entry.name == name)
+    except Exception:
+        return None, "load_failed"
+    if len(matches) != 1:
+        return None, "unavailable"
+    try:
+        loaded = _call_provider(matches[0].load, suppress_output=True)
+        if inspect.isawaitable(loaded):
+            _call_provider(lambda: _close_coroutine(loaded), suppress_output=True)
+            return None, "load_failed"
+        prepared = _call_provider(
+            lambda: prepare_provider(loaded),
+            suppress_output=True,
+        )
+        if isinstance(loaded, type):
+            if not callable(loaded):
+                return None, "load_failed"
+            loaded = _call_provider(loaded, suppress_output=True)
+            if inspect.isawaitable(loaded):
+                _call_provider(lambda: _close_coroutine(loaded), suppress_output=True)
+                return None, "load_failed"
+            prepared = _call_provider(
+                lambda: prepare_provider(loaded),
+                suppress_output=True,
+            )
+        elif prepared is None:
+            if not inspect.isroutine(loaded):
+                return None, "load_failed"
+            loaded = _call_provider(loaded, suppress_output=True)
+            if inspect.isawaitable(loaded):
+                _call_provider(lambda: _close_coroutine(loaded), suppress_output=True)
+                return None, "load_failed"
+            prepared = _call_provider(
+                lambda: prepare_provider(loaded),
+                suppress_output=True,
+            )
+    except Exception:
+        return None, "load_failed"
+    if prepared is None:
+        return None, "load_failed"
+    return loaded, None
+
+
+def _prepare_anchor_provider(provider: object) -> _PreparedAnchorProvider | None:
+    try:
+        provider_id = getattr(provider, "provider_id")
+        protocol_version = getattr(provider, "protocol_version")
+        verify = getattr(provider, "verify_continuity")
+    except Exception:
+        return None
+    if (
+        not isinstance(provider_id, str)
+        or not _EXTERNAL_IDENTIFIER.fullmatch(provider_id)
+        or not isinstance(protocol_version, str)
+        or not _EXTERNAL_IDENTIFIER.fullmatch(protocol_version)
+        or not callable(verify)
+    ):
+        return None
+    return _PreparedAnchorProvider(provider_id, protocol_version, verify)
+
+
+def _prepare_receipt_verifier(verifier: object) -> _PreparedReceiptVerifier | None:
+    try:
+        verifier_id = getattr(verifier, "verifier_id")
+        protocol_version = getattr(verifier, "protocol_version")
+        verify = getattr(verifier, "verify")
+    except Exception:
+        return None
+    if (
+        not isinstance(verifier_id, str)
+        or not _EXTERNAL_IDENTIFIER.fullmatch(verifier_id)
+        or not isinstance(protocol_version, str)
+        or not _EXTERNAL_IDENTIFIER.fullmatch(protocol_version)
+        or not callable(verify)
+    ):
+        return None
+    return _PreparedReceiptVerifier(verifier_id, protocol_version, verify)
+
+
+def _normalize_anchor_request(
+    request: object,
+) -> AnchorVerificationRequest | None:
+    if type(request) is not AnchorVerificationRequest:
+        return None
+    try:
+        return AnchorVerificationRequest(
+            sequence_id=request.sequence_id,
+            entries=request.entries,
+            subject_bundle_id=request.subject_bundle_id,
+            subject_bundle_digest=request.subject_bundle_digest,
+            tenant_digest=request.tenant_digest,
+        )
+    except (EvidenceExternalValidationError, TypeError, ValueError, AttributeError):
+        return None
+
+
+def _normalize_anchor_result(
+    result: object,
+) -> tuple[AnchorVerificationResult | None, bool]:
+    if inspect.isawaitable(result):
+        _close_coroutine(result)
+        return None, True
+    if type(result) is not AnchorVerificationResult:
+        return None, False
+    try:
+        return AnchorVerificationResult(result.state, result.reason), False
+    except (EvidenceExternalValidationError, TypeError, ValueError, AttributeError):
+        return None, False
+
+
+def _normalize_receipt_result(
+    result: object,
+) -> tuple[ReceiptVerificationResult | None, bool]:
+    if inspect.isawaitable(result):
+        _close_coroutine(result)
+        return None, True
+    if type(result) is not ReceiptVerificationResult:
+        return None, False
+    try:
+        return ReceiptVerificationResult(result.state, result.outcome, result.reason), False
+    except (EvidenceExternalValidationError, TypeError, ValueError, AttributeError):
+        return None, False
+
+
+def _close_coroutine(value: object) -> None:
+    if inspect.iscoroutine(value):
+        try:
+            value.close()
+        except Exception:
+            return None
+
+
+def _anchor_failure_reason(reason: str | None) -> str:
+    if reason in _ANCHOR_FAILURE_REASONS:
+        return reason
+    return "anchor_provider_not_verified"
+
+
+def _anchor_unsupported_reason(reason: str | None) -> str:
+    if reason in _ANCHOR_UNSUPPORTED_REASONS:
+        return reason
+    return "anchor_provider_unsupported"
+
+
+def _receipt_failure_reason(reason: str | None) -> str:
+    if reason in _RECEIPT_FAILURE_REASONS:
+        return reason
+    return "receipt_not_verified"
+
+
+def _receipt_unsupported_reason(reason: str | None) -> str:
+    if reason in _RECEIPT_UNSUPPORTED_REASONS:
+        return reason
+    return "receipt_verifier_unsupported"
+
+
+def _call_provider(
+    callback: Any,
+    *,
+    suppress_output: bool,
+) -> Any:
+    if not suppress_output:
+        return callback()
+    sink = _DiscardingTextStream()
+    with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+        return callback()
+
+
+def _stable_reason_codes(
+    reasons: Sequence[str],
+    *,
+    allowed: frozenset[str],
+    fallback: str,
+) -> tuple[str, ...]:
+    return tuple(
+        reason if isinstance(reason, str) and reason in allowed else fallback
+        for reason in reasons
+    )
+
+
 def _report(
     *,
     integrity: dict[str, Any],
     authenticity: dict[str, Any] | None = None,
+    outcome_verified: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "report_schema_version": _REPORT_SCHEMA_VERSION,
         "integrity": integrity,
         "authenticity": authenticity or _not_requested_level(),
-        "outcome_verified": _unsupported_level("receipt_verifier_unsupported"),
+        "outcome_verified": outcome_verified
+        or _unsupported_level("receipt_verifier_unsupported"),
     }
 
 
@@ -473,13 +1082,28 @@ def _not_evaluated_level(reason: str) -> dict[str, Any]:
     return _level(state="not_evaluated", ok=False, reasons=(reason,))
 
 
-def _emit_and_exit(report: dict[str, Any], *, require_outcome: bool = False) -> int:
+def _emit_and_exit(
+    report: dict[str, Any],
+    *,
+    require_anchor: bool = False,
+    require_outcome: bool = False,
+) -> int:
     integrity = report["integrity"]
     authenticity = report["authenticity"]
+    anchor = integrity.get("audit_continuity")
+    outcome_verified = report["outcome_verified"]
     exit_code = EXIT_SUCCESS
-    if integrity["ok"] is False or authenticity["state"] == "failed":
+    if (
+        integrity["ok"] is False
+        or authenticity["state"] == "failed"
+        or (require_outcome and outcome_verified["state"] == "failed")
+    ):
         exit_code = EXIT_VERIFICATION_FAILURE
-    elif authenticity["state"] == "unsupported" or require_outcome:
+    elif (
+        authenticity["state"] == "unsupported"
+        or (require_anchor and anchor is not None and anchor["state"] == "unsupported")
+        or (require_outcome and outcome_verified["state"] == "unsupported")
+    ):
         exit_code = EXIT_UNSUPPORTED
     encoded = json.dumps(report, sort_keys=True, separators=(",", ":"), allow_nan=False)
     try:

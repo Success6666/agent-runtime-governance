@@ -693,7 +693,9 @@ def _venv_python(venv: Path) -> Path:
     return venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
-def test_wheel_and_sdist_execute_offline_verifier_entry_point(tmp_path: Path) -> None:
+def test_wheel_and_sdist_execute_verifier_and_include_compatibility_resources(
+    tmp_path: Path,
+) -> None:
     distribution = tmp_path / "dist"
     _run(
         [
@@ -724,6 +726,28 @@ def test_wheel_and_sdist_execute_offline_verifier_entry_point(tmp_path: Path) ->
                 "install",
                 "--disable-pip-version-check",
                 str(artifact),
+            ],
+            cwd=tmp_path,
+        )
+        _run(
+            [
+                str(python),
+                "-I",
+                "-c",
+                "\n".join(
+                    (
+                        "import json",
+                        "from importlib.resources import files",
+                        "from agent_runtime_governance import EvidenceBundle",
+                        "root = files('agent_runtime_governance').joinpath('_compatibility', 'evidence', 'v1')",
+                        "fixture = json.loads(root.joinpath('bundle.json').read_text('utf-8'))",
+                        "canonical = bytes.fromhex(root.joinpath('canonical-unsigned.hex').read_text('ascii').strip())",
+                        "bundle = EvidenceBundle.from_dict(fixture['document'])",
+                        "assert bundle.to_dict() == fixture['document']",
+                        "assert bundle.canonical_unsigned_bytes() == canonical",
+                        "assert bundle.bundle_digest == fixture['bundle_digest']",
+                    )
+                ),
             ],
             cwd=tmp_path,
         )

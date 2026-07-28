@@ -1,0 +1,65 @@
+{
+  "action": {
+    "action_digest": "e953e975e860b623481582a78fb2705aeae566856a3ddfb07b93597efd3c46de",
+    "contract_digest": "889a4dac1cc4832bfc34202f68c2a0b99a701e021dadbb8f2496d8f04c8491b3",
+    "contract_id": "ops.evidence.export",
+    "contract_version": 2,
+    "parameters_digest": "266c69a0ecb37c231a5bb17f6bea71b847de3d79691a7f02fccc1c8f16e67077",
+    "precondition_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "tool_name": "export_evidence"
+  },
+  "approval": {
+    "arguments_digest": "82bc37bae1ba45afb3831b4e90dbf7f463e60813ae246486a0891466b45e6d5a",
+    "decided_at": "2026-07-02T00:00:00Z",
+    "decision_id": "approval-decision-1",
+    "expires_at": "2026-07-04T00:00:00Z",
+    "outcome": "allow",
+    "request_id": "approval-request-1"
+  },
+  "audit_anchor": {
+    "chain_head_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "record_count": 17
+  },
+  "bundle_id": "evidence-bundle-1",
+  "created_at": "2026-07-03T00:00:00Z",
+  "execution": {
+    "execution_record_id": "execution-record-1",
+    "finished_at": "2026-07-02T02:00:00Z",
+    "receipt": null,
+    "started_at": "2026-07-02T01:00:00Z",
+    "status": "succeeded"
+  },
+  "identity": {
+    "identity_digest_key_version": "key-v1",
+    "principal_digest": "b2fc99b49549ed81bb0f7564ac122ba632c2f0d38f40d66a91798e02ae14570f",
+    "tenant_digest": "03429426f71ada1c5617ee05b1baa4a925d467922f16221483019be0fded4361"
+  },
+  "policy": {
+    "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "version": "policy-v1"
+  },
+  "reconciliation": [
+    {
+      "created_at": "2026-07-02T03:00:00Z",
+      "evidence_kind": "receipt",
+      "new_state": "MANUAL_REVIEW",
+      "prior_state": "UNKNOWN",
+      "provider_id": "receipt-probe-v1",
+      "seq": 1
+    },
+    {
+      "created_at": "2026-07-02T04:00:00Z",
+      "evidence_kind": "manual-resolution",
+      "new_state": "CONFIRMED_SUCCEEDED",
+      "prior_state": "MANUAL_REVIEW",
+      "provider_id": null,
+      "seq": 2
+    }
+  ],
+  "redactions": [
+    "/approval/arguments",
+    "/parameters"
+  ],
+  "schema_version": "2",
+  "signature": null
+}
