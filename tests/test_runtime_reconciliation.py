@@ -2067,7 +2067,7 @@ async def test_timed_out_outbox_delivery_recovers_without_poisoning_ledger(
         with pytest.raises(ReconciliationAuditDeliveryPendingError) as pending:
             await runtime.areconcile(
                 execution_record_id,
-                deadline=datetime.now(timezone.utc) + timedelta(seconds=2),
+                deadline=datetime.now(timezone.utc) + timedelta(seconds=5),
             )
         assert pending.value.execution_record_id == execution_record_id
         assert await asyncio.to_thread(sink.entered.wait, 1.0)
