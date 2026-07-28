@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 from threading import Event
 
@@ -137,6 +138,49 @@ def test_runtime_close_detaches_prometheus_dispatch_snapshot() -> None:
         'closed_pipeline_rebind_extension_dispatch_workers{state="capacity"} 0.0'
         in generate_latest(registry).decode()
     )
+
+
+@pytest.mark.asyncio
+async def test_close_rejects_concurrent_pipeline_rebinding_after_metrics_detach_starts() -> None:
+    registry = CollectorRegistry()
+    metrics = PrometheusMiddleware(
+        registry=registry,
+        prefix="closing_pipeline_rebind",
+    )
+    runtime = Runtime([metrics])
+    detach_started = Event()
+    allow_detach = Event()
+    detach = runtime._detach_extension_dispatch_metrics
+
+    def block_detach() -> None:
+        detach_started.set()
+        assert allow_detach.wait(timeout=1)
+        detach()
+
+    runtime._detach_extension_dispatch_metrics = block_detach  # type: ignore[method-assign]
+    close_task = asyncio.create_task(asyncio.to_thread(runtime.close))
+    setter_task: asyncio.Task[None] | None = None
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(detach_started.wait, 1), timeout=1.1)
+        setter_task = asyncio.create_task(
+            asyncio.to_thread(setattr, runtime, "pipeline", [metrics])
+        )
+        await asyncio.sleep(0)
+        allow_detach.set()
+        await asyncio.wait_for(close_task, timeout=1)
+        with pytest.raises(RuntimeError, match="runtime is closed"):
+            await asyncio.wait_for(setter_task, timeout=1)
+
+        snapshot = metrics._extension_snapshot()
+        assert snapshot.worker_capacity == 0
+        assert snapshot.in_flight_capacity == 0
+    finally:
+        allow_detach.set()
+        await asyncio.gather(close_task, return_exceptions=True)
+        if setter_task is not None:
+            await asyncio.gather(setter_task, return_exceptions=True)
+        if not runtime._closed:
+            runtime.close()
 
 
 def test_registry_preserves_public_pipeline_registration_order() -> None:
