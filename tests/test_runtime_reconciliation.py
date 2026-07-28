@@ -2024,7 +2024,7 @@ async def test_timed_out_outbox_delivery_recovers_without_poisoning_ledger(
         idempotency_store=SQLiteIdempotencyStore(path),
         reconciliation_ledger=SQLiteReconciliationLedger(path),
         limits=RuntimeLimits(
-            reconciliation_audit_delivery_timeout_seconds=0.01,
+            reconciliation_audit_delivery_timeout_seconds=0.1,
             max_reconciliation_audit_delivery_in_flight=1,
         ),
     )
@@ -2061,6 +2061,7 @@ async def test_timed_out_outbox_delivery_recovers_without_poisoning_ledger(
         execution_record_id = failed.value.execution_record_id
         assert execution_record_id is not None
 
+        await runtime.adrain_reconciliation_audit_outbox(limit=16)
         sink.completed.clear()
         sink.block = True
         with pytest.raises(ReconciliationAuditDeliveryPendingError) as pending:

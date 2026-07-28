@@ -31,7 +31,11 @@ from agent_runtime_governance._blocking import (
     invoke_extension,
     schedule_extension_cleanup,
 )
-from agent_runtime_governance._extensions import invoke_standalone_extension
+from agent_runtime_governance._extensions import (
+    _ExtensionDispatcher,
+    invoke_standalone_extension,
+    is_native_async_callable,
+)
 from agent_runtime_governance.context import ExecutionContext, ExecutionStatus, ToolCall
 from agent_runtime_governance.hooks import HookPoint
 from agent_runtime_governance.middleware.base import GatingMiddleware
@@ -108,6 +112,92 @@ async def test_standalone_sync_fallback_closes_late_coroutine_after_cancellation
             release.set()
             await asyncio.gather(task, return_exceptions=True)
     assert not any("was never awaited" in str(item.message) for item in captured)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"max_workers": 0}, "max_workers"),
+        ({"max_in_flight": 0}, "max_in_flight"),
+        ({"capacity_timeout_seconds": 0}, "capacity_timeout_seconds"),
+    ],
+)
+def test_extension_dispatcher_rejects_invalid_capacity(
+    kwargs: dict[str, float | int], message: str
+) -> None:
+    options: dict[str, object] = {
+        "max_workers": 1,
+        "max_in_flight": 1,
+        "capacity_timeout_seconds": 1.0,
+        "admission_lock": threading.Lock(),
+        "is_accepting": lambda: True,
+    }
+    options.update(kwargs)
+
+    with pytest.raises(ValueError, match=message):
+        _ExtensionDispatcher(**options)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_extension_dispatcher_isolates_metrics_observer_errors() -> None:
+    class BrokenObserver:
+        def record_queue_wait(self, **_kwargs: object) -> None:
+            raise RuntimeError("metrics unavailable")
+
+        def record_execution(self, **_kwargs: object) -> None:
+            raise RuntimeError("metrics unavailable")
+
+        def record_saturation(self, **_kwargs: object) -> None:
+            raise RuntimeError("metrics unavailable")
+
+        def record_detached_work(self, **_kwargs: object) -> None:
+            raise RuntimeError("metrics unavailable")
+
+    dispatcher = _ExtensionDispatcher(
+        max_workers=1,
+        max_in_flight=1,
+        capacity_timeout_seconds=1.0,
+        admission_lock=threading.Lock(),
+        is_accepting=lambda: True,
+    )
+    dispatcher.add_observer(BrokenObserver())  # type: ignore[arg-type]
+    try:
+        assert await dispatcher.invoke(lambda: "ok") == "ok"
+    finally:
+        dispatcher.shutdown(wait=True)
+
+
+@pytest.mark.asyncio
+async def test_extension_dispatcher_rejects_new_work_after_shutdown() -> None:
+    dispatcher = _ExtensionDispatcher(
+        max_workers=1,
+        max_in_flight=1,
+        capacity_timeout_seconds=1.0,
+        admission_lock=threading.Lock(),
+        is_accepting=lambda: True,
+    )
+    dispatcher.shutdown(wait=True)
+
+    async def native() -> str:
+        return "unexpected"
+
+    try:
+        assert dispatcher.create_cleanup_task(lambda: asyncio.sleep(0)) is None
+        with pytest.raises(RuntimeError, match="runtime is closed"):
+            await dispatcher.invoke(native)
+        with pytest.raises(RuntimeError, match="runtime is closed"):
+            await dispatcher.invoke(lambda: "unexpected")
+    finally:
+        dispatcher.shutdown(wait=True)
+
+
+def test_native_async_detection_handles_a_recursive_wrapped_chain() -> None:
+    def callback() -> None:
+        return None
+
+    callback.__wrapped__ = callback  # type: ignore[attr-defined]
+
+    assert not is_native_async_callable(callback)
 
 
 @pytest.mark.asyncio
@@ -607,6 +697,83 @@ async def test_sync_otel_terminal_awaits_wrapped_attributes_before_end() -> None
 
     await middleware.process(context)
     await middleware.process(context.evolve(status=ExecutionStatus.SUCCEEDED))
+
+
+@pytest.mark.asyncio
+async def test_native_async_otel_terminal_records_failed_and_aborted_spans() -> None:
+    class Span:
+        def __init__(self) -> None:
+            self.attributes: dict[str, object] = {}
+            self.exceptions: list[BaseException] = []
+            self.ended = False
+
+        async def set_attribute(self, key: str, value: object) -> None:
+            self.attributes[key] = value
+
+        async def record_exception(self, error: BaseException) -> None:
+            self.exceptions.append(error)
+
+        async def end(self) -> None:
+            self.ended = True
+
+    class Tracer:
+        def __init__(self) -> None:
+            self.spans: list[Span] = []
+
+        async def start_span(
+            self, _name: str, *, attributes: dict[str, object]
+        ) -> Span:
+            span = Span()
+            span.attributes.update(attributes)
+            self.spans.append(span)
+            return span
+
+    tracer = Tracer()
+    middleware = OpenTelemetryMiddleware(tracer)
+    failed = ExecutionContext.create(ToolCall("failed"))
+    aborted = ExecutionContext.create(ToolCall("aborted"))
+
+    await middleware.process(failed)
+    await middleware.process(failed.evolve(status=ExecutionStatus.FAILED))
+    await middleware.process(aborted)
+    assert await middleware.aabort(aborted.trace_id, description="cancelled")
+
+    assert tracer.spans[0].attributes["arg.status"] == ExecutionStatus.FAILED.value
+    assert tracer.spans[0].exceptions
+    assert tracer.spans[0].ended
+    assert tracer.spans[1].exceptions
+    assert tracer.spans[1].ended
+
+
+@pytest.mark.asyncio
+async def test_native_async_otel_drops_an_unsupported_parent_context() -> None:
+    class Span:
+        def __init__(self) -> None:
+            self.ended = False
+
+        def set_attribute(self, _key: str, _value: object) -> None:
+            return None
+
+        def end(self) -> None:
+            self.ended = True
+
+    class Tracer:
+        def __init__(self) -> None:
+            self.attributes: dict[str, object] = {}
+            self.span = Span()
+
+        async def start_span(self, _name: str, *, attributes: dict[str, object]) -> Span:
+            self.attributes = dict(attributes)
+            return self.span
+
+    tracer = Tracer()
+    middleware = OpenTelemetryMiddleware(tracer, parent_context=object())
+    context = ExecutionContext.create(ToolCall("work"))
+
+    await middleware.process(context)
+    assert tracer.attributes["arg.parent_context_dropped"] is True
+    assert await middleware.aabort(context.trace_id)
+    assert tracer.span.ended
 
 
 @pytest.mark.asyncio

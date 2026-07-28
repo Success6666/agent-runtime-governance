@@ -56,6 +56,88 @@ async def test_sync_public_transport_methods_return_native_awaitables_once() -> 
 
 
 @pytest.mark.asyncio
+async def test_sync_wrapped_transports_preserve_public_awaitables() -> None:
+    calls: list[str] = []
+
+    async def complete_opa() -> dict[str, object]:
+        calls.append("opa")
+        return {"result": True}
+
+    def opa_transport(_payload: dict[str, object]):
+        return complete_opa()
+
+    client = OPAClient(
+        "http://localhost:8181", "agent/allow", transport=opa_transport
+    )
+    decision = client.evaluate(_context())
+    assert inspect.isawaitable(decision)
+    assert (await decision).allow
+
+    async def complete_slack() -> None:
+        calls.append("slack")
+
+    def slack_transport(_payload: dict[str, object]):
+        return complete_slack()
+
+    notifier = SlackWebhookNotifier(
+        "https://hooks.slack.com/services/T/B/C", transport=slack_transport
+    )
+    sent = notifier.send({"text": "done"})
+    assert inspect.isawaitable(sent)
+    await sent
+    assert calls == ["opa", "slack"]
+
+
+@pytest.mark.asyncio
+async def test_slack_async_entry_point_accepts_a_sync_transport() -> None:
+    caller_thread = threading.current_thread().name
+    threads: list[str] = []
+
+    def transport(_payload: dict[str, object]) -> None:
+        threads.append(threading.current_thread().name)
+
+    notifier = SlackWebhookNotifier(
+        "https://hooks.slack.com/services/T/B/C", transport=transport
+    )
+
+    await notifier.asend({"text": "done"})
+
+    assert threads and threads[0] != caller_thread
+
+
+@pytest.mark.asyncio
+async def test_default_opa_and_slack_transports_use_encoded_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opa_requests: list[bytes] = []
+    client = OPAClient("http://localhost:8181", "agent/allow")
+
+    def post_opa(encoded: bytes) -> dict[str, object]:
+        opa_requests.append(encoded)
+        return {"result": True}
+
+    monkeypatch.setattr(client, "_post", post_opa)
+    assert (await client.aevaluate(_context())).allow
+    assert opa_requests
+
+    slack_requests: list[bytes] = []
+    notifier = SlackWebhookNotifier("https://hooks.slack.com/services/T/B/C")
+
+    def post_slack(encoded: bytes) -> None:
+        slack_requests.append(encoded)
+
+    monkeypatch.setattr(notifier, "_post", post_slack)
+    await notifier.asend({"text": "async"})
+    assert notifier.send({"text": "sync"}) is None
+    assert len(slack_requests) == 2
+
+
+def test_opa_rejects_a_non_mapping_response() -> None:
+    with pytest.raises(ValueError, match="JSON object"):
+        OPAClient._parse_response([])  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("response", "denied"),
     [
