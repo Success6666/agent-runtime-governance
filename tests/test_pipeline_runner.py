@@ -91,7 +91,29 @@ def test_pipeline_replacement_rebinds_current_extension_integrations() -> None:
         )
         assert telemetry.shutdown_signals == [
             runtime._extension_dispatcher.shutdown_signal
-        ]
+        ] * 2
+    finally:
+        runtime.close()
+
+
+def test_runtime_accepts_unhashable_opentelemetry_subclasses() -> None:
+    class Tracer:
+        def start_span(self, name: str, *, attributes: dict[str, object]) -> object:
+            raise AssertionError(f"unexpected span: {name} {attributes}")
+
+    class EqualTelemetry(OpenTelemetryMiddleware):
+        def __eq__(self, other: object) -> bool:
+            return self is other
+
+    telemetry = EqualTelemetry(Tracer())
+    runtime = Runtime([telemetry])
+
+    try:
+        runtime.pipeline = [telemetry]
+        assert (
+            telemetry._extension_shutdown_signal
+            is runtime._extension_dispatcher.shutdown_signal
+        )
     finally:
         runtime.close()
 

@@ -917,6 +917,56 @@ async def test_legacy_otel_manager_releases_on_runtime_shutdown_signal() -> None
 
 
 @pytest.mark.asyncio
+async def test_pipeline_replacement_rebinds_shared_legacy_otel_shutdown() -> None:
+    exited = threading.Event()
+
+    class Span:
+        def set_attribute(self, _key: str, _value: object) -> None:
+            return None
+
+        def end(self) -> None:
+            return None
+
+    class LegacyTracer:
+        def start_as_current_span(self, _name: str, **_kwargs: object):
+            @contextmanager
+            def manager():
+                try:
+                    yield Span()
+                finally:
+                    exited.set()
+
+            return manager()
+
+    middleware = OpenTelemetryMiddleware(LegacyTracer(), terminal_wait_seconds=1.0)
+    first = Runtime([middleware])
+    second = Runtime([middleware])
+    context = ExecutionContext.create(ToolCall("work"))
+
+    try:
+        first.pipeline = [middleware]
+        assert (
+            middleware._extension_shutdown_signal
+            is first._extension_dispatcher.shutdown_signal
+        )
+        assert (
+            middleware._extension_shutdown_signal
+            is not second._extension_dispatcher.shutdown_signal
+        )
+        await middleware.process(context)
+
+        await first.aclose()
+
+        assert await asyncio.wait_for(asyncio.to_thread(exited.wait, 1), timeout=1.1)
+        await _wait_until(lambda: middleware.active_span_count == 0)
+    finally:
+        if not first._closed:
+            await first.aclose()
+        if not second._closed:
+            await second.aclose()
+
+
+@pytest.mark.asyncio
 async def test_cancelled_sync_extension_remains_visible_until_aclose_waits_for_it() -> None:
     runtime = Runtime(
         limits=RuntimeLimits(
