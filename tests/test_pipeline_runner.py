@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
+from agent_runtime_governance import Pipeline as PublicPipeline
 from agent_runtime_governance._pipeline_runner import MiddlewareRegistry, PipelineRunner
 from agent_runtime_governance.context import ExecutionContext, ToolCall
 from agent_runtime_governance.decisions import DecisionOutcome, DecisionRecord
@@ -24,6 +27,28 @@ class NamedMiddleware(Middleware):
 
     async def process(self, context: ExecutionContext) -> ExecutionContext:
         return context
+
+
+def test_pipeline_public_api_signature_snapshot_is_preserved() -> None:
+    expected_signatures = {
+        "__init__": ("self", "middlewares"),
+        "__iter__": ("self",),
+        "__len__": ("self",),
+        "append": ("self", "middleware"),
+        "remove": ("self", "name"),
+        "insert_before": ("self", "target", "middleware"),
+        "insert_after": ("self", "target", "middleware"),
+        "replace": ("self", "target", "middleware"),
+    }
+
+    assert PublicPipeline is Pipeline
+    assert tuple(Pipeline.__dataclass_fields__) == ("middlewares",)
+    assert tuple(Pipeline.__dataclass_fields__["middlewares"].default) == ()
+    assert {
+        name: tuple(inspect.signature(getattr(Pipeline, name)).parameters)
+        for name in expected_signatures
+    } == expected_signatures
+    assert tuple(inspect.signature(Runtime.pipeline.fset).parameters) == ("self", "value")
 
 
 def test_registry_preserves_public_pipeline_registration_order() -> None:
