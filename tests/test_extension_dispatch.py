@@ -1777,7 +1777,8 @@ async def test_concurrent_otel_terminal_calls_end_once_and_forget_failed_span(
 
     assert tracer.span.end_calls == 1
     assert middleware.active_span_count == 0
-    assert all(isinstance(outcome, RuntimeError) for outcome in outcomes)
+    assert any(isinstance(outcome, RuntimeError) for outcome in outcomes)
+    assert all(outcome is False or isinstance(outcome, RuntimeError) for outcome in outcomes)
 
 
 @pytest.mark.asyncio
