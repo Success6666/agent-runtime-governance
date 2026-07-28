@@ -26,6 +26,8 @@ All notable changes are documented here.
   policy semantic-digest, and public contract bytes while keeping RFC 8785 for
   portable action and reconciliation commitments. v0.5/v0.7 JSONL, SQLite,
   hash, HMAC, Unicode, and float fixtures lock the compatibility boundary.
+- A dependency-neutral internal redaction boundary shared by audit and
+  snapshots, preserving public audit imports and v0.7 JSONL/SQLite bytes.
 
 ### Changed
 

@@ -9,44 +9,20 @@ import sqlite3
 import threading
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
-from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Awaitable, Protocol
 
 from filelock import FileLock
 
+from . import _redaction
 from ._canonical import legacy_audit_json_text
-from ._serialization import json_safe as _json_safe
 from ._sqlite import connect_sqlite, initialize_sqlite
 from .context import ExecutionContext
 from .errors import AuditIntegrityError
 
-DEFAULT_SENSITIVE_KEYS = frozenset(
-    {
-        "password",
-        "passwd",
-        "secret",
-        "token",
-        "api_key",
-        "authorization",
-        "cookie",
-        "identity_claims",
-        "signature",
-    }
-)
-DEFAULT_SENSITIVE_PATHS = frozenset(
-    {
-        "reason",
-        "context.input_text",
-        "context.result",
-        "context.error",
-        "context.tool_call.args.*",
-        "context.tool_call.kwargs.*",
-        "context.decision.reason",
-        "context.history.*.reason",
-    }
-)
-_REDACTED = "[REDACTED]"
+DEFAULT_SENSITIVE_KEYS = _redaction.DEFAULT_SENSITIVE_KEYS
+DEFAULT_SENSITIVE_PATHS = _redaction.DEFAULT_SENSITIVE_PATHS
+_safe_json_value = _redaction._safe_json_value
 _GENESIS_HASH = "0" * 64
 _SOURCE_EVENT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 
@@ -856,85 +832,13 @@ def redact_sensitive_data(
 ) -> Any:
     """Return a JSON-safe copy with configured secrets removed."""
 
-    patterns = tuple(
-        re.compile(pattern) if isinstance(pattern, str) else pattern
-        for pattern in value_patterns
+    return _redaction.redact_sensitive_data(
+        value,
+        sensitive_keys=sensitive_keys,
+        sensitive_paths=sensitive_paths,
+        value_patterns=value_patterns,
+        allow_paths=allow_paths,
     )
-    return _redact(
-        _safe_json_value(value),
-        frozenset(str(key).lower() for key in sensitive_keys),
-        frozenset(str(path) for path in sensitive_paths),
-        patterns,
-        frozenset(str(path) for path in allow_paths),
-    )
-
-
-def _redact(
-    value: Any,
-    sensitive_keys: frozenset[str],
-    sensitive_paths: frozenset[str],
-    value_patterns: tuple[re.Pattern[str], ...],
-    allow_paths: frozenset[str],
-    *,
-    path: str = "",
-) -> Any:
-    if path and _matches_path(path, allow_paths):
-        return value
-    if path and _matches_path(path, sensitive_paths):
-        return _REDACTED
-    if isinstance(value, Mapping):
-        result: dict[str, Any] = {}
-        for key, item in value.items():
-            normalized = str(key).lower()
-            child_path = f"{path}.{key}" if path else str(key)
-            result[str(key)] = (
-                _REDACTED
-                if normalized in sensitive_keys and not _matches_path(child_path, allow_paths)
-                else _redact(
-                    item,
-                    sensitive_keys,
-                    sensitive_paths,
-                    value_patterns,
-                    allow_paths,
-                    path=child_path,
-                )
-            )
-        return result
-    if isinstance(value, list | tuple):
-        return [
-            _redact(
-                item,
-                sensitive_keys,
-                sensitive_paths,
-                value_patterns,
-                allow_paths,
-                path=f"{path}.{index}" if path else str(index),
-            )
-            for index, item in enumerate(value)
-        ]
-    if isinstance(value, str):
-        for pattern in value_patterns:
-            value = pattern.sub(_REDACTED, value)
-        return value
-    return value
-
-
-def _matches_path(path: str, patterns: frozenset[str]) -> bool:
-    return any(fnmatchcase(path, pattern) for pattern in patterns)
-
-
-def _safe_json_value(value: Any) -> Any:
-    if isinstance(value, float):
-        return _json_safe(value)
-    if value is None or isinstance(value, str | int | bool):
-        return value
-    if isinstance(value, Mapping):
-        return {str(key): _safe_json_value(item) for key, item in value.items()}
-    if isinstance(value, list | tuple):
-        return [_safe_json_value(item) for item in value]
-    if isinstance(value, set | frozenset):
-        return sorted((_safe_json_value(item) for item in value), key=str)
-    return f"[UNSERIALIZABLE:{type(value).__name__}]"
 
 
 def _fsync_directory(path: Path) -> None:
