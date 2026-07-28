@@ -3,17 +3,19 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
 from typing import Any, Awaitable, Iterable, Mapping, Protocol
 
+from ._internal.runtime.durable_operations import (
+    DurableOperationCapability,
+    _ReconciliationDurability,
+)
 from ._internal.serialization.values import thaw as _thaw
 from .action_contracts import ActionContract
 from .context import ExecutionMode
 from .middleware.audit import AuditMiddleware
 from .middleware.decision import DecisionMiddleware
 from .pipeline import Pipeline
-from .reconciliation import SQLiteReconciliationLedger
-from .registry import SQLiteIdempotencyStore, ToolSpec
+from .registry import ToolSpec
 
 _KEY_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _POLICY_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}$")
@@ -205,7 +207,19 @@ class ProductionProfile:
         identity_provider: Any,
         require_verified_identity: bool,
         reconciliation_ledger: Any = None,
+        _durable_operation_capability: DurableOperationCapability | None = None,
     ) -> ProductionReadinessReport:
+        durable_operation_capability = _durable_operation_capability
+        if (
+            type(durable_operation_capability) is not DurableOperationCapability
+            or not durable_operation_capability.matches(
+                idempotency_store, reconciliation_ledger
+            )
+        ):
+            durable_operation_capability = DurableOperationCapability(
+                idempotency_store,
+                reconciliation_ledger,
+            )
         tool_items = tuple(tools)
         inventory = self.inventory(tool_items)
         entries = inventory.tools
@@ -243,8 +257,7 @@ class ProductionProfile:
                 )
             self._reconciliation_reasons(
                 idempotent_tools,
-                idempotency_store,
-                reconciliation_ledger,
+                durable_operation_capability,
                 reasons,
             )
             if any(tool.contract_id is not None for tool in entries):
@@ -399,21 +412,19 @@ class ProductionProfile:
     @staticmethod
     def _reconciliation_reasons(
         tools: tuple[ToolSpec[Any, Any], ...],
-        idempotency_store: Any,
-        reconciliation_ledger: Any,
+        durable_operation_capability: DurableOperationCapability,
         reasons: list[ProductionReadinessReason],
     ) -> None:
         if not tools:
             return
-        if not _capability(reconciliation_ledger, "production_durable"):
+        durability = durable_operation_capability.reconciliation_durability
+        if durability is _ReconciliationDurability.DURABLE_LEDGER_REQUIRED:
             reasons.append(ProductionReadinessReason.RECONCILIATION_DURABLE_REQUIRED)
-        elif not isinstance(
-            reconciliation_ledger, SQLiteReconciliationLedger
-        ) or not isinstance(idempotency_store, SQLiteIdempotencyStore):
+        elif durability is _ReconciliationDurability.ATOMIC_ADAPTER_REQUIRED:
             reasons.append(
                 ProductionReadinessReason.RECONCILIATION_ATOMIC_LEDGER_REQUIRED
             )
-        elif not _same_sqlite_database(idempotency_store, reconciliation_ledger):
+        elif durability is _ReconciliationDurability.COLOCATED_DATABASE_REQUIRED:
             reasons.append(
                 ProductionReadinessReason.RECONCILIATION_COLOCATED_REQUIRED
             )
@@ -470,10 +481,3 @@ def _schemas_equal(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
 
 def _capability(value: Any, name: str) -> bool:
     return getattr(value, name, False) is True
-
-
-def _same_sqlite_database(
-    idempotency_store: SQLiteIdempotencyStore,
-    reconciliation_ledger: SQLiteReconciliationLedger,
-) -> bool:
-    return Path(idempotency_store.path).resolve() == Path(reconciliation_ledger.path).resolve()

@@ -37,6 +37,7 @@ from ._internal.runtime.blocking import (
 )
 from ._internal.runtime.context_boundaries import validate_middleware_transition
 from ._internal.runtime.daemon_executor import DaemonThreadPoolExecutor
+from ._internal.runtime.durable_operations import DurableOperationCapability
 from ._internal.runtime.extensions import (
     ExtensionDispatchSnapshot,
     _discard_unawaited_result,
@@ -89,21 +90,18 @@ from .production import (
     ProductionProfile,
     ProductionReadinessError,
     ProductionReadinessReport,
-    _same_sqlite_database,
 )
 from .reconciliation import (
     ManualResolution,
     ProviderDescriptor,
     ReconciliationAttemptContext,
     ReconciliationAttemptOutcome,
-    ReconciliationAuditEnvelope,
     ReconciliationConflictError,
     ReconciliationFinding,
     ReconciliationHead,
     ReconciliationLedger,
     ReconciliationNotFoundError,
     ReconciliationState,
-    SQLiteReconciliationLedger,
     UnknownAction,
     idempotency_namespace_digest,
     new_execution_record_id,
@@ -117,7 +115,6 @@ from .registry import (
     IdempotencyOutcomeUnknownError,
     IdempotencyStore,
     InMemoryIdempotencyStore,
-    SQLiteIdempotencyStore,
     ToolRegistry,
     ToolSpec,
 )
@@ -297,7 +294,10 @@ class Runtime:
         self._registry = ToolRegistry()
         self._idempotency_store = idempotency_store or InMemoryIdempotencyStore()
         self._reconciliation_ledger = reconciliation_ledger
-        self._atomic_reconciliation_preparation: bool | None = None
+        self._durable_operation_capability = DurableOperationCapability(
+            self._idempotency_store,
+            self._reconciliation_ledger,
+        )
         self._identity_provider = identity_provider
         self._require_verified_identity = require_verified_identity
         self._production_profile = production_profile
@@ -1225,7 +1225,7 @@ class Runtime:
         with self._production_seal_lock:
             self._guard_sealed_mutation("idempotency_store")
             self._idempotency_store = value
-            self._atomic_reconciliation_preparation = None
+            self._rebuild_durable_operation_capability()
 
     @property
     def reconciliation_ledger(self) -> ReconciliationLedger | None:
@@ -1236,7 +1236,7 @@ class Runtime:
         with self._production_seal_lock:
             self._guard_sealed_mutation("reconciliation_ledger")
             self._reconciliation_ledger = value
-            self._atomic_reconciliation_preparation = None
+            self._rebuild_durable_operation_capability()
 
     @property
     def identity_provider(self) -> IdentityProvider | None:
@@ -1279,6 +1279,7 @@ class Runtime:
             pipeline=self.pipeline,
             idempotency_store=self.idempotency_store,
             reconciliation_ledger=self.reconciliation_ledger,
+            _durable_operation_capability=self._durable_operation_capability,
             identity_provider=self.identity_provider,
             require_verified_identity=self.require_verified_identity,
         )
@@ -1298,6 +1299,7 @@ class Runtime:
                     pipeline=self.pipeline,
                     idempotency_store=self.idempotency_store,
                     reconciliation_ledger=self.reconciliation_ledger,
+                    _durable_operation_capability=self._durable_operation_capability,
                     identity_provider=self.identity_provider,
                     require_verified_identity=self.require_verified_identity,
                 )
@@ -1643,14 +1645,14 @@ class Runtime:
                     context = await self._run_observers(context, post=True)
                     raise denial
                 if (
-                    isinstance(self.reconciliation_ledger, SQLiteReconciliationLedger)
+                    self._durable_operation_capability.supports_sqlite_reconciliation
                     and prepared_action is None
                 ):
                     # Compatibility path for non-co-located development adapters.
                     # Production sealing requires the atomic store/ledger path above.
                     prepared_action = self._unknown_action(spec, context, claim)
                     await self._run_reconciliation_operation(
-                        self.reconciliation_ledger.prepare_action,
+                        self._durable_operation_capability.prepare_non_atomic_sqlite_action,
                         claim,
                         prepared_action,
                         deadline=context.deadline,
@@ -2047,9 +2049,8 @@ class Runtime:
             stage="reconciliation read head",
         )
         self._assert_reconciliation_tenant_access(principal, head.action)
-        if isinstance(ledger, SQLiteReconciliationLedger):
+        if self._durable_operation_capability.supports_audit_outbox:
             await self._drain_reconciliation_audit_outbox(
-                ledger,
                 execution_record_id=execution_record_id,
                 deadline=deadline,
             )
@@ -2263,8 +2264,7 @@ class Runtime:
             raise ProductionReadinessError(self.production_readiness())
         if type(limit) is not int or not 1 <= limit <= 1_000:
             raise ValueError("audit outbox limit must be between 1 and 1000")
-        ledger = self.reconciliation_ledger
-        if not isinstance(ledger, SQLiteReconciliationLedger):
+        if not self._durable_operation_capability.supports_audit_outbox:
             raise ReconciliationNotFoundError(
                 "a durable SQLite reconciliation ledger is required for audit delivery"
             )
@@ -2274,7 +2274,7 @@ class Runtime:
             operation="drain",
         )
         return await self._drain_reconciliation_audit_outbox(
-            ledger, limit=limit, deadline=deadline
+            limit=limit, deadline=deadline
         )
 
     async def aresolve_reconciliation(
@@ -2553,10 +2553,8 @@ class Runtime:
         operator_identity_digest: str | None = None,
         deadline: datetime | None = None,
     ) -> None:
-        ledger = self.reconciliation_ledger
-        if isinstance(ledger, SQLiteReconciliationLedger):
+        if self._durable_operation_capability.supports_audit_outbox:
             await self._drain_reconciliation_audit_outbox(
-                ledger,
                 execution_record_id=head.execution_record_id,
                 deadline=deadline,
             )
@@ -2595,7 +2593,7 @@ class Runtime:
 
     async def _drain_reconciliation_audit_outbox(
         self,
-        ledger: SQLiteReconciliationLedger,
+        outbox_operations: Any | None = None,
         *,
         execution_record_id: str | None = None,
         limit: int | None = None,
@@ -2605,6 +2603,11 @@ class Runtime:
 
         if limit is not None and (type(limit) is not int or limit < 1):
             raise ValueError("audit outbox limit must be a positive integer")
+        outbox_operations = (
+            self._durable_operation_capability
+            if outbox_operations is None
+            else outbox_operations
+        )
         middleware = next(
             (item for item in self.pipeline if isinstance(item, AuditMiddleware)),
             None,
@@ -2615,7 +2618,7 @@ class Runtime:
         while limit is None or delivered < limit:
             batch_limit = 128 if limit is None else min(128, limit - delivered)
             envelopes = await self._run_reconciliation_operation(
-                ledger.pending_audit_events,
+                outbox_operations.pending_audit_events,
                 execution_record_id=execution_record_id,
                 limit=batch_limit,
                 deadline=deadline,
@@ -2624,7 +2627,6 @@ class Runtime:
             if not envelopes:
                 return delivered
             for envelope in envelopes:
-                assert isinstance(envelope, ReconciliationAuditEnvelope)
                 event = _thaw(envelope.event)
                 event["reconciliation_audit_id"] = envelope.outbox_id
                 try:
@@ -2637,7 +2639,7 @@ class Runtime:
                         stage="reconciliation audit delivery",
                     )
                     await self._run_reconciliation_operation(
-                        ledger.mark_audit_event_delivered,
+                        outbox_operations.mark_audit_event_delivered,
                         envelope.outbox_id,
                         deadline=deadline,
                         stage="reconciliation audit acknowledgement",
@@ -2654,7 +2656,7 @@ class Runtime:
                 except Exception as exc:
                     try:
                         await self._run_reconciliation_operation(
-                            ledger.record_audit_delivery_failure,
+                            outbox_operations.record_audit_delivery_failure,
                             envelope.outbox_id,
                             exc,
                             deadline=deadline,
@@ -3425,19 +3427,13 @@ class Runtime:
     def _supports_atomic_reconciliation_preparation(self) -> bool:
         """Return whether a claim and recovery descriptor share one SQLite DB."""
 
-        with self._production_seal_lock:
-            cached = self._atomic_reconciliation_preparation
-            if cached is not None:
-                return cached
-            store = self.idempotency_store
-            ledger = self.reconciliation_ledger
-            cached = (
-                isinstance(store, SQLiteIdempotencyStore)
-                and isinstance(ledger, SQLiteReconciliationLedger)
-                and _same_sqlite_database(store, ledger)
-            )
-            self._atomic_reconciliation_preparation = cached
-            return cached
+        return self._durable_operation_capability.supports_atomic_preparation
+
+    def _rebuild_durable_operation_capability(self) -> None:
+        self._durable_operation_capability = DurableOperationCapability(
+            self._idempotency_store,
+            self._reconciliation_ledger,
+        )
 
     @staticmethod
     def _normalize_result(
@@ -3489,26 +3485,13 @@ class Runtime:
             poison_on_timeout = (
                 timeout >= self.limits.idempotency_operation_timeout_seconds
             )
-            if prepared_action is None:
-                future = self._idempotency_executor.submit(
-                    self.idempotency_store.acquire,
-                    namespace,
-                    key,
-                    fingerprint,
-                )
-            else:
-                store = self.idempotency_store
-                if not isinstance(store, SQLiteIdempotencyStore):
-                    raise RuntimeError(
-                        "atomic reconciliation preparation requires SQLite idempotency"
-                    )
-                future = self._idempotency_executor.submit(
-                    store.acquire_prepared,
-                    namespace,
-                    key,
-                    fingerprint,
-                    prepared_action,
-                )
+            future = self._idempotency_executor.submit(
+                self._durable_operation_capability.acquire,
+                namespace,
+                key,
+                fingerprint,
+                prepared_action=prepared_action,
+            )
         except BaseException:
             lease.release()
             raise
@@ -3523,17 +3506,15 @@ class Runtime:
                 return
             try:
                 error = TimeoutError("request stopped waiting during acquisition")
-                if (
-                    prepared_action is not None
-                    and isinstance(self.reconciliation_ledger, SQLiteReconciliationLedger)
+                if self._durable_operation_capability.record_orphaned_prepared_claim_unknown(
+                    claim,
+                    prepared_action,
+                    error,
                 ):
                     # The descriptor and claim were committed together. Preserve
                     # that invariant when an abandoned acquisition is settled.
-                    self.reconciliation_ledger.record_unknown(
-                        claim, prepared_action, error
-                    )
-                else:
-                    self.idempotency_store.mark_unknown(claim, error)
+                    return
+                self.idempotency_store.mark_unknown(claim, error)
             except BaseException:
                 return
 
@@ -3872,9 +3853,9 @@ class Runtime:
         ledger = self.reconciliation_ledger
         assert ledger is not None
         action = self._unknown_action(spec, context, claim, error)
-        if isinstance(ledger, SQLiteReconciliationLedger):
+        if self._durable_operation_capability.supports_sqlite_reconciliation:
             head = await self._run_reconciliation_operation(
-                ledger.record_unknown,
+                self._durable_operation_capability.record_unknown,
                 claim,
                 action,
                 error,

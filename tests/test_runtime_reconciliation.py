@@ -14,6 +14,7 @@ from time import monotonic, sleep
 
 import pytest
 
+import agent_runtime_governance._internal.runtime.durable_operations as durable_operations
 import agent_runtime_governance.runtime as runtime_module
 from agent_runtime_governance import (
     ActionContract,
@@ -66,22 +67,23 @@ def _runtime(path: Path, *, limits: RuntimeLimits | None = None) -> Runtime:
     )
 
 
-def test_atomic_preparation_colocation_cache_invalidates_on_store_reassignment(
+def test_durable_operation_capability_rebuilds_on_store_or_ledger_reassignment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     path = tmp_path / "shared.db"
     calls = 0
-    original = runtime_module._same_sqlite_database
+    original = durable_operations._same_sqlite_database
 
     def counted(store, ledger) -> bool:
         nonlocal calls
         calls += 1
         return original(store, ledger)
 
-    monkeypatch.setattr(runtime_module, "_same_sqlite_database", counted)
+    monkeypatch.setattr(durable_operations, "_same_sqlite_database", counted)
     runtime = _runtime(path)
     try:
+        first_capability = runtime._durable_operation_capability
         assert runtime._supports_atomic_reconciliation_preparation() is True
         assert runtime._supports_atomic_reconciliation_preparation() is True
         assert calls == 1
@@ -90,8 +92,11 @@ def test_atomic_preparation_colocation_cache_invalidates_on_store_reassignment(
             tmp_path / "separate.db"
         )
 
+        assert runtime._durable_operation_capability is not first_capability
         assert runtime._supports_atomic_reconciliation_preparation() is False
         assert calls == 2
+        assert "SQLiteIdempotencyStore" not in runtime_module.__dict__
+        assert "SQLiteReconciliationLedger" not in runtime_module.__dict__
     finally:
         runtime.close()
 
