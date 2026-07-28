@@ -343,6 +343,23 @@ def test_receipt_binding_and_outcome_disagreement_fail_closed() -> None:
     }
 
 
+def test_damaged_receipt_attachment_fails_closed_without_raising() -> None:
+    bundle = _bundle()
+    damaged = object.__new__(ReceiptAttachment)
+
+    report = verify_evidence_bundle_document(
+        bundle.to_dict(),
+        receipt_verifier=UnsupportedReceiptVerifier(),
+        receipt=damaged,
+    )
+
+    assert report["outcome_verified"] == {
+        "ok": False,
+        "reasons": ["receipt_attachment_invalid"],
+        "state": "failed",
+    }
+
+
 def test_reference_receipt_verifier_binds_bundle_and_tenant_identity() -> None:
     raw_receipt = b"receipt-v1"
     original = _bundle()

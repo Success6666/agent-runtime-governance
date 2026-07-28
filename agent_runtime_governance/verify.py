@@ -768,9 +768,12 @@ def _verify_outcome(
         return _unsupported_level("receipt_verifier_unsupported")
     if receipt is None:
         return _failed_level("receipt_attachment_missing")
+    normalized_receipt = _normalize_receipt_attachment(receipt)
+    if normalized_receipt is None:
+        return _failed_level("receipt_attachment_invalid")
     try:
-        request = ReceiptVerificationRequest.from_bundle(bundle, receipt)
-    except (EvidenceExternalValidationError, TypeError, ValueError):
+        request = ReceiptVerificationRequest.from_bundle(bundle, normalized_receipt)
+    except (AttributeError, EvidenceExternalValidationError, TypeError, ValueError):
         return _failed_level("receipt_bundle_digest_mismatch")
     try:
         prepared = _call_provider(
@@ -806,6 +809,19 @@ def _verify_outcome(
     if result.state == "unsupported":
         return _unsupported_level(_receipt_unsupported_reason(result.reason), **details)
     return _failed_level(_receipt_failure_reason(result.reason), **details)
+
+
+def _normalize_receipt_attachment(
+    receipt: object,
+) -> ReceiptAttachment | None:
+    """Re-parse an API input so malformed subclasses fail closed at the boundary."""
+
+    if not isinstance(receipt, ReceiptAttachment):
+        return None
+    try:
+        return ReceiptAttachment.from_dict(receipt.to_dict())
+    except (AttributeError, EvidenceExternalValidationError, TypeError, ValueError):
+        return None
 
 
 def _load_anchor_provider(
