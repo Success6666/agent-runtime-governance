@@ -211,6 +211,46 @@ def test_idempotent_production_requires_atomic_colocated_reconciliation(
     )
 
 
+def test_idempotent_production_rejects_untrusted_atomicity_flags(tmp_path) -> None:
+    class ClaimedDurableStore(InMemoryIdempotencyStore):
+        production_durable = True
+        atomic_reconciliation_preparation = True
+
+    class ClaimedDurableLedger:
+        production_durable = True
+        atomic_reconciliation_preparation = True
+        same_sqlite_database = True
+
+    runtime = Runtime(
+        [
+            AuditMiddleware(
+                SQLiteAuditSink(tmp_path / "audit.db", sign_key=b"a" * 32),
+                fail_closed=True,
+            )
+        ],
+        idempotency_store=ClaimedDurableStore(),
+        reconciliation_ledger=ClaimedDurableLedger(),  # type: ignore[arg-type]
+        identity_provider=StaticIdentityProvider(_principal()),
+        require_verified_identity=True,
+        production_profile=strict_profile(),
+    )
+
+    @runtime.tool(
+        execution_mode=ExecutionMode.IDEMPOTENT,
+        action_contract=contract(execution_mode=ExecutionMode.IDEMPOTENT),
+        reconciliation_provider=reconciliation_provider(),
+    )
+    def operate(target: str) -> bool:
+        return bool(target)
+
+    try:
+        assert ProductionReadinessReason.RECONCILIATION_ATOMIC_LEDGER_REQUIRED in (
+            runtime.production_readiness().runtime_reasons
+        )
+    finally:
+        runtime.close()
+
+
 def test_idempotent_production_seals_with_colocated_provider(tmp_path) -> None:
     path = tmp_path / "runtime.db"
     runtime = Runtime(
