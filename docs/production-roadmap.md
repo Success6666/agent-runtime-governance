@@ -324,16 +324,19 @@ that supported framework adapters preserve identical governance semantics.
   and `outcome_verified` separate. Integrity alone never asserts an external
   real-world result; an unsigned bundle without an expected digest is reported
   as unanchored.
+- A deployment can explicitly select one detached external anchor provider or
+  tool-specific receipt verifier. The verifier has no generic network client;
+  without a protected anchor, continuity remains unsupported, and a valid
+  receipt establishes only the outcome claim that its verifier supports.
+- Bundle v1 remains closed and canonical. Its historical vector is packaged in
+  wheel and sdist artifacts; unknown versions, fields, and non-null in-bundle
+  receipt/signature semantics are rejected rather than interpreted as v1.
 - The optional `evidence` extra supplies the default Ed25519 signer and verifier
   with key identifiers, trust roots, rotation, and revocation. It remains out
   of the core installation.
 
 ### Remaining planned model
 
-- Support external sequence anchors or equivalent continuity evidence when a
-  deployment needs deletion and gap detection.
-- Allow tool-specific receipt verifiers to establish supported external outcome
-  claims.
 - Publish a machine-readable Release Verification Manifest containing test and
   coverage summaries, integration results, dependency-audit status, and pinned
   external-service image digests. Include it in release checksums and provenance

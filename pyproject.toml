@@ -76,6 +76,12 @@ Issues = "https://github.com/Success6666/agent-runtime-governance/issues"
 [tool.setuptools.packages.find]
 include = ["agent_runtime_governance*"]
 
+[tool.setuptools.package-data]
+agent_runtime_governance = [
+  "_compatibility/evidence/v1/*.json",
+  "_compatibility/evidence/v1/*.hex",
+]
+
 [tool.pytest.ini_options]
 addopts = "-q"
 asyncio_mode = "auto"
