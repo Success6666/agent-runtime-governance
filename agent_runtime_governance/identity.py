@@ -8,7 +8,7 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Mapping, Protocol
+from typing import Any, Awaitable, Mapping, Protocol
 
 from ._serialization import freeze_mapping as _freeze_mapping
 from ._serialization import thaw as _thaw
@@ -65,7 +65,9 @@ class VerifiedPrincipal:
 
 
 class IdentityProvider(Protocol):
-    def verify(self, claims: Mapping[str, Any] | None = None) -> VerifiedPrincipal: ...
+    def verify(
+        self, claims: Mapping[str, Any] | None = None
+    ) -> VerifiedPrincipal | Awaitable[VerifiedPrincipal]: ...
 
 
 class StaticIdentityProvider:

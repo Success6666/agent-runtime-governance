@@ -175,3 +175,37 @@ def test_circuit_breaker_opens_and_recovers(monkeypatch: pytest.MonkeyPatch) -> 
     assert breaker.state is CircuitState.HALF_OPEN
     assert breaker.call(lambda: "ok") == "ok"
     assert breaker.state is CircuitState.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_releases_cancelled_async_recovery_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = {"value": 10.0}
+    monkeypatch.setattr("agent_runtime_governance.resilience.monotonic", lambda: clock["value"])
+    breaker = CircuitBreaker(failure_threshold=1, recovery_seconds=5)
+
+    def fail() -> None:
+        raise ConnectionError("down")
+
+    with pytest.raises(ConnectionError):
+        breaker.call(fail)
+    clock["value"] += 5
+
+    entered = asyncio.Event()
+
+    async def blocked_probe() -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    probe = asyncio.create_task(breaker.acall(blocked_probe))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    with pytest.raises(CircuitOpenError, match="probe is in flight"):
+        await breaker.acall(lambda: None)
+
+    probe.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await probe
+
+    assert await breaker.acall(lambda: "recovered") == "recovered"
+    assert breaker.state is CircuitState.CLOSED

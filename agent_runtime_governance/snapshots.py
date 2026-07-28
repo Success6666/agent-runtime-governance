@@ -11,11 +11,11 @@ from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Protocol, runtime_checkable
+from typing import Any, Awaitable, Mapping, Protocol, runtime_checkable
 
 from filelock import FileLock
 
-from ._blocking import run_blocking
+from ._blocking import invoke_extension
 from ._sqlite import connect_sqlite, initialize_sqlite
 from .audit import DEFAULT_SENSITIVE_KEYS, redact_sensitive_data
 from .context import ExecutionContext, ExecutionStatus, HistoryEntry
@@ -122,7 +122,7 @@ class ContextSnapshot:
 
 
 class SnapshotStore(Protocol):
-    def write(self, snapshot: ContextSnapshot) -> None: ...
+    def write(self, snapshot: ContextSnapshot) -> None | Awaitable[None]: ...
     def read_trace(self, trace_id: str) -> tuple[ContextSnapshot, ...]: ...
 
 
@@ -137,7 +137,7 @@ class AtomicSnapshotStore(SnapshotStore, Protocol):
         created_at: str,
         policy_version: str | None,
         policy_digest: str | None,
-    ) -> ContextSnapshot: ...
+    ) -> ContextSnapshot | Awaitable[ContextSnapshot]: ...
 
 
 class InMemorySnapshotStore:
@@ -537,7 +537,10 @@ class SnapshotMiddleware(ObservingMiddleware):
     priority = 975
     replayable = False
 
-    def __init__(self, store: SnapshotStore) -> None:
+    def __init__(
+        self,
+        store: SnapshotStore,
+    ) -> None:
         self.store = store
         self._sequences: dict[str, int] = {}
         self._lock = threading.Lock()
@@ -551,7 +554,7 @@ class SnapshotMiddleware(ObservingMiddleware):
             return context
         created_at = datetime.now(timezone.utc).isoformat()
         if isinstance(self.store, AtomicSnapshotStore):
-            snapshot = await run_blocking(
+            snapshot = await invoke_extension(
                 self.store.write_context,
                 trace_id=context.trace_id,
                 stage=stage,
@@ -579,7 +582,7 @@ class SnapshotMiddleware(ObservingMiddleware):
             policy_version=updated.metadata.get("policy_version"),
             policy_digest=updated.metadata.get("policy_digest"),
         )
-        await run_blocking(self.store.write, snapshot)
+        await invoke_extension(self.store.write, snapshot)
         if context.status in {
             ExecutionStatus.SUCCEEDED,
             ExecutionStatus.FAILED,

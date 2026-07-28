@@ -17,7 +17,7 @@ The detailed production plan is in
 - [x] v0.6.0: immutable action contracts across policy, approval, idempotency,
   execution, telemetry, and audit
 
-## Implementation under release verification
+## Released v0.7
 
 - [x] v0.7: deterministic `UNKNOWN` reconciliation on an append-only,
   revision-checked ledger; atomic SQLite claim/descriptor preparation;
@@ -27,8 +27,9 @@ The detailed production plan is in
   tenant isolation; bounded provider/finalization/audit-delivery paths; and
   recovery of expired unfinished probes into `MANUAL_REVIEW`
 
-The v0.7 implementation is not listed as released until its protected CI,
-Docker integration, migration, package, and publication evidence is recorded.
+v0.7.0 was released on 2026-07-27 from protected `main`. Its immutable CI,
+integration, package, provenance, and PyPI publication evidence is recorded in
+[`docs/release-verification.md`](docs/release-verification.md).
 
 ## Product direction
 
@@ -81,9 +82,10 @@ this release.
   audit-delivery, crash/restart, and competing-worker regression coverage on
   local durable SQLite storage
 
-Release evidence still requires the protected workflow and documented
-publication record. The implementation does not claim external exactly-once
-behavior without a downstream idempotency or receipt/probe guarantee.
+The protected workflow and publication record for v0.7.0 are documented in
+[`docs/release-verification.md`](docs/release-verification.md). The release
+does not claim external exactly-once behavior without a downstream idempotency
+or receipt/probe guarantee.
 
 ## v0.8 - Evidence and conformance
 

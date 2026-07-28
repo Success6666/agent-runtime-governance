@@ -5,36 +5,37 @@ latency SLA or a guarantee against future advisories. CI repeats the test
 matrix, policy checks, dependency audit, and Docker integration smoke from
 clean runners.
 
-## v0.7.0 (pending publication)
+## v0.7.0
 
-There is intentionally no verification result or release claim for v0.7.0 in
-this file yet. The implementation must not be described as published or
-verified until the protected CI/integration workflows, the post-publication
-release-artifact workflow, the PyPI publication workflow, and the recorded
-operator checks together provide evidence for all of the following:
+v0.7.0 was released on 2026-07-27 (UTC) from protected `main` commit
+`3998c975f88737c9e009b9d85c073122431ddb94`.
 
-- the full test suite and coverage gate on the supported Python matrix in
-  `ci.yml`, plus Docker-backed integration smoke in `integration.yml`;
-- deterministic-reconciliation fault and restart coverage, including atomic
-  prepared-claim rollback, provider identity drift, cancellation/finalization,
-  expired unfinished attempts, manual-resolution authorization, migration
-  snapshots, and idempotent audit redelivery after acknowledgement failure;
-- Docker-backed external integration smoke for OPA, OTLP, and Prometheus, plus
-  the release's documented local durable-storage checks;
-- migration validation from the supported prior SQLite schema, including a
-  backup/restore drill and delivery of pending outbox envelopes;
-- post-publication release-artifact verification on Python 3.13: isolated
-  dependency audit, wheel/source-distribution build and `twine check`, clean
-  wheel/source installation/import, SBOM, checksums, and provenance; and
-- release assets, SHA256 checksums, SPDX SBOM, and GitHub provenance, followed
-  by PyPI Trusted Publishing and an independent public-index installation
-  check.
+- The protected [CI workflow](https://github.com/Success6666/agent-runtime-governance/actions/runs/30298602257)
+  passed its Python 3.10, 3.11, 3.12, and 3.13 matrix with 822 tests per
+  interpreter and 89.34%--89.37% coverage (80% enforced minimum), plus Ruff,
+  package build, repository-policy, and paired benchmark-budget checks.
+- The [security workflow](https://github.com/Success6666/agent-runtime-governance/actions/runs/30298602202)
+  passed the isolated production-dependency audit and CodeQL.
+- The [integration workflow](https://github.com/Success6666/agent-runtime-governance/actions/runs/30298602735)
+  passed Docker-backed OPA strict-policy and `UNKNOWN` reconciliation, OTLP
+  Collector export, and Prometheus endpoint smoke on Python 3.13. Its Kind
+  sub-check was intentionally skipped by `--skip-kind` and is not claimed as
+  release evidence.
+- The [release-artifact workflow](https://github.com/Success6666/agent-runtime-governance/actions/runs/30298956687)
+  verified the protected source, tag/package version, isolated production
+  dependencies, wheel and source-distribution builds and isolated installs,
+  SPDX SBOM, SHA256 checksums, and GitHub artifact attestation before uploading
+  the release assets.
+- The [PyPI Trusted Publishing workflow](https://github.com/Success6666/agent-runtime-governance/actions/runs/30299616690)
+  re-verified the release files, checksums, and provenance before publishing
+  [`agent-runtime-governance==0.7.0`](https://pypi.org/project/agent-runtime-governance/0.7.0/).
+  The public wheel and source distribution match the GitHub release checksums.
 
-The eventual v0.7.0 entry must name the protected `main` commit, dates, exact
-test and coverage results, immutable GitHub workflow/release links, PyPI
-version, the result of the recorded migration restore/public-index installation
-checks, and any measured benchmark evidence. It must distinguish the SDK's
-durable local protocol from a claim of downstream exactly-once execution.
+The immutable release assets and provenance entry point are available from the
+[`v0.7.0` release](https://github.com/Success6666/agent-runtime-governance/releases/tag/v0.7.0).
+The release proves the SDK's durable local reconciliation protocol; it does not
+claim downstream external exactly-once execution without a downstream
+idempotency or receipt/probe guarantee.
 
 ## v0.6.0
 

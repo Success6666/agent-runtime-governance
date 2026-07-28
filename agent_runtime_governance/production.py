@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Protocol
+from typing import Any, Awaitable, Iterable, Mapping, Protocol
 
 from ._serialization import thaw as _thaw
 from .action_contracts import ActionContract
@@ -24,7 +24,7 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 class IdentityDigestKeyProvider(Protocol):
     """Resolve tenant-scoped action identity keys without exposing them in reports."""
 
-    def get_key(self, *, tenant: str, version: str) -> bytes: ...
+    def get_key(self, *, tenant: str, version: str) -> bytes | Awaitable[bytes]: ...
 
 
 class PreconditionDigestProvider(Protocol):
@@ -37,7 +37,7 @@ class PreconditionDigestProvider(Protocol):
         parameters: Mapping[str, Any],
         principal: str,
         tenant: str,
-    ) -> str: ...
+    ) -> str | Awaitable[str]: ...
 
 
 class ProductionReadinessState(str, Enum):

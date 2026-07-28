@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import contextlib
 import hashlib
+import json
 import os
 import secrets
 import shutil
@@ -20,6 +21,7 @@ from agent_runtime_governance import (
     ActionContract,
     AuditMiddleware,
     ExecutionMode,
+    ExecutionStatus,
     GovernanceDenied,
     IdempotencyAlreadyAppliedError,
     InvocationOptions,
@@ -35,6 +37,8 @@ from agent_runtime_governance import (
     ReconciliationState,
     RiskTier,
     Runtime,
+    SlackNotificationMiddleware,
+    SlackWebhookNotifier,
     SQLiteAuditSink,
     SQLiteIdempotencyStore,
     SQLiteReconciliationLedger,
@@ -117,6 +121,7 @@ def run_opa_smoke(keep_containers: bool) -> None:
     try:
         run(command)
         wait_http("http://127.0.0.1:8181/health", expected_status=200)
+        asyncio.run(_run_async_adapter_smoke())
         policy_digest = hashlib.sha256(
             (policy_dir / "policy.rego").read_bytes()
         ).hexdigest()
@@ -194,6 +199,167 @@ def run_opa_smoke(keep_containers: bool) -> None:
     finally:
         if not keep_containers:
             cleanup_container(name)
+
+
+async def _run_async_adapter_smoke() -> None:
+    """Exercise native async OPA transport and a controlled Slack HTTP stub."""
+
+    caller_loop = asyncio.get_running_loop()
+    opa_loops: list[asyncio.AbstractEventLoop] = []
+
+    async def async_opa_transport(payload: dict[str, object]) -> dict[str, object]:
+        opa_loops.append(asyncio.get_running_loop())
+        return await _async_post_json(
+            "127.0.0.1",
+            8181,
+            "/v1/data/agents/tools/allow",
+            payload,
+        )
+
+    opa_runtime = Runtime(
+        [
+            OPAMiddleware(
+                OPAClient(
+                    "http://127.0.0.1:8181",
+                    "agents/tools/allow",
+                    transport=async_opa_transport,
+                )
+            )
+        ]
+    )
+
+    @opa_runtime.tool(name="read_status")
+    def read_status() -> str:
+        return "ok"
+
+    @opa_runtime.tool(name="delete_file", risk=RiskTier.HIGH)
+    def delete_file() -> str:
+        return "unexpected"
+
+    try:
+        assert await opa_runtime.ainvoke("read_status") == "ok"
+        try:
+            await opa_runtime.ainvoke("delete_file")
+        except GovernanceDenied:
+            pass
+        else:
+            raise AssertionError("async OPA transport did not deny delete_file")
+        assert opa_loops and all(loop is caller_loop for loop in opa_loops)
+    finally:
+        await opa_runtime.aclose()
+
+    received_payloads: list[dict[str, object]] = []
+
+    async def slack_stub(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        try:
+            header_bytes = await reader.readuntil(b"\r\n\r\n")
+            header_text = header_bytes.decode("iso-8859-1")
+            content_length = 0
+            for line in header_text.split("\r\n"):
+                if line.lower().startswith("content-length:"):
+                    content_length = int(line.partition(":")[2].strip())
+                    break
+            body = await reader.readexactly(content_length)
+            received_payloads.append(json.loads(body.decode("utf-8")))
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                b"Content-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}"
+            )
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(slack_stub, "127.0.0.1", 0)
+    address = server.sockets[0].getsockname()
+    slack_loops: list[asyncio.AbstractEventLoop] = []
+
+    async def async_slack_transport(payload: dict[str, object]) -> None:
+        slack_loops.append(asyncio.get_running_loop())
+        await _async_post_json(
+            "127.0.0.1",
+            int(address[1]),
+            "/services/controlled-smoke",
+            payload,
+        )
+
+    notifier = SlackWebhookNotifier(
+        "https://hooks.slack.com/services/controlled-smoke",
+        transport=async_slack_transport,
+    )
+    slack_runtime = Runtime(
+        [
+            SlackNotificationMiddleware(
+                notifier.send,
+                statuses=frozenset({ExecutionStatus.SUCCEEDED}),
+            )
+        ]
+    )
+
+    @slack_runtime.tool(name="async_slack_probe")
+    def async_slack_probe() -> str:
+        return "ok"
+
+    try:
+        assert await slack_runtime.ainvoke("async_slack_probe") == "ok"
+        assert slack_loops == [caller_loop]
+        assert len(received_payloads) == 1
+        text = str(received_payloads[0].get("text", ""))
+        assert "async_slack_probe" in text
+    finally:
+        await slack_runtime.aclose()
+        server.close()
+        await server.wait_closed()
+
+
+async def _async_post_json(
+    host: str,
+    port: int,
+    path: str,
+    payload: dict[str, object],
+) -> dict[str, object]:
+    """POST a local JSON request without moving native adapter work to a worker."""
+
+    body = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    reader, writer = await asyncio.open_connection(host, port)
+    try:
+        writer.write(
+            (
+                f"POST {path} HTTP/1.1\r\n"
+                f"Host: {host}:{port}\r\n"
+                "Content-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode("ascii")
+            + body
+        )
+        await writer.drain()
+        status_line = await reader.readline()
+        if not status_line.startswith(b"HTTP/1.1 200"):
+            raise RuntimeError(
+                f"controlled async HTTP request failed: {status_line!r}"
+            )
+        content_length = 0
+        while True:
+            line = await reader.readline()
+            if line in {b"\r\n", b""}:
+                break
+            name, _, value = line.decode("iso-8859-1").partition(":")
+            if name.lower() == "content-length":
+                content_length = int(value.strip())
+        response = await reader.readexactly(content_length)
+        decoded = json.loads(response.decode("utf-8"))
+        if not isinstance(decoded, dict):
+            raise RuntimeError("controlled async HTTP response must be a JSON object")
+        return decoded
+    finally:
+        writer.close()
+        await writer.wait_closed()
 
 
 def _strict_opa_runtime(

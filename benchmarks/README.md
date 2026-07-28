@@ -62,3 +62,39 @@ earlier pre-release record remains in
 Results are not treated as universal performance claims. Compare runs on the
 same pinned environment and investigate regressions in both tail latency and
 memory before release.
+
+## Extension-dispatch matrix
+
+The v0.8 dispatch matrix exercises the Runtime-owned extension boundary with
+paired local callbacks: a native coroutine using `asyncio.sleep` and a legacy
+synchronous callback using `time.sleep`. It intentionally makes no network
+calls. Each pair uses the same interpreter and host, runs in alternating order,
+and reports the median of an odd number of repetitions.
+
+Run the CI-sized matrix locally:
+
+```bash
+python benchmarks/benchmark_runtime.py \
+  --skip-runtime-matrix \
+  --dispatch-matrix \
+  --dispatch-requests-per-cell 20 \
+  --paired-repetitions 3 \
+  --output benchmarks/results/extension-dispatch.json
+
+python scripts/check_benchmark_budget.py \
+  benchmarks/results/extension-dispatch.json \
+  --budget benchmarks/budgets/v0.8.0-extension-dispatch.json
+```
+
+The default dispatch cells cover 5 ms, 20 ms, and 50 ms synthetic I/O at
+concurrency 1, 16, 100, and 500. Each cell records end-to-end p50/p95/p99 and
+mean latency, throughput, traced peak memory, event-loop lag percentiles,
+callback queue-wait percentiles, process/extension worker thread peaks, and
+dispatcher worker, executor-queue, and admission-waiter peaks.
+
+The budget compares legacy sync results against the native async result from
+the same cell, not against an external service-level objective. Limits widen
+only with the configured four-worker queue depth; this catches unexpected
+scheduler or allocation regressions without treating a synthetic local sleep
+as a production latency promise. Change the budget only in a separate reviewed
+change with new same-host evidence.

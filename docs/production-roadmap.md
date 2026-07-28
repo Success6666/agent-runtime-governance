@@ -4,9 +4,9 @@
 
 - Direction approved after the v0.5.1 production reliability release.
 - Last reviewed: 2026-07-26.
-- This document defines future work and the v0.7 implementation's release exit
-  criteria, not shipped behavior. Shipped behavior is documented in the release
-  notes and production guide.
+- This document defines future work and retains the v0.7 release exit criteria
+  as historical evidence. Shipped behavior is documented in the release notes
+  and production guide.
 - A production claim is published only when it points to a repeatable test,
   benchmark, integration run, or release artifact.
 
@@ -31,7 +31,8 @@ runtime binds their decisions to the committed action.
 
 ## Verified baseline
 
-The roadmap starts from the released v0.5.1 baseline, not from planned features.
+The roadmap starts from the released v0.7.0 baseline, not from planned
+features. The v0.5.1 evidence below remains a historical release record.
 
 | Evidence | Verified result |
 | --- | --- |
@@ -267,9 +268,10 @@ without ever treating uncertainty as permission to repeat a side effect.
 
 ### Implementation status
 
-The core protocol is implemented in the v0.7 worktree, but it is not a release
-claim until the exit criteria and protected publication workflow have complete,
-recorded evidence. The implemented model is:
+The core protocol shipped as v0.7.0 on 2026-07-27 from protected `main` after
+the recorded CI, Docker integration, package, provenance, and PyPI publication
+checks. See [`release-verification.md`](release-verification.md) for immutable
+workflow and release links. The released model is:
 
 - A versioned `ReconciliationProvider` protocol whose stable identifier,
   protocol version, and supported evidence kinds are persisted with the

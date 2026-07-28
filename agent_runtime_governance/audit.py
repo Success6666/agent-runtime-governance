@@ -11,7 +11,7 @@ from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Awaitable, Protocol
 
 from filelock import FileLock
 
@@ -51,7 +51,7 @@ _SOURCE_EVENT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 
 
 class AuditSink(Protocol):
-    def write(self, event: Mapping[str, Any]) -> None: ...
+    def write(self, event: Mapping[str, Any]) -> None | Awaitable[None]: ...
 
 
 class InMemoryAuditSink:
