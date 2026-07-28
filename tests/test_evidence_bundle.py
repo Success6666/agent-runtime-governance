@@ -15,6 +15,7 @@ from jsonschema import Draft202012Validator
 
 import agent_runtime_governance.evidence as evidence_module
 from agent_runtime_governance import (
+    EVIDENCE_BUNDLE_SCHEMA_V1,
     ActionContract,
     ApprovalRequest,
     AuditAnchor,
@@ -27,7 +28,6 @@ from agent_runtime_governance import (
     ExecutionMode,
     ReconciliationEvidenceEntry,
 )
-from agent_runtime_governance.evidence import EVIDENCE_BUNDLE_SCHEMA_V1
 
 _FIXTURE = Path(__file__).parent / "fixtures" / "evidence" / "v1" / "bundle.json"
 _CANONICAL_FIXTURE = _FIXTURE.with_name("canonical-unsigned.hex")
@@ -150,6 +150,7 @@ def test_evidence_bundle_matches_v1_golden_fixture() -> None:
     assert hashlib.sha256(bundle.commitment_bytes()).hexdigest() == bundle.bundle_digest
     assert b'"signature"' not in bundle.canonical_unsigned_bytes()
     assert bundle.signature is None
+    assert EVIDENCE_BUNDLE_SCHEMA_V1 is evidence_module.EVIDENCE_BUNDLE_SCHEMA_V1
 
 
 def test_bundle_projects_only_allowlisted_values_and_never_serializes_secrets(
@@ -425,6 +426,37 @@ def test_bundle_rejects_invalid_redactions_and_reconciliation_lineage() -> None:
         )
 
 
+def test_bundle_rejects_reconciliation_lineage_timestamp_regression() -> None:
+    action = _action()
+
+    with pytest.raises(
+        EvidenceBundleValidationError,
+        match="timestamps must not move backwards",
+    ):
+        EvidenceBundle.from_bound_action(
+            action,
+            bundle_id="backwards-lineage-bundle-1",
+            created_at=_at(3),
+            execution=EvidenceExecution("backwards-lineage-execution-1", "failed", _at(2)),
+            reconciliation=(
+                ReconciliationEvidenceEntry(
+                    seq=1,
+                    prior_state="UNKNOWN",
+                    new_state="MANUAL_REVIEW",
+                    evidence_kind="receipt",
+                    created_at=_at(2, 1),
+                ),
+                ReconciliationEvidenceEntry(
+                    seq=2,
+                    prior_state="MANUAL_REVIEW",
+                    new_state="CONFIRMED_SUCCEEDED",
+                    evidence_kind="manual-resolution",
+                    created_at=_at(2),
+                ),
+            ),
+        )
+
+
 def test_evidence_leaf_values_reject_invalid_public_inputs() -> None:
     with pytest.raises(EvidenceBundleValidationError, match="execution status"):
         EvidenceExecution("invalid-status-execution-1", "running", _at(2))
@@ -456,14 +488,31 @@ def test_evidence_leaf_values_reject_invalid_public_inputs() -> None:
 
 
 def test_closed_schema_rejects_extra_fields_and_non_null_receipts() -> None:
-    validator = Draft202012Validator(EVIDENCE_BUNDLE_SCHEMA_V1)
+    validator = Draft202012Validator(
+        EVIDENCE_BUNDLE_SCHEMA_V1,
+        format_checker=Draft202012Validator.FORMAT_CHECKER,
+    )
     document = _bundle().to_dict()
     document["unexpected"] = "not-allowed"
 
-    assert list(validator.iter_errors(document))
+    assert any(
+        error.validator == "additionalProperties"
+        and list(error.absolute_path) == []
+        for error in validator.iter_errors(document)
+    )
     document.pop("unexpected")
     document["execution"]["receipt"] = "raw-receipt-secret"
-    assert list(validator.iter_errors(document))
+    assert any(
+        error.validator == "type"
+        and list(error.absolute_path) == ["execution", "receipt"]
+        for error in validator.iter_errors(document)
+    )
+    document["execution"]["receipt"] = None
+    document["created_at"] = "not-an-rfc3339-timestamp"
+    assert any(
+        error.validator == "format" and list(error.absolute_path) == ["created_at"]
+        for error in validator.iter_errors(document)
+    )
 
 
 def test_evidence_values_are_frozen_and_signature_is_fixed_null() -> None:
@@ -484,6 +533,7 @@ def test_distribution_contains_evidence_module_and_golden_fixture(tmp_path: Path
         cwd=repository,
         capture_output=True,
         text=True,
+        timeout=180,
     )
     assert completed.returncode == 0, completed.stderr
 

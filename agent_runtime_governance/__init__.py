@@ -53,6 +53,7 @@ from .evaluation import (
     RegressionResult,
 )
 from .evidence import (
+    EVIDENCE_BUNDLE_SCHEMA_V1,
     AuditAnchor,
     EvidenceBundle,
     EvidenceBundleValidationError,
@@ -209,6 +210,7 @@ __all__ = [
     "ExecutionContext",
     "ExecutionMode",
     "ExecutionStatus",
+    "EVIDENCE_BUNDLE_SCHEMA_V1",
     "EvidenceBundle",
     "EvidenceBundleValidationError",
     "EvidenceExecution",

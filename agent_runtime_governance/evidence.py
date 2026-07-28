@@ -91,7 +91,7 @@ EVIDENCE_BUNDLE_SCHEMA_V1: dict[str, Any] = {
     "properties": {
         "schema_version": {"const": _EVIDENCE_SCHEMA_VERSION},
         "bundle_id": {"type": "string", "pattern": _IDENTIFIER.pattern},
-        "created_at": {"type": "string", "format": "date-time"},
+        "created_at": {"$ref": "#/$defs/timestamp"},
         "action": {"$ref": "#/$defs/action"},
         "identity": {"$ref": "#/$defs/identity"},
         "policy": {"$ref": "#/$defs/policy"},
@@ -285,6 +285,10 @@ EVIDENCE_BUNDLE_SCHEMA_V1: dict[str, Any] = {
     },
 }
 Draft202012Validator.check_schema(EVIDENCE_BUNDLE_SCHEMA_V1)
+if "date-time" not in Draft202012Validator.FORMAT_CHECKER.checkers:
+    raise RuntimeError(
+        "rfc3339-validator is required for fail-closed evidence timestamp validation"
+    )
 _SCHEMA_VALIDATOR = Draft202012Validator(
     EVIDENCE_BUNDLE_SCHEMA_V1,
     format_checker=Draft202012Validator.FORMAT_CHECKER,
@@ -654,12 +658,16 @@ class EvidenceBundle:
         """Return the closed schema v1 document with a fixed null signature."""
 
         document = self._document(include_signature=True)
-        self._validate_for_serialization()
+        self._validate_for_serialization(document)
         return document
 
-    def _validate_for_serialization(self) -> None:
+    def _validate_for_serialization(
+        self, document: dict[str, Any] | None = None
+    ) -> None:
         _validate_reconciliation_lineage(self.reconciliation)
-        _validate_document(self._document(include_signature=True))
+        _validate_document(
+            self._document(include_signature=True) if document is None else document
+        )
 
     def _document(self, *, include_signature: bool) -> dict[str, Any]:
         document: dict[str, Any] = {
@@ -745,10 +753,15 @@ def _validate_reconciliation_lineage(
     entries: tuple[ReconciliationEvidenceEntry, ...],
 ) -> None:
     previous_state: str | None = None
+    previous_created_at: datetime | None = None
     for index, entry in enumerate(entries, start=1):
         if entry.seq != index:
             raise EvidenceBundleValidationError(
                 "reconciliation sequence numbers must start at 1 and be contiguous"
+            )
+        if previous_created_at is not None and entry.created_at < previous_created_at:
+            raise EvidenceBundleValidationError(
+                "reconciliation lineage timestamps must not move backwards"
             )
         if previous_state is not None and entry.prior_state != previous_state:
             raise EvidenceBundleValidationError(
@@ -761,6 +774,7 @@ def _validate_reconciliation_lineage(
                 "reconciliation lineage contains an illegal state transition"
             )
         previous_state = entry.new_state
+        previous_created_at = entry.created_at
 
 
 def _normalize_redactions(value: Sequence[str]) -> tuple[str, ...]:
