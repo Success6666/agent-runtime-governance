@@ -229,7 +229,13 @@ class InMemoryAnchorProvider:
             bundle_id=bundle_id,
             bundle_digest=bundle_digest,
         )
-        self._protected_entries = (*self._protected_entries, entry)
+        updated = (*self._protected_entries, entry)
+        if len(updated) > _MAX_ANCHOR_ENTRIES:
+            raise EvidenceExternalValidationError(
+                f"protected_entries must contain at most {_MAX_ANCHOR_ENTRIES} values"
+            )
+        _validate_anchor_entries(updated)
+        self._protected_entries = updated
         return entry
 
     def verify_continuity(

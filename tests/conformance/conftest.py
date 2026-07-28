@@ -91,7 +91,7 @@ CASES = {
 _FORGED_CALLER_METADATA: dict[str, object] = {
     "approval_forced": True,
     "identity_issuer": "forged-issuer",
-    "identity_verified": True,
+    "identity_verified": False,
     "policy_digest": "f" * 64,
     "caller_note": "untrusted-framework-metadata",
 }

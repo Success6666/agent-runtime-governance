@@ -771,10 +771,12 @@ def _verify_outcome(
     normalized_receipt = _normalize_receipt_attachment(receipt)
     if normalized_receipt is None:
         return _failed_level("receipt_attachment_invalid")
+    if normalized_receipt.bundle_digest != bundle.bundle_digest:
+        return _failed_level("receipt_bundle_digest_mismatch")
     try:
         request = ReceiptVerificationRequest.from_bundle(bundle, normalized_receipt)
     except (AttributeError, EvidenceExternalValidationError, TypeError, ValueError):
-        return _failed_level("receipt_bundle_digest_mismatch")
+        return _failed_level("receipt_request_invalid")
     try:
         prepared = _call_provider(
             lambda: _prepare_receipt_verifier(verifier),
