@@ -17,8 +17,8 @@ from typing import Any, Protocol, runtime_checkable
 
 from jsonschema import Draft202012Validator
 
-from . import _evidence_ed25519
-from ._canonical import CanonicalJsonError, rfc8785_json_bytes
+from ._internal.evidence import ed25519 as _evidence_ed25519
+from ._internal.serialization.canonical import CanonicalJsonError, rfc8785_json_bytes
 from .evidence import EvidenceBundle
 
 _SIGNATURE_SCHEMA_VERSION = "1"

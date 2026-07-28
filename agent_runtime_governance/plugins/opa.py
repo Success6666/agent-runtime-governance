@@ -10,8 +10,8 @@ from typing import Any, Awaitable, Protocol
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
-from .._blocking import invoke_extension
-from .._extensions import is_native_async_callable
+from .._internal.runtime.blocking import invoke_extension
+from .._internal.runtime.extensions import is_native_async_callable
 from ..context import ExecutionContext, HistoryEntry
 from ..decisions import DecisionOutcome, DecisionRecord
 from ..middleware.base import GatingMiddleware

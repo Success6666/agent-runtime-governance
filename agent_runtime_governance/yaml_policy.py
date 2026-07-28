@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from ._canonical import legacy_policy_json_bytes
+from ._internal.serialization.canonical import legacy_policy_json_bytes
 from .context import RiskTier
 from .policy import PolicyMiddleware, SimplePolicy
 

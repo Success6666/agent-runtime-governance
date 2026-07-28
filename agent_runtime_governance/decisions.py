@@ -8,9 +8,9 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Protocol, TypeAlias
 from uuid import uuid4
 
-from ._blocking import invoke_extension
-from ._serialization import freeze_mapping as _freeze_mapping
-from ._serialization import thaw as _thaw
+from ._internal.runtime.blocking import invoke_extension
+from ._internal.serialization.values import freeze_mapping as _freeze_mapping
+from ._internal.serialization.values import thaw as _thaw
 from .contracts import canonical_json_bytes
 
 if TYPE_CHECKING:

@@ -12,9 +12,9 @@ from typing import Any
 import rfc8785
 from jsonschema import Draft202012Validator
 
-from ._canonical import CanonicalJsonError, rfc8785_json_bytes
-from ._serialization import freeze_mapping as _freeze_mapping
-from ._serialization import thaw as _thaw
+from ._internal.serialization.canonical import CanonicalJsonError, rfc8785_json_bytes
+from ._internal.serialization.values import freeze_mapping as _freeze_mapping
+from ._internal.serialization.values import thaw as _thaw
 from .context import ExecutionMode
 from .contracts import validate_schema
 from .errors import ContractValidationError, RegistryError

@@ -58,6 +58,11 @@ All notable changes are documented here.
 
 ### Changed
 
+- Private runtime dispatch, audit redaction, optional evidence-signing, and
+  serialization helpers are now grouped under `_internal` domain packages.
+  Existing private paths remain thin re-exports; stable public module paths,
+  public object identities, signatures, audit/evidence bytes, and SQLite
+  formats remain unchanged.
 - `RuntimeLimits.max_blocking_extension_workers` (default `4`) now controls
   extension worker count independently from
   `max_blocking_extension_in_flight` (default `16`), which bounds admitted

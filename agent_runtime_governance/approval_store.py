@@ -12,7 +12,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Protocol
 
-from ._canonical import legacy_storage_json_text
+from ._internal.serialization.canonical import legacy_storage_json_text
 from ._sqlite import connect_sqlite, initialize_sqlite
 from .decisions import (
     ApprovalRequest,

@@ -6,10 +6,10 @@ from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Any, Mapping
 from uuid import uuid4
 
-from ._serialization import freeze as _freeze
-from ._serialization import freeze_mapping as _freeze_mapping
-from ._serialization import json_safe as _json_safe
-from ._serialization import thaw as _thaw
+from ._internal.serialization.values import freeze as _freeze
+from ._internal.serialization.values import freeze_mapping as _freeze_mapping
+from ._internal.serialization.values import json_safe as _json_safe
+from ._internal.serialization.values import thaw as _thaw
 from .decisions import DecisionOutcome, DecisionRecord
 from .errors import ContextMutationError
 

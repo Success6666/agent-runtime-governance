@@ -4,7 +4,7 @@ import weakref
 from collections.abc import Callable, Iterator
 from typing import Any
 
-from .._extensions import ExtensionDispatchSnapshot
+from .._internal.runtime.extensions import ExtensionDispatchSnapshot
 from ..context import ExecutionContext, ExecutionStatus, HistoryEntry
 from ..middleware.base import ObservingMiddleware
 from .core import RuntimeBuilder

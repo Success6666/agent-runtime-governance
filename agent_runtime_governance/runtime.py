@@ -16,7 +16,7 @@ from time import perf_counter
 from typing import Any, Awaitable, Callable, Iterable, Mapping, ParamSpec, TypeVar
 from uuid import uuid4
 
-from ._blocking import (
+from ._internal.runtime.blocking import (
     BlockingRunner,
     ExtensionCleanupScheduler,
     ExtensionRunner,
@@ -32,12 +32,15 @@ from ._blocking import (
     reset_extension_cleanup_scheduler,
     reset_extension_runner,
 )
-from ._context_boundaries import validate_middleware_transition
-from ._daemon_executor import DaemonThreadPoolExecutor
-from ._extensions import ExtensionDispatchSnapshot, _ExtensionDispatcher
-from ._metadata import metadata_text as _metadata_text
-from ._pipeline_runner import PipelineRunner
-from ._serialization import thaw as _thaw
+from ._internal.runtime.context_boundaries import validate_middleware_transition
+from ._internal.runtime.daemon_executor import DaemonThreadPoolExecutor
+from ._internal.runtime.extensions import (
+    ExtensionDispatchSnapshot,
+    _ExtensionDispatcher,
+)
+from ._internal.runtime.metadata import metadata_text as _metadata_text
+from ._internal.runtime.pipeline_runner import PipelineRunner
+from ._internal.serialization.values import thaw as _thaw
 from .action_contracts import ActionContract, BoundAction
 from .audit import reconciliation_event
 from .context import (

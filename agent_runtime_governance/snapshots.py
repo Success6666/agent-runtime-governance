@@ -15,9 +15,12 @@ from typing import Any, Awaitable, Mapping, Protocol, runtime_checkable
 
 from filelock import FileLock
 
-from ._blocking import invoke_extension
-from ._canonical import legacy_audit_json_bytes, legacy_storage_json_text
-from ._redaction import DEFAULT_SENSITIVE_KEYS, redact_sensitive_data
+from ._internal.audit.redaction import DEFAULT_SENSITIVE_KEYS, redact_sensitive_data
+from ._internal.runtime.blocking import invoke_extension
+from ._internal.serialization.canonical import (
+    legacy_audit_json_bytes,
+    legacy_storage_json_text,
+)
 from ._sqlite import connect_sqlite, initialize_sqlite
 from .context import ExecutionContext, ExecutionStatus, HistoryEntry
 from .errors import AuditIntegrityError

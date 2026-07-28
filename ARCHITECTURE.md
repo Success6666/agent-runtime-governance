@@ -34,6 +34,28 @@ modules are prefixed with `_`; consumers must not depend on them. Any later
 audit, codec, protocol, or event extraction preserves its current public import
 paths and serialized compatibility contract. See [ADR 0006](docs/adr/0006-v08-runtime-service-boundaries.md).
 
+### Private service layout
+
+The package root contains stable public facades and thin compatibility
+re-exports. The private implementation code that backs those facades is
+grouped by ownership:
+
+```text
+agent_runtime_governance/_internal/
+  runtime/          dispatch, pipeline, lifecycle helpers
+  audit/            redaction primitive
+  evidence/         optional signing helper
+  serialization/    canonical codec and immutable values
+```
+
+Private runtime services may use value and protocol modules, but never import
+the public `Runtime` facade. The previous private helper paths remain as thin
+compatibility re-exports during v0.8 so existing imports continue to resolve. The
+root `_sqlite.py` remains a compatibility exception because its
+journal-capability values are stable v0.7 imports. This layout changes neither
+public module paths nor persistence formats; see
+[ADR 0008](docs/adr/0008-v08-private-service-layout.md).
+
 Canonical JSON is an internal compatibility boundary with explicit profiles,
 not a format migration. Audit event/state integrity uses the legacy ASCII
 sorted-JSON profile; snapshot and approval storage retain their legacy ASCII
