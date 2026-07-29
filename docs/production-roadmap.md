@@ -115,7 +115,7 @@ teams seeking a hosted dashboard without owning their execution code.
 
 ## Target developer contract
 
-The roadmap targets six v1.0 invariants. They are not all current v0.5.1
+The roadmap targets seven v1.0 invariants. They are not all current v0.5.1
 capabilities:
 
 1. **Intent binding** - policy, approval, idempotency, execution, and audit use
