@@ -223,8 +223,8 @@ identity-verification metadata and never creates an executor-authoritative
 audit, and telemetry are never invoked by deterministic replay. A fresh bound
 preview uses `apreview()` and the current trusted identity provider.
 
-`Runtime.events` is a separate terminal-event subscription seam for debugger
-and replay consumers. It publishes only frozen, versioned allowlist projections:
+`Runtime.events` is a separate terminal-event subscription seam for independent
+debugger and replay consumers. It publishes only frozen, versioned allowlist projections:
 the tool identity, terminal status, approval state, cancellation marker, and
 bound-action digests. It never exposes a live `Runtime` or `ExecutionContext`,
 nor raw user or tenant values, input, parameters, result, approval reason, or

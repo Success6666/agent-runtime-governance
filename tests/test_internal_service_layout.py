@@ -90,6 +90,30 @@ def test_internal_runtime_services_do_not_import_the_runtime_facade() -> None:
         assert not facade_imports, source_path.name
 
 
+def test_debugger_and_replay_consumers_do_not_import_the_runtime_facade() -> None:
+    for module_name in ("debugger.py", "replay.py"):
+        source_path = _PACKAGE_ROOT / module_name
+        module = ast.parse(source_path.read_text(encoding="utf-8"))
+        facade_imports = [node for node in ast.walk(module) if _is_runtime_facade(node)]
+        assert not facade_imports, module_name
+
+
+def test_runtime_facade_import_detection_catches_package_root_runtime() -> None:
+    package_runtime = ast.parse(
+        "from agent_runtime_governance import Runtime"
+    ).body[0]
+    package_module = ast.parse(
+        "from agent_runtime_governance import runtime"
+    ).body[0]
+    unrelated_import = ast.parse(
+        "from agent_runtime_governance import Rule"
+    ).body[0]
+
+    assert _is_runtime_facade(package_runtime)
+    assert _is_runtime_facade(package_module)
+    assert not _is_runtime_facade(unrelated_import)
+
+
 def test_package_sources_do_not_import_the_moved_private_modules() -> None:
     for source_path in _PACKAGE_ROOT.rglob("*.py"):
         module = ast.parse(source_path.read_text(encoding="utf-8"))
@@ -109,10 +133,13 @@ def _is_runtime_facade(node: ast.AST) -> bool:
     if node.module == "agent_runtime_governance.runtime":
         return True
     if node.module == "agent_runtime_governance":
-        return any(alias.name == "runtime" for alias in node.names)
+        return any(alias.name in {"runtime", "Runtime"} for alias in node.names)
     return node.level == 3 and (
         node.module == "runtime"
-        or (node.module is None and any(alias.name == "runtime" for alias in node.names))
+        or (
+            node.module is None
+            and any(alias.name in {"runtime", "Runtime"} for alias in node.names)
+        )
     )
 
 
