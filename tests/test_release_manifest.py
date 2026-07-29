@@ -13,6 +13,8 @@ from typing import Any, Callable
 
 import pytest
 
+from agent_runtime_governance import __version__
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = ROOT / "scripts" / "release_manifest.py"
 SOURCE_COMMIT = "a" * 40
@@ -20,6 +22,7 @@ SERVICE_IMAGES = {
     "opa": "openpolicyagent/opa@sha256:" + "1" * 64,
     "otel": "otel/opentelemetry-collector-contrib@sha256:" + "2" * 64,
 }
+CURRENT_RELEASE_TAG = f"v{__version__}"
 
 
 def _load_release_manifest() -> ModuleType:
@@ -40,7 +43,7 @@ def release_manifest() -> ModuleType:
     return _load_release_manifest()
 
 
-def _write_release_inputs(root: Path) -> None:
+def _write_release_inputs(root: Path, *, package_version: str = "0.7.0") -> None:
     evidence = root / "release-evidence"
     dist = root / "dist"
     evidence.mkdir()
@@ -73,10 +76,10 @@ def _write_release_inputs(root: Path) -> None:
         json.dumps([{"name": "example", "version": "1.0", "vulns": []}]),
         encoding="utf-8",
     )
-    (dist / "agent_runtime_governance-0.7.0-py3-none-any.whl").write_bytes(
+    (dist / f"agent_runtime_governance-{package_version}-py3-none-any.whl").write_bytes(
         b"wheel"
     )
-    (dist / "agent_runtime_governance-0.7.0.tar.gz").write_bytes(b"sdist")
+    (dist / f"agent_runtime_governance-{package_version}.tar.gz").write_bytes(b"sdist")
     (dist / "sbom.spdx.json").write_text("{}\n", encoding="utf-8")
 
 
@@ -447,7 +450,7 @@ def test_rejects_manifest_not_bound_to_the_trusted_release_source(
 
 
 def test_cli_records_generates_and_validates_manifest(tmp_path: Path) -> None:
-    _write_release_inputs(tmp_path)
+    _write_release_inputs(tmp_path, package_version=__version__)
     record = subprocess.run(
         [
             sys.executable,
@@ -472,7 +475,7 @@ def test_cli_records_generates_and_validates_manifest(tmp_path: Path) -> None:
             str(SCRIPT_PATH),
             "generate",
             "--release-tag",
-            "v0.7.0",
+            CURRENT_RELEASE_TAG,
             "--source-commit",
             SOURCE_COMMIT,
             "--root",
@@ -494,7 +497,7 @@ def test_cli_records_generates_and_validates_manifest(tmp_path: Path) -> None:
             str(SCRIPT_PATH),
             "validate",
             "--release-tag",
-            "v0.7.0",
+            CURRENT_RELEASE_TAG,
             "--source-commit",
             SOURCE_COMMIT,
             "--root",

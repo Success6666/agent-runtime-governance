@@ -89,10 +89,10 @@ or receipt/probe guarantee.
 
 ## v0.8 - Evidence and conformance
 
-- Versioned, privacy-aware Governance Evidence Bundle
-- Offline verification and schema compatibility tests
-- Cross-framework conformance for standalone, LangGraph, and OpenAI Agents SDK
-- Async-first extension dispatch with controlled synchronous fallback,
+- [x] Versioned, privacy-aware Governance Evidence Bundle
+- [x] Offline verification and schema compatibility tests
+- [x] Cross-framework conformance for standalone, LangGraph, and OpenAI Agents SDK
+- [x] Async-first extension dispatch with controlled synchronous fallback,
   event-loop-isolation tests, native async external-adapter compatibility, and
   bounded worker/queue observability ([#43](https://github.com/Success6666/agent-runtime-governance/issues/43))
 

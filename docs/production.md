@@ -1,13 +1,14 @@
 # Production Operations
 
-This guide covers the released v0.7 operational contract and the current v0.8
-development baseline. The unreleased v0.8 material is not a production claim
-until its own release verification is recorded. Applications remain responsible
-for tool-specific authorization, business rollback, downstream idempotency,
-and data-retention requirements.
+This guide covers the v0.8 implementation contract. Point-in-time release
+verification evidence for published versions is recorded in
+[`release-verification.md`](release-verification.md). Applications remain
+responsible for tool-specific authorization, business rollback, downstream
+idempotency, and data-retention requirements.
 
 The v0.6 strict profile adds an explicit registration and sealing lifecycle;
-v0.7 adds deterministic reconciliation requirements for idempotent tools.
+v0.7 adds deterministic reconciliation requirements for idempotent tools; and
+v0.8 adds portable evidence verification and async-first extension dispatch.
 Configure `ProductionProfile`, register every tool, call
 `seal_production()`, and expose readiness or accept traffic only after the
 returned report has `ready=True`. Compatibility runtimes can call
