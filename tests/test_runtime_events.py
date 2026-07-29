@@ -187,6 +187,27 @@ async def test_independent_debugger_and_replay_consumers_receive_detached_events
         await runtime.aclose()
 
 
+@pytest.mark.asyncio
+async def test_failing_event_subscriber_does_not_block_other_consumers() -> None:
+    replay_events: list[RuntimeEvent] = []
+
+    def failing(_event: RuntimeEvent) -> None:
+        raise RuntimeError("debugger consumer failed")
+
+    runtime = Runtime(event_subscribers=(failing, replay_events.append))
+
+    @runtime.tool(execution_mode=ExecutionMode.READ_ONLY)
+    def inspect(secret: str) -> str:
+        return f"result-canary:{secret}"
+
+    try:
+        result = await runtime.arun("inspect", "parameters-canary")
+        assert result.value == "result-canary:parameters-canary"
+        await _wait_until(lambda: len(replay_events) == 1)
+    finally:
+        await runtime.aclose()
+
+
 def test_runtime_event_rejects_nonterminal_statuses() -> None:
     action = RuntimeEventAction.from_bound_action(None)
     with pytest.raises(ValueError, match="status must be terminal"):
