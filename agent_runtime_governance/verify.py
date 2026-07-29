@@ -127,7 +127,7 @@ class _CliUsageError(ValueError):
     """Raised instead of writing argparse diagnostics to the public protocol."""
 
 
-class _JsonInputError(ValueError):
+class JsonInputError(ValueError):
     """Raised when a JSON input is not a strict JSON object."""
 
 
@@ -459,8 +459,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _emit_and_exit(_report(integrity=_failed_level("cli_usage_invalid")))
 
     try:
-        document = _read_json_object(arguments.bundle, "bundle")
-    except _JsonInputError as exc:
+        document = read_json_object(arguments.bundle, "bundle")
+    except JsonInputError as exc:
         return _emit_and_exit(_report(integrity=_failed_level(str(exc))))
 
     signature, signature_reasons = _read_signature(arguments.signature)
@@ -645,21 +645,23 @@ def _argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _read_json_object(path: Path, label: str) -> dict[str, Any]:
+def read_json_object(path: Path, label: str) -> dict[str, Any]:
+    """Read one strict JSON object with duplicate-key and finite-number checks."""
+
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
-        raise _JsonInputError(f"{label}_unreadable") from exc
+        raise JsonInputError(f"{label}_unreadable") from exc
     try:
         document = json.loads(
             text,
             object_pairs_hook=_reject_duplicate_object_keys,
             parse_constant=_reject_nonfinite_constant,
         )
-    except (json.JSONDecodeError, _JsonInputError) as exc:
-        raise _JsonInputError(f"{label}_invalid_json") from exc
+    except (json.JSONDecodeError, JsonInputError) as exc:
+        raise JsonInputError(f"{label}_invalid_json") from exc
     if not isinstance(document, dict):
-        raise _JsonInputError(f"{label}_must_be_object")
+        raise JsonInputError(f"{label}_must_be_object")
     return document
 
 
@@ -669,13 +671,13 @@ def _reject_duplicate_object_keys(
     document: dict[str, Any] = {}
     for key, value in pairs:
         if key in document:
-            raise _JsonInputError("duplicate_json_key")
+            raise JsonInputError("duplicate_json_key")
         document[key] = value
     return document
 
 
 def _reject_nonfinite_constant(value: str) -> None:
-    raise _JsonInputError(f"nonfinite_json_constant_{value}")
+    raise JsonInputError(f"nonfinite_json_constant_{value}")
 
 
 def _read_signature(
@@ -685,11 +687,11 @@ def _read_signature(
         return None, []
     try:
         return EvidenceSignatureAttachment.from_dict(
-            _read_json_object(path, "signature")
+            read_json_object(path, "signature")
         ), []
     except (
         EvidenceSignatureValidationError,
-        _JsonInputError,
+        JsonInputError,
         TypeError,
         ValueError,
     ):
@@ -702,10 +704,10 @@ def _read_trust_roots(
     if path is None:
         return None, []
     try:
-        return EvidenceTrustRoots.from_dict(_read_json_object(path, "trust_roots")), []
+        return EvidenceTrustRoots.from_dict(read_json_object(path, "trust_roots")), []
     except (
         EvidenceTrustRootValidationError,
-        _JsonInputError,
+        JsonInputError,
         TypeError,
         ValueError,
     ):
@@ -719,11 +721,11 @@ def _read_anchor_request(
         return None, []
     try:
         return AnchorVerificationRequest.from_dict(
-            _read_json_object(path, "anchor_sequence")
+            read_json_object(path, "anchor_sequence")
         ), []
     except (
         EvidenceExternalValidationError,
-        _JsonInputError,
+        JsonInputError,
         TypeError,
         ValueError,
     ):
@@ -736,10 +738,10 @@ def _read_receipt(
     if path is None:
         return None, []
     try:
-        return ReceiptAttachment.from_dict(_read_json_object(path, "receipt")), []
+        return ReceiptAttachment.from_dict(read_json_object(path, "receipt")), []
     except (
         EvidenceExternalValidationError,
-        _JsonInputError,
+        JsonInputError,
         TypeError,
         ValueError,
     ):

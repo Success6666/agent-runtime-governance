@@ -278,6 +278,10 @@ class OPAMiddleware(GatingMiddleware):
                     self.name,
                     "error",
                     f"OPA unavailable, fail open: {type(exc).__name__}",
+                    data={
+                        **self._policy_metadata(),
+                        **unavailable_decision_controls_history_data(),
+                    },
                 )
             )
         if not decision.allow:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import NoReturn
@@ -14,11 +15,13 @@ from .decision_explanations import (
 from .verify import (
     EXIT_SUCCESS,
     EXIT_VERIFICATION_FAILURE,
+    JsonInputError,
     VerifiedDecisionExplanation,
-    _JsonInputError,
-    _read_json_object,
+    read_json_object,
     verify_decision_explanation,
 )
+
+_EXIT_USAGE_ERROR = 2
 
 
 class _ArgumentParser(argparse.ArgumentParser):
@@ -74,7 +77,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--expected-evidence-bundle-digest", metavar="SHA256")
     try:
         arguments = parser.parse_args(argv)
-        document = _read_json_object(arguments.attachment, "attachment")
+    except ValueError as exc:
+        print(f"Invalid arguments: {exc}", file=sys.stderr)
+        return _EXIT_USAGE_ERROR
+    try:
+        document = read_json_object(arguments.attachment, "attachment")
         attachment = DecisionExplanationAttachment.from_dict(document)
         verified = verify_decision_explanation(
             attachment,
@@ -88,7 +95,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     except (
         DecisionExplanationValidationError,
-        _JsonInputError,
+        JsonInputError,
         TypeError,
         ValueError,
     ):

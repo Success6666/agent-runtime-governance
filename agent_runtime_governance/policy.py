@@ -74,14 +74,7 @@ class PolicyMiddleware(GatingMiddleware):
 
     async def process(self, context: ExecutionContext) -> ExecutionContext:
         tool = context.tool_call.name
-        policy_metadata = {
-            key: value
-            for key, value in {
-                "policy_version": self.version,
-                "policy_digest": self.digest,
-            }.items()
-            if value is not None
-        }
+        policy_metadata = self._policy_metadata()
         if policy_metadata:
             context = context.evolve(
                 metadata={**context.metadata, **policy_metadata}
@@ -150,6 +143,16 @@ class PolicyMiddleware(GatingMiddleware):
             reason_code=reason_code,
         )
 
+    def _policy_metadata(self) -> dict[str, str]:
+        return {
+            key: value
+            for key, value in {
+                "policy_version": self.version,
+                "policy_digest": self.digest,
+            }.items()
+            if value is not None
+        }
+
     def _deny(
         self,
         context: ExecutionContext,
@@ -165,14 +168,7 @@ class PolicyMiddleware(GatingMiddleware):
                 "deny",
                 reason,
                 data={
-                    **{
-                        key: value
-                        for key, value in {
-                            "policy_version": self.version,
-                            "policy_digest": self.digest,
-                        }.items()
-                        if value is not None
-                    },
+                    **self._policy_metadata(),
                     **decision_controls_history_data(controls),
                 },
             )
