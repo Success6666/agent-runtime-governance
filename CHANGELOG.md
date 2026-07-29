@@ -4,6 +4,8 @@ All notable changes are documented here.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-29
+
 ### Added
 
 - A versioned, closed Release Verification Manifest generated from protected
@@ -44,11 +46,12 @@ All notable changes are documented here.
   delivered through a Runtime-owned async-first boundary without becoming
   governance-authoritative; synchronous consumers use isolated, bounded
   best-effort delivery.
-- A privacy-safe, unsigned evidence bundle schema v1. Immutable allowlisted
+- A privacy-safe evidence bundle schema v1. Immutable allowlisted
   DTOs bind action, pseudonymous identity, policy, optional approval,
   receipt-free execution, reconciliation lineage, audit-anchor, and redaction
-  commitments through an RFC 8785 domain-separated digest; external-outcome
-  verification remains a separate v0.8 work package.
+  commitments through an RFC 8785 domain-separated digest. Its integrity
+  commitment remains separate from detached external-outcome verification,
+  which runs only through an explicitly selected provider.
 - Optional detached Ed25519 evidence signatures and closed, explicitly
   configured trust roots. Signature attachments bind a fixed version, key ID,
   algorithm, and unsigned bundle digest without changing the bundle; unknown,
@@ -58,8 +61,9 @@ All notable changes are documented here.
   evidence parsing, canonical digest commitments, detached signature/trust-root
   validation, requested tenant/policy/contract bindings, and reconciliation
   lineage. It reports integrity, authenticity, and outcome verification as
-  independent JSON levels; anchors and receipt verification remain explicitly
-  unsupported.
+  independent JSON levels. Selected detached anchor and receipt providers are
+  bounded verification inputs; absent or unsupported providers report
+  `unsupported` rather than implying continuity or an external outcome.
 
 ### Changed
 

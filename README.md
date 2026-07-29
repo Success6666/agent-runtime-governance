@@ -21,7 +21,8 @@ world within the configured storage guarantees. It runs inside the agent stack
 you already use rather than replacing it. The default in-memory idempotency
 store has bounded TTL/LRU retention and does not survive restarts; longer-lived
 protection requires a durable store. v0.7 adds durable, deterministic
-reconciliation for `UNKNOWN` outcomes.
+reconciliation for `UNKNOWN` outcomes, and v0.8 adds portable evidence
+verification and cross-framework conformance.
 
 ## Quick start
 
@@ -119,12 +120,29 @@ exactly-once unless the downstream system independently supports that property.
 | Shared SQLite migration rejects orphaned staging objects and cannot upgrade idempotency independently of an existing reconciliation authority | [`test_sqlite_idempotency_rejects_orphaned_migration_staging_table`](tests/test_contracts_idempotency.py), [`test_standalone_idempotency_migration_rejects_colocated_reconciliation`](tests/test_contracts_idempotency.py) |
 | Async shutdown rejects self- and cross-loop deadlocks, stops new admission, and waits for already-admitted, cancellation-ignoring, and thread-backed runtime work before releasing executors | [`test_aclose_waits_for_active_public_operation`](tests/test_runtime.py), [`test_aclose_waits_for_detached_uncooperative_async_tool`](tests/test_runtime.py), [`test_aclose_waits_for_timed_out_uncooperative_sync_hook`](tests/test_runtime.py), [`test_aclose_waits_for_timed_out_uncooperative_sync_audit_sink`](tests/test_runtime.py), [`test_aclose_waits_for_timed_out_sync_tool_on_external_executor`](tests/test_runtime.py), [`test_aclose_waits_for_a_cancellation_ignoring_provider`](tests/test_runtime_reconciliation.py), [`test_aclose_rejects_self_shutdown_from_active_operation`](tests/test_runtime.py), [`test_aclose_rejects_cross_loop_shutdown_while_work_is_active`](tests/test_runtime.py) |
 
-The staged v0.8-v1.0 direction and its exit criteria are in
+v0.8 makes evidence portable and keeps asynchronous extension behavior explicit.
+Its claims remain bounded: integrity, signer authenticity, and configured
+external outcome verification are distinct; no row below claims certification,
+generic external verification, or exactly-once side effects.
+
+| v0.8.0 implementation evidence | Evidence |
+| --- | --- |
+| Evidence Bundle v1 is a closed, immutable RFC 8785 commitment over allowlisted values and never serializes raw parameters, identity values, secrets, or receipts | [`test_evidence_bundle_matches_v1_golden_fixture`](tests/test_evidence_bundle.py), [`test_bundle_projects_only_allowlisted_values_and_never_serializes_secrets`](tests/test_evidence_bundle.py), [`test_historical_v1_vector_is_packaged_and_byte_stable`](tests/test_evidence_schema_evolution.py) |
+| Detached Ed25519 signatures validate only against explicit trust roots; trusted, rotated, unknown, revoked, and expired keys have deterministic outcomes | [`test_ed25519_signature_verifies_without_mutating_v1_bundle`](tests/test_evidence_signing.py), [`test_rotated_trust_roots_verify_signatures_from_each_configured_key`](tests/test_evidence_signing.py), [`test_verification_rejects_unknown_key`](tests/test_evidence_signing.py), [`test_verification_rejects_revoked_key`](tests/test_evidence_signing.py), [`test_verification_rejects_expired_key`](tests/test_evidence_signing.py) |
+| The offline verifier reports integrity, signer authenticity, and external outcome separately and rejects mutation, binding substitution, and broken reconciliation lineage | [`test_cli_verifies_signed_bundle_and_never_claims_an_external_outcome`](tests/test_evidence_verifier.py), [`test_cli_detects_mutation_against_detached_signature_and_expected_digest`](tests/test_evidence_verifier.py), [`test_cli_detects_cross_tenant_and_stale_binding_substitution`](tests/test_evidence_verifier.py), [`test_cli_rejects_broken_reconciliation_lineage`](tests/test_evidence_verifier.py) |
+| External anchor continuity and receipt outcomes are verified only through an explicitly selected provider; absent or unsupported providers report `unsupported` | [`test_anchor_provider_detects_deletion_and_reordering_without_changing_bundle`](tests/test_evidence_external.py), [`test_absent_or_unsupported_anchor_never_claims_continuity`](tests/test_evidence_external.py), [`test_receipt_verifier_projects_only_bounded_identity_and_never_leaks_receipt`](tests/test_evidence_external.py), [`test_receipt_binding_and_outcome_disagreement_fail_closed`](tests/test_evidence_external.py) |
+| The release workflow derives and validates a closed Release Verification Manifest, then protects the manifest with release checksums and provenance before distribution | [`test_generates_and_validates_same_job_release_evidence`](tests/test_release_manifest.py), [`test_release_and_publish_workflows_gate_manifest_before_distribution`](tests/test_release_manifest.py) |
+| Standalone Runtime, LangGraph, and OpenAI Agents SDK real tool entries preserve shared success, policy-denial, and approval-denial governance semantics | [`test_standalone_runtime_keeps_protected_semantics`](tests/conformance/test_standalone.py), [`test_langgraph_node_matches_standalone_protected_semantics`](tests/conformance/test_langgraph.py), [`test_openai_agents_tool_matches_standalone_protected_semantics`](tests/conformance/test_openai_agents.py) |
+| Native asynchronous extensions stay on the caller loop; synchronous fallback has bounded worker and queue capacity, while OPA and Slack native transports retain asynchronous behavior | [`test_native_async_callable_instances_and_partials_stay_on_calling_loop`](tests/test_extension_dispatch.py), [`test_sync_capacity_separates_workers_from_admitted_queue`](tests/test_extension_dispatch.py), [`test_sync_observer_does_not_stall_a_ten_millisecond_ticker`](tests/test_extension_dispatch.py), [`test_runtime_opa_timeout_cancels_native_transport_without_warning`](tests/test_async_plugin_transports.py), [`test_runtime_slack_native_async_transport_stays_on_calling_loop`](tests/test_async_plugin_transports.py) |
+| v0.7 public imports and call signatures remain compatible while private services are grouped by domain; terminal events are immutable, redacted, and failure-isolated for consumers | [`test_v070_public_call_signatures_remain_compatible`](tests/test_public_api_snapshot.py), [`test_v070_wheel_and_sdist_expose_stable_imports`](tests/test_public_api_snapshot.py), [`test_private_services_are_grouped_under_explicit_internal_domains`](tests/test_internal_service_layout.py), [`test_runtime_event_projection_is_versioned_immutable_and_redacted`](tests/test_runtime_events.py), [`test_failing_event_subscriber_does_not_block_other_consumers`](tests/test_runtime_events.py) |
+| The CI-sized extension-dispatch matrix passed its committed same-host ratio budget on the recorded Windows/Python 3.12 host; this is point-in-time measurement evidence, not a service-level promise | [`v0.8.0-windows-python312.json`](benchmarks/results/v0.8.0-windows-python312.json), [`v0.8 dispatch budget`](benchmarks/budgets/v0.8.0-extension-dispatch.json), [`test_extension_dispatch_budget_uses_same_host_mode_ratios`](tests/test_benchmark_budget.py) |
+
+The staged v0.9-v1.0 direction and its exit criteria are in
 [`ROADMAP.md`](ROADMAP.md) and [`docs/production-roadmap.md`](docs/production-roadmap.md).
 Planned capabilities are never presented as shipped.
 
-The unreleased v0.8 verifier, its detached external-evidence boundaries, and
-its input/exit-code contract are documented in
+The v0.8 verifier, its detached external-evidence boundaries, and its
+input/exit-code contract are documented in
 [`docs/evidence-verification.md`](docs/evidence-verification.md). Its closed v1
 schema and future-version policy are in
 [`docs/evidence-schema-compatibility.md`](docs/evidence-schema-compatibility.md).
@@ -428,7 +446,14 @@ paired budget are in
 [`benchmarks/results/v0.6.0-rc-windows-python312.json`](benchmarks/results/v0.6.0-rc-windows-python312.json),
 and [`benchmarks/budgets/v0.6.0.json`](benchmarks/budgets/v0.6.0.json).
 
-## Releases
+The v0.8 extension-dispatch matrix is recorded in
+[`benchmarks/results/v0.8.0-windows-python312.json`](benchmarks/results/v0.8.0-windows-python312.json)
+and checked against
+[`benchmarks/budgets/v0.8.0-extension-dispatch.json`](benchmarks/budgets/v0.8.0-extension-dispatch.json).
+It compares paired native-async and legacy-sync callbacks on the same host; it
+is not a production latency or throughput promise.
+
+## Version history
 
 | Version | Scope |
 | --- | --- |
@@ -441,6 +466,8 @@ and [`benchmarks/budgets/v0.6.0.json`](benchmarks/budgets/v0.6.0.json).
 | v0.5.0 | Production reliability: idempotency, identity, durable approvals, audit, deadlines, cancellation, contracts, real integration smoke |
 | v0.5.1 | Security hardening: caller metadata isolation and exact approval binding |
 | v0.6.0 | Immutable action contracts from admission through approval, idempotency, executor revalidation, telemetry, and audit |
+| v0.7.0 | Durable `UNKNOWN` reconciliation, strict recovery authorization, and a source-idempotent reconciliation-audit outbox |
+| v0.8.0 (release candidate) | Portable governance evidence, configured external verification, cross-framework conformance, async-first extension dispatch, and internal service boundaries |
 
 Released versions are preserved as immutable Git tags. See
 [CHANGELOG.md](CHANGELOG.md) for the detailed compatibility and security notes.

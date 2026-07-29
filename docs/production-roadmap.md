@@ -3,10 +3,10 @@
 ## Status
 
 - Direction approved after the v0.5.1 production reliability release.
-- Last reviewed: 2026-07-27.
-- This document defines future work and retains the v0.7 release exit criteria
-  as historical evidence. Shipped behavior is documented in the release notes
-  and production guide.
+- Last reviewed: 2026-07-29.
+- This document defines future work and retains the v0.7 release and v0.8
+  implementation exit criteria as historical evidence. Shipped behavior is
+  documented in the release notes and production guide.
 - A production claim is published only when it points to a repeatable test,
   benchmark, integration run, or release artifact.
 
@@ -31,7 +31,7 @@ runtime binds their decisions to the committed action.
 
 ## Verified baseline
 
-The roadmap starts from the released v0.7.0 baseline, not from planned
+The roadmap starts from the v0.8.0 implementation baseline, not from planned
 features. The v0.5.1 evidence below remains a historical release record.
 
 | Evidence | Verified result |
@@ -311,7 +311,7 @@ Make the integrity and configured signer authenticity of action-governance
 evidence independently verifiable, verify supported external receipts, and prove
 that supported framework adapters preserve identical governance semantics.
 
-### Unreleased implementation
+### Implemented v0.8 scope
 
 - A versioned Governance Evidence Bundle contains normalized action, identity,
   policy, approval, execution, reconciliation, audit-anchor, and redaction
@@ -335,14 +335,16 @@ that supported framework adapters preserve identical governance semantics.
   with key identifiers, trust roots, rotation, and revocation. It remains out
   of the core installation.
 
-### Remaining planned model
+### Implemented release boundaries
 
-- Publish a machine-readable Release Verification Manifest containing test and
-  coverage summaries, integration results, dependency-audit status, and pinned
-  external-service image digests. Include it in release checksums and provenance
-  so evidence remains available after Actions log retention expires.
-- Redact raw prompts, secrets, and sensitive parameters by default.
-- Replace illustrative framework examples with a conformance suite for the
+- The release workflow is configured to publish a machine-readable Release
+  Verification Manifest containing test and coverage summaries, integration
+  results, dependency-audit status, and pinned external-service image digests.
+  It is included in release checksums and provenance so evidence remains
+  available after Actions log retention expires.
+- Evidence Bundle v1 projects a closed allowlist that excludes raw prompts,
+  secrets, sensitive parameters, and raw identity values.
+- The conformance suite covers the
   standalone runtime, LangGraph, and OpenAI Agents SDK paths.
 
 ### Exit criteria
@@ -353,8 +355,8 @@ that supported framework adapters preserve identical governance semantics.
 - Signature tests cover trusted, unknown, rotated, revoked, and expired keys.
 - Receipt tests prove that a valid bundle without a supported receipt verifier
   can be authentic while `outcome_verified` remains false.
-- Evidence contains no raw secret fixture in privacy tests and supports
-  application-defined redaction extensions.
+- Evidence contains no raw secret fixture in privacy tests and uses a closed
+  allowlist projection.
 - At least three real framework entry paths produce the same decision, action
   digest, execution status, and evidence semantics for shared fixtures.
 - Schema evolution and migration fixtures run in CI.

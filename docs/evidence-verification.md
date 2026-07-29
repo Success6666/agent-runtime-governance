@@ -1,9 +1,9 @@
-# Offline evidence verification (unreleased v0.8)
+# Offline evidence verification (v0.8)
 
 `python -m agent_runtime_governance.verify` validates a portable Governance
-Evidence Bundle without performing network access itself. It is an unreleased
-v0.8 capability. It never infers a provider, endpoint, receipt, or protected
-anchor from bundle contents.
+Evidence Bundle without performing network access itself. It is a v0.8
+capability. It never infers a provider, endpoint, receipt, or protected anchor
+from bundle contents.
 
 ## Inputs
 

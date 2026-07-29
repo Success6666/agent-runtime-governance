@@ -29,7 +29,7 @@ Runtime-owned callbacks. Extension dispatch is likewise internal and
 async-first. Concrete SQLite adapters are construction-boundary dependencies,
 not dependencies of reusable runtime services.
 
-Stable modules and public imports remain compatible through v0.8. Internal
+Stable modules and public imports remain compatible at v0.8. Internal
 modules are prefixed with `_`; consumers must not depend on them. Any later
 audit, codec, protocol, or event extraction preserves its current public import
 paths and serialized compatibility contract. See [ADR 0006](docs/adr/0006-v08-runtime-service-boundaries.md).
@@ -50,7 +50,7 @@ agent_runtime_governance/_internal/
 
 Private runtime services may use value and protocol modules, but never import
 the public `Runtime` facade. The previous private helper paths remain as thin
-compatibility re-exports during v0.8 so existing imports continue to resolve. The
+compatibility re-exports at v0.8 so existing imports continue to resolve. The
 root `_sqlite.py` remains a compatibility exception because its
 journal-capability values are stable v0.7 imports. This layout changes neither
 public module paths nor persistence formats; see
@@ -80,9 +80,10 @@ digest and a closed, explicitly configured trust-root set; it never changes
 the unsigned bundle or treats a signature as an external outcome. The offline
 verifier reconstructs only the strict canonical v1 model, reports integrity
 and configured signer authenticity independently, and labels a bundle without
-a detached or caller-supplied digest commitment as unanchored. External
-anchors, receipts, and external outcome verification remain later v0.8
-capabilities.
+a detached or caller-supplied digest commitment as unanchored. External anchor
+and receipt verification run only through explicitly selected detached
+providers; without a supported provider, continuity and outcome verification
+remain `unsupported`.
 
 ## Invariants
 
