@@ -31,7 +31,7 @@ runtime binds their decisions to the committed action.
 
 ## Verified baseline
 
-The roadmap starts from the v0.8.0 implementation baseline, not from planned
+The roadmap starts from the released v0.8.1 baseline, not from planned
 features. The v0.5.1 evidence below remains a historical release record.
 
 | Evidence | Verified result |
@@ -43,6 +43,7 @@ features. The v0.5.1 evidence below remains a historical release record.
 | Supply chain | The release contains the [SPDX SBOM](https://github.com/Success6666/agent-runtime-governance/releases/download/v0.5.1/sbom.spdx.json), [SHA256 checksums](https://github.com/Success6666/agent-runtime-governance/releases/download/v0.5.1/SHA256SUMS), and [GitHub provenance](https://github.com/Success6666/agent-runtime-governance/attestations/37136035) |
 | Dependency audit | The isolated production dependency audit passed in the [release job](https://github.com/Success6666/agent-runtime-governance/actions/runs/30189974541/job/89761387069) |
 | Distribution | [`agent-runtime-governance==0.5.1`](https://pypi.org/project/agent-runtime-governance/0.5.1/) was published with PyPI Trusted Publishing and installed from the public index in a clean environment |
+| Current release record | [`v0.8.1`](https://github.com/Success6666/agent-runtime-governance/releases/tag/v0.8.1) released after its protected artifact and PyPI workflows; the point-in-time evidence is recorded in [`release-verification.md`](release-verification.md) |
 
 The evidence is point-in-time. It is not an uptime, latency, security, or future
 dependency guarantee.
@@ -76,13 +77,13 @@ of another project's production quality:
 - [Microsoft Agent Governance Toolkit packages](https://microsoft.github.io/agent-governance-toolkit/packages/)
 
 The defensible opening is the commit boundary between an approved action and an
-external side effect. Microsoft documents that its current audit records action
-attempts and allow/deny results rather than verified real-world outcomes, with
-outcome attestation listed as planned. That limitation is a useful market
-signal, not proof that this project or no other project solves the entire
-problem. The intended differentiation is the tested combination of a unified
-bound action, intent-bound approval, explicit `UNKNOWN` reconciliation, and
-cross-framework evidence consistency:
+external side effect. Adjacent projects, including Microsoft Agent Governance
+Toolkit, are actively expanding receipt and outcome-attestation work. That
+overlap is a market signal, not proof that this project or no other project
+solves the entire problem. The intended differentiation is the tested
+combination of a unified bound action, intent-bound approval, explicit
+`UNKNOWN` reconciliation, cross-framework evidence consistency, and a narrow
+in-process deployment model:
 [Microsoft known limitations at commit `2962693`](https://github.com/microsoft/agent-governance-toolkit/blob/2962693358c26201f2bbc13a54b5966af933accf/docs/LIMITATIONS.md).
 
 Two boundary observations recorded on 2026-07-26 qualify that opening:
@@ -130,6 +131,9 @@ capabilities:
    and an external outcome is verified only by a supported receipt verifier.
 6. **Framework consistency** - the same bound action receives the same
    governance result regardless of the supported host framework.
+7. **Decision provenance** - a verifier can inspect the deterministic controls
+   behind a recorded policy result without receiving policy inputs, prompts, or
+   free-text remote output.
 
 ## Reference flow
 
@@ -174,7 +178,8 @@ User intent + trusted principal + tool request
 | v0.6 | One immutable action is shared by contract, policy, approval, idempotency, execution, and audit | No reconciliation engine or distributed transaction |
 | v0.7 | Every uncertain side effect enters a deterministic reconciliation protocol that may still require manual review | No automatic compensation or hosted operator UI |
 | v0.8 | Governance evidence is portable, privacy-aware, and independently verifiable | No compliance certification claims |
-| v0.9 | Multi-instance state adapters preserve single-active-commit-owner semantics under failure | Redis is not an authoritative fact store |
+| v0.9 | A recorded policy result has a detached, privacy-safe, offline-verifiable explanation | No policy DSL, dashboard, or tool replay |
+| v0.10 | Multi-instance state adapters preserve single-active-commit-owner semantics under failure | Redis is not an authoritative fact store |
 | v1.0 | Public APIs, state transitions, schemas, and compatibility policy are stable | No platform expansion during stabilization |
 
 ## v0.6 - Action Contracts and strict production profile
@@ -303,7 +308,7 @@ workflow and release links. The released model is:
 - Windows, Linux, and Docker recovery tests use real persistence rather than
   mocked repositories.
 
-## v0.8 - Evidence and conformance
+## Released v0.8 - Evidence and conformance
 
 ### Objective
 
@@ -311,7 +316,7 @@ Make the integrity and configured signer authenticity of action-governance
 evidence independently verifiable, verify supported external receipts, and prove
 that supported framework adapters preserve identical governance semantics.
 
-### Implemented v0.8 scope
+### Shipped model
 
 - A versioned Governance Evidence Bundle contains normalized action, identity,
   policy, approval, execution, reconciliation, audit-anchor, and redaction
@@ -365,37 +370,57 @@ that supported framework adapters preserve identical governance semantics.
 - Documentation makes no certification or legal-compliance claim without an
   external assessment.
 
-## v0.9 - Distributed production adapters
+## v0.9 - Verifiable policy decisions
 
 ### Objective
 
-Preserve action commit safety when multiple runtime instances compete and fail
-independently.
+Make the deterministic policy result for an already-bound action independently
+inspectable without turning the SDK into a policy platform or duplicating the
+v0.8 receipt-verification path.
 
 ### Planned model
 
-- Implement PostgreSQL adapters for approvals, idempotency, reconciliation, and
-  evidence anchors using transactions and compare-and-set semantics.
-- Keep Redis optional for bounded coordination or caching; it is not the source
-  of truth for irreversible actions.
-- Add multi-instance leases, schema migrations, failover tests, and W3C trace
-  carrier mapping.
-- Keep deployment infrastructure optional and retain the embeddable SDK model.
+- Define a versioned immutable decision-explanation attachment bound to the
+  action digest, policy version/digest, final decision, risk, approval
+  requirement, and an ordered sequence of stable control results.
+- Limit each control result to a stable control ID/version, effect, result, and
+  machine-readable reason code. Raw parameters, prompts, model output,
+  chain-of-thought, secrets, identity values, and free-text remote policy
+  output are excluded.
+- Keep Evidence Bundle v1 closed. The attachment binds to its action and bundle
+  identity without changing v1 bytes, schemas, signatures, or receipt sidecars.
+- Extend the existing offline verifier and provide a thin human-readable
+  renderer of its report. Neither component becomes an authorizer, dashboard,
+  network client, or second verification engine.
+- Add a read-only comparison of two attachments for the same action identity.
+  It reports decision, policy, risk, approval, and control drift without
+  invoking a tool, LLM, human decision provider, or external receipt provider.
+- Project deterministic explanations from built-in Python/YAML policies and
+  rule middleware. An external policy can participate only through a declared
+  structured explanation contract; a free-text reason is not verified evidence.
 
 ### Exit criteria
 
-- Two independent runtime instances competing for one action produce at most
-  one commit owner.
-- Database restart, latency, connection loss, worker crash, and lease handoff
-  tests allow at most one active commit owner. They do not claim arbitrary
-  downstream exactly-once behavior.
-- Stable downstream idempotency keys or receipt/probe verification are required
-  before an external outcome is confirmed; unresolved cases remain `UNKNOWN`.
-- Migrations have forward-upgrade and tested rollback procedures.
-- Release CI starts a real PostgreSQL service and runs fault injection and
-  concurrency tests against it.
-- Performance reports separate local policy cost, storage cost, and complete
-  governed-action latency.
+- An attachment proves its final decision, ordered controls, risk, approval
+  requirement, action identity, and policy identity without exposing sensitive
+  inputs.
+- The verifier rejects reordering, duplicate controls, mutation, action/policy
+  substitution, and final-decision inconsistency.
+- Missing or invalid explanation evidence can never authorize an action or
+  rewrite an evidence bundle, receipt outcome, or reconciliation state.
+- The comparison path remains side-effect free and detects policy/control/risk/
+  approval drift.
+- Standalone, LangGraph, and OpenAI Agents SDK paths produce identical decision
+  explanation semantics for shared fixtures.
+- A measured performance budget and the existing compatibility, security, and
+  release gates remain green.
+
+## v0.10 - Deferred multi-instance adapters
+
+The retained [multi-instance PostgreSQL proposal](https://github.com/Success6666/agent-runtime-governance/issues/31)
+starts only after a real adopter needs it. It will then cover authoritative
+PostgreSQL state, bounded Redis coordination, leases, migrations, failover,
+fault injection, and a separate performance record.
 
 ## v1.0 - Stable Action Commit Safety
 

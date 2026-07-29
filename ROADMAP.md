@@ -47,11 +47,11 @@ The runtime is embedded inside existing agent frameworks as a governance
 layer. It complements framework-native approval flows instead of replacing
 the host framework.
 
-The [Microsoft Agent Governance Toolkit's versioned limitations](https://github.com/microsoft/agent-governance-toolkit/blob/2962693358c26201f2bbc13a54b5966af933accf/docs/LIMITATIONS.md)
-explicitly distinguish attempted actions and allow/deny audit from verified
-real-world outcomes and list outcome attestation as planned. That adjacent gap
-is expected to narrow. Delivery speed for v0.6 and v0.7 is part of the strategy,
-not an implementation detail.
+Adjacent governance toolkits are also advancing outcome-attestation work, so
+signed evidence alone is not a durable differentiator. This SDK remains focused
+on the narrow, tested combination of immutable action binding, intent-bound
+approval, explicit `UNKNOWN` containment, and offline verification at the
+commit boundary.
 
 ## v0.6 - Action Contracts
 
@@ -87,20 +87,39 @@ The protected workflow and publication record for v0.7.0 are documented in
 does not claim external exactly-once behavior without a downstream idempotency
 or receipt/probe guarantee.
 
-## v0.8 - Evidence and conformance
+## Released v0.8
 
-- [x] Versioned, privacy-aware Governance Evidence Bundle
-- [x] Offline verification and schema compatibility tests
-- [x] Cross-framework conformance for standalone, LangGraph, and OpenAI Agents SDK
-- [x] Async-first extension dispatch with controlled synchronous fallback,
+- [x] Versioned, privacy-aware Governance Evidence Bundle with detached signing,
+  anchor, and receipt-verification boundaries
+- [x] Offline verification, schema compatibility tests, and release-manifest
+  provenance
+- [x] Cross-framework conformance for standalone, LangGraph, and OpenAI Agents
+  SDK
+- [x] Async-first extension dispatch with a controlled synchronous fallback,
   event-loop-isolation tests, native async external-adapter compatibility, and
   bounded worker/queue observability ([#43](https://github.com/Success6666/agent-runtime-governance/issues/43))
 
-## v0.9 - Distributed production adapters
+v0.8.0 was withdrawn before distribution after its release verification failed.
+v0.8.1 was released on 2026-07-29 with the same implementation scope and a
+corrected release-audit path. Its immutable evidence is recorded in
+[`docs/release-verification.md`](docs/release-verification.md).
 
-- PostgreSQL authoritative state adapters
-- Multi-instance leases, migrations, failover, and real database fault tests
-- Optional Redis coordination that is never the irreversible-action fact source
+## v0.9 - Verifiable policy decisions
+
+- A detached, privacy-safe decision-explanation attachment bound to the action
+  and policy identity, with stable control IDs, machine-readable results, and
+  no raw inputs or free-text remote policy output ([#91](https://github.com/Success6666/agent-runtime-governance/issues/91))
+- Offline verification and read-only comparison of decision, policy, risk,
+  approval, and ordered-control drift; no new authorizer or tool replay
+- A thin human-readable projection of the existing verifier report, not a
+  dashboard, hosted service, policy DSL, or second verification engine
+
+## v0.10 - Deferred multi-instance adapters
+
+- PostgreSQL authoritative state adapters, leases, migrations, failover, and
+  database fault tests remain retained in [#31](https://github.com/Success6666/agent-runtime-governance/issues/31)
+- This work starts only when a real multi-host adopter requires it; Redis is
+  never the irreversible-action fact source
 
 ## v1.0 - Stable Action Commit Safety
 
@@ -112,5 +131,5 @@ or receipt/probe guarantee.
 ## Out of scope
 
 General policy language, plugin marketplace, dashboard, scheduler, cluster
-controller, hosted control plane, model routing, agent planning, and automatic
-compensation.
+controller, hosted control plane, model routing, agent planning, automatic
+compensation, prompt/model provenance collection, and chain-of-thought storage.
