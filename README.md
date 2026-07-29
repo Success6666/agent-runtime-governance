@@ -125,13 +125,18 @@ Its claims remain bounded: integrity, signer authenticity, and configured
 external outcome verification are distinct; no row below claims certification,
 generic external verification, or exactly-once side effects.
 
-| v0.8.0 implementation evidence | Evidence |
+The v0.8.0 GitHub Release was withdrawn before it gained verified assets,
+provenance, or a PyPI distribution. v0.8.1 is the release-validation patch
+that retains the implementation scope and corrects that path.
+
+| v0.8 implementation evidence | Evidence |
 | --- | --- |
 | Evidence Bundle v1 is a closed, immutable RFC 8785 commitment over allowlisted values and never serializes raw parameters, identity values, secrets, or receipts | [`test_evidence_bundle_matches_v1_golden_fixture`](tests/test_evidence_bundle.py), [`test_bundle_projects_only_allowlisted_values_and_never_serializes_secrets`](tests/test_evidence_bundle.py), [`test_historical_v1_vector_is_packaged_and_byte_stable`](tests/test_evidence_schema_evolution.py) |
 | Detached Ed25519 signatures validate only against explicit trust roots; trusted, rotated, unknown, revoked, and expired keys have deterministic outcomes | [`test_ed25519_signature_verifies_without_mutating_v1_bundle`](tests/test_evidence_signing.py), [`test_rotated_trust_roots_verify_signatures_from_each_configured_key`](tests/test_evidence_signing.py), [`test_verification_rejects_unknown_key`](tests/test_evidence_signing.py), [`test_verification_rejects_revoked_key`](tests/test_evidence_signing.py), [`test_verification_rejects_expired_key`](tests/test_evidence_signing.py) |
 | The offline verifier reports integrity, signer authenticity, and external outcome separately and rejects mutation, binding substitution, and broken reconciliation lineage | [`test_cli_verifies_signed_bundle_and_never_claims_an_external_outcome`](tests/test_evidence_verifier.py), [`test_cli_detects_mutation_against_detached_signature_and_expected_digest`](tests/test_evidence_verifier.py), [`test_cli_detects_cross_tenant_and_stale_binding_substitution`](tests/test_evidence_verifier.py), [`test_cli_rejects_broken_reconciliation_lineage`](tests/test_evidence_verifier.py) |
 | External anchor continuity and receipt outcomes are verified only through an explicitly selected provider; absent or unsupported providers report `unsupported` | [`test_anchor_provider_detects_deletion_and_reordering_without_changing_bundle`](tests/test_evidence_external.py), [`test_absent_or_unsupported_anchor_never_claims_continuity`](tests/test_evidence_external.py), [`test_receipt_verifier_projects_only_bounded_identity_and_never_leaks_receipt`](tests/test_evidence_external.py), [`test_receipt_binding_and_outcome_disagreement_fail_closed`](tests/test_evidence_external.py) |
 | The release workflow derives and validates a closed Release Verification Manifest, then protects the manifest with release checksums and provenance before distribution | [`test_generates_and_validates_same_job_release_evidence`](tests/test_release_manifest.py), [`test_release_and_publish_workflows_gate_manifest_before_distribution`](tests/test_release_manifest.py) |
+| The v0.8.1 release workflow audit is limited to the frozen external production dependency closure, fails on audit collection errors, and continues to reject every skipped dependency entry before distribution | [`test_release_and_publish_workflows_gate_manifest_before_distribution`](tests/test_release_manifest.py), [`test_generation_rejects_a_dependency_audit_with_skipped_dependency`](tests/test_release_manifest.py) |
 | Standalone Runtime, LangGraph, and OpenAI Agents SDK real tool entries preserve shared success, policy-denial, and approval-denial governance semantics | [`test_standalone_runtime_keeps_protected_semantics`](tests/conformance/test_standalone.py), [`test_langgraph_node_matches_standalone_protected_semantics`](tests/conformance/test_langgraph.py), [`test_openai_agents_tool_matches_standalone_protected_semantics`](tests/conformance/test_openai_agents.py) |
 | Native asynchronous extensions stay on the caller loop; synchronous fallback has bounded worker and queue capacity, while OPA and Slack native transports retain asynchronous behavior | [`test_native_async_callable_instances_and_partials_stay_on_calling_loop`](tests/test_extension_dispatch.py), [`test_sync_capacity_separates_workers_from_admitted_queue`](tests/test_extension_dispatch.py), [`test_sync_observer_does_not_stall_a_ten_millisecond_ticker`](tests/test_extension_dispatch.py), [`test_runtime_opa_timeout_cancels_native_transport_without_warning`](tests/test_async_plugin_transports.py), [`test_runtime_slack_native_async_transport_stays_on_calling_loop`](tests/test_async_plugin_transports.py) |
 | v0.7 public imports and call signatures remain compatible while private services are grouped by domain; terminal events are immutable, redacted, and failure-isolated for consumers | [`test_v070_public_call_signatures_remain_compatible`](tests/test_public_api_snapshot.py), [`test_v070_wheel_and_sdist_expose_stable_imports`](tests/test_public_api_snapshot.py), [`test_private_services_are_grouped_under_explicit_internal_domains`](tests/test_internal_service_layout.py), [`test_runtime_event_projection_is_versioned_immutable_and_redacted`](tests/test_runtime_events.py), [`test_failing_event_subscriber_does_not_block_other_consumers`](tests/test_runtime_events.py) |
@@ -467,9 +472,11 @@ is not a production latency or throughput promise.
 | v0.5.1 | Security hardening: caller metadata isolation and exact approval binding |
 | v0.6.0 | Immutable action contracts from admission through approval, idempotency, executor revalidation, telemetry, and audit |
 | v0.7.0 | Durable `UNKNOWN` reconciliation, strict recovery authorization, and a source-idempotent reconciliation-audit outbox |
-| v0.8.0 (implementation scope) | Portable governance evidence, configured external verification, cross-framework conformance, async-first extension dispatch, and internal service boundaries |
+| v0.8.0 (withdrawn before distribution) | Portable governance evidence, configured external verification, cross-framework conformance, async-first extension dispatch, and internal service boundaries |
+| v0.8.1 (release-validation patch) | The v0.8 implementation scope with a strict audit of its frozen external production dependencies |
 
-Released versions are preserved as immutable Git tags. See
+Released versions are preserved as immutable Git tags. A withdrawn prerelease
+remains visible as a tag, but is not a verified distribution. See
 [CHANGELOG.md](CHANGELOG.md) for the detailed compatibility and security notes.
 
 ## Non-goals

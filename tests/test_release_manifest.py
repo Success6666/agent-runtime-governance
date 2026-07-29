@@ -554,6 +554,11 @@ def test_release_and_publish_workflows_gate_manifest_before_distribution() -> No
     assert release.index("python scripts/release_manifest.py validate") < release.index(
         "Upload verified artifacts to release"
     )
+    audit_step = release[
+        release.index("Audit isolated production dependencies") : release.index(
+            "Verify tag and package version match"
+        )
+    ]
     checksum_step = release[
         release.index("Generate SHA256 checksums") : release.index("Verify checksums")
     ]
@@ -563,9 +568,21 @@ def test_release_and_publish_workflows_gate_manifest_before_distribution() -> No
         )
     ]
     upload_step = release[release.index("Upload verified artifacts to release") :]
+    freeze_command = (
+        'pip freeze --exclude agent-runtime-governance > "$audit_requirements"'
+    )
+    audit_command = 'pip-audit --strict --requirement "$audit_requirements"'
     assert "dist/release-manifest.json" in checksum_step
     assert "dist/release-manifest.json" in attestation_step
     assert "dist/release-manifest.json" in upload_step
+    assert freeze_command in audit_step
+    assert 'test -s "$audit_requirements"' in audit_step
+    assert audit_command in audit_step
+    assert audit_step.index(freeze_command) < audit_step.index('test -s "$audit_requirements"')
+    assert audit_step.index('test -s "$audit_requirements"') < audit_step.index(
+        audit_command
+    )
+    assert "pip-audit --path" not in audit_step
     assert "actions/download-artifact" not in release
     assert "gh run download" not in release
     assert "continue-on-error" not in release

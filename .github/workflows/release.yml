@@ -77,8 +77,10 @@ jobs:
           /tmp/release-audit/bin/python -m pip install --disable-pip-version-check ".[evidence,otel,yaml,prometheus]"
           python -m venv /tmp/release-audit-tool
           /tmp/release-audit-tool/bin/python -m pip install --disable-pip-version-check "pip-audit==2.10.1"
-          audit_path="$(/tmp/release-audit/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
-          /tmp/release-audit-tool/bin/pip-audit --path "$audit_path" -f json -o release-evidence/dependency-audit.json
+          audit_requirements="/tmp/release-audit-requirements.txt"
+          /tmp/release-audit/bin/python -m pip freeze --exclude agent-runtime-governance > "$audit_requirements"
+          test -s "$audit_requirements"
+          /tmp/release-audit-tool/bin/pip-audit --strict --requirement "$audit_requirements" -f json -o release-evidence/dependency-audit.json
 
       - name: Verify tag and package version match
         run: |

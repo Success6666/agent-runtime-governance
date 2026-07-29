@@ -4,7 +4,21 @@ All notable changes are documented here.
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-07-29
+
+### Fixed
+
+- Release verification now audits the frozen third-party production dependency
+  closure rather than the not-yet-published local package distribution. The
+  audit remains strict, and the Release Verification Manifest still rejects
+  every skipped dependency entry.
+
 ## [0.8.0] - 2026-07-29
+
+> **Withdrawn before distribution:** the GitHub Release verification failed
+> before it attached assets or provenance, and no PyPI distribution was
+> published. v0.8.1 keeps the same implementation scope and corrects the
+> verification path.
 
 ### Added
 
@@ -452,7 +466,8 @@ All notable changes are documented here.
 - Redacted JSONL audit records with optional HMAC verification.
 - Basic trace replay, LangGraph integration example, tests, and CI.
 
-[Unreleased]: https://github.com/Success6666/agent-runtime-governance/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/Success6666/agent-runtime-governance/compare/v0.8.0...HEAD
+[0.8.1]: https://github.com/Success6666/agent-runtime-governance/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/Success6666/agent-runtime-governance/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/Success6666/agent-runtime-governance/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/Success6666/agent-runtime-governance/compare/v0.5.1...v0.6.0
