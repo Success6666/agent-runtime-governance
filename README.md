@@ -146,6 +146,11 @@ The staged v0.9-v1.0 direction and its exit criteria are in
 [`ROADMAP.md`](ROADMAP.md) and [`docs/production-roadmap.md`](docs/production-roadmap.md).
 Planned capabilities are never presented as shipped.
 
+The v0.9 development contract for detached, privacy-safe policy-decision
+attachments is documented in
+[`docs/decision-explanations.md`](docs/decision-explanations.md). It remains
+separate from v0.8 Evidence Bundle and receipt-verification protocols.
+
 The v0.8 verifier, its detached external-evidence boundaries, and its
 input/exit-code contract are documented in
 [`docs/evidence-verification.md`](docs/evidence-verification.md). Its closed v1

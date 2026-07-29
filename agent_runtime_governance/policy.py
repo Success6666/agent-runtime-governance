@@ -6,6 +6,7 @@ from types import MappingProxyType
 from typing import Mapping
 
 from .context import ExecutionContext, HistoryEntry, RiskTier
+from .decision_explanations import DecisionControl, decision_controls_history_data
 from .decisions import DecisionOutcome, DecisionRecord
 from .middleware.base import GatingMiddleware
 
@@ -47,6 +48,7 @@ class PolicyMiddleware(GatingMiddleware):
         *,
         version: str | None = None,
         digest: str | None = None,
+        explanation_namespace: str = "python-policy",
     ) -> None:
         if (version is None) != (digest is None):
             raise ValueError("policy version and digest must be provided together")
@@ -56,9 +58,14 @@ class PolicyMiddleware(GatingMiddleware):
             raise ValueError("policy version is invalid")
         if digest is not None and not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise ValueError("policy digest must be a SHA-256 hex digest")
+        if not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}", explanation_namespace
+        ):
+            raise ValueError("policy explanation_namespace is invalid")
         self.policy = policy
         self.version = version
         self.digest = digest
+        self._explanation_namespace = explanation_namespace
 
     def action_policy_identity(self) -> tuple[str, str] | None:
         if self.version is None or self.digest is None:
@@ -80,31 +87,76 @@ class PolicyMiddleware(GatingMiddleware):
                 metadata={**context.metadata, **policy_metadata}
             )
         changes: dict[str, object] = {}
+        controls: list[DecisionControl] = []
         if tool in self.policy.approval_tools:
             changes["requires_approval"] = True
+            controls.append(
+                self._control("approval", "require_approval", "approval_required")
+            )
         if tool in self.policy.risk_overrides:
             changes["risk_tier"] = self.policy.risk_overrides[tool]
+            controls.append(self._control("risk", "risk", "risk_overridden"))
         updated = context.evolve(**changes) if changes else context
         if tool in self.policy.denied_tools:
-            return self._deny(updated, "tool denied by policy")
+            return self._deny(
+                updated,
+                "tool denied by policy",
+                controls=[
+                    *controls,
+                    self._control("deny-tool", "deny", "tool_denied"),
+                ],
+            )
         if tool in self.policy.admin_only and "admin" not in updated.permissions:
-            return self._deny(updated, "admin permission required")
+            return self._deny(
+                updated,
+                "admin permission required",
+                controls=[
+                    *controls,
+                    self._control("admin", "deny", "admin_permission_missing"),
+                ],
+            )
         required = self.policy.required_permissions.get(tool, frozenset())
         missing = required.difference(updated.permissions)
         if missing:
             return self._deny(
-                updated, f"missing permissions: {', '.join(sorted(missing))}"
+                updated,
+                f"missing permissions: {', '.join(sorted(missing))}",
+                controls=[
+                    *controls,
+                    self._control(
+                        "permissions", "deny", "required_permissions_missing"
+                    ),
+                ],
             )
+        controls.append(self._control("allow", "allow", "policy_allowed"))
         return updated.append_history(
             HistoryEntry(
                 self.name,
                 "allow",
                 "python policy allowed",
-                data=policy_metadata,
+                data={
+                    **policy_metadata,
+                    **decision_controls_history_data(controls),
+                },
             )
         )
 
-    def _deny(self, context: ExecutionContext, reason: str) -> ExecutionContext:
+    def _control(self, name: str, effect: str, reason_code: str) -> DecisionControl:
+        return DecisionControl(
+            control_id=f"{self._explanation_namespace}.{name}",
+            control_version=1,
+            effect=effect,
+            result="matched",
+            reason_code=reason_code,
+        )
+
+    def _deny(
+        self,
+        context: ExecutionContext,
+        reason: str,
+        *,
+        controls: list[DecisionControl],
+    ) -> ExecutionContext:
         return context.with_decision(
             DecisionRecord(DecisionOutcome.DENY, reason, self.name)
         ).append_history(
@@ -113,12 +165,15 @@ class PolicyMiddleware(GatingMiddleware):
                 "deny",
                 reason,
                 data={
-                    key: value
-                    for key, value in {
-                        "policy_version": self.version,
-                        "policy_digest": self.digest,
-                    }.items()
-                    if value is not None
+                    **{
+                        key: value
+                        for key, value in {
+                            "policy_version": self.version,
+                            "policy_digest": self.digest,
+                        }.items()
+                        if value is not None
+                    },
+                    **decision_controls_history_data(controls),
                 },
             )
         )

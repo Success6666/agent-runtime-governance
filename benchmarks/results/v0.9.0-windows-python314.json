@@ -1,0 +1,34 @@
+{
+  "generated_at": "2026-07-29T19:20:02.176924+00:00",
+  "environment": {
+    "python": "3.14.3 (tags/v3.14.3:323c59a, Feb  3 2026, 16:04:56) [MSC v.1944 64 bit (AMD64)]",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "processor": "Intel64 Family 6 Model 154 Stepping 3, GenuineIntel",
+    "cpu_count": 16
+  },
+  "paired_repetitions": 3,
+  "measurements": [
+    {
+      "scenario": "attachment_projection",
+      "requests": 1000,
+      "concurrency": 1,
+      "throughput_per_second": 676.7767640155163,
+      "mean_ms": 1.4722698011319153,
+      "p50_ms": 1.3753000530414283,
+      "p95_ms": 2.244299976155162,
+      "p99_ms": 2.7254000306129456,
+      "peak_memory_kib": 37.41796875
+    },
+    {
+      "scenario": "attachment_projection_and_verification",
+      "requests": 1000,
+      "concurrency": 1,
+      "throughput_per_second": 56.42918530555423,
+      "mean_ms": 17.713540699274745,
+      "p50_ms": 16.87079999828711,
+      "p95_ms": 25.401400052942336,
+      "p99_ms": 30.868800007738173,
+      "peak_memory_kib": 39.5439453125
+    }
+  ]
+}

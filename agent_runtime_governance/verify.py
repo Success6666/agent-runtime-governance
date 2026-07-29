@@ -21,6 +21,10 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any, NoReturn
 
+from .decision_explanations import (
+    DecisionExplanationAttachment,
+    DecisionExplanationValidationError,
+)
 from .evidence import EvidenceBundle, EvidenceBundleValidationError
 from .evidence_external import (
     ANCHOR_PROVIDER_ENTRY_POINT_GROUP,
@@ -84,6 +88,39 @@ _RECEIPT_INPUT_REASONS = frozenset(
 )
 _RECEIPT_FAILURE_REASONS = frozenset({"receipt_not_found", "receipt_not_verified"})
 _RECEIPT_UNSUPPORTED_REASONS = frozenset({"receipt_verifier_unsupported"})
+
+
+class DecisionExplanationVerificationError(ValueError):
+    """Raised when a decision attachment cannot enter read-only comparison."""
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedDecisionExplanation:
+    """An attachment accepted by the existing offline verification surface."""
+
+    attachment: DecisionExplanationAttachment
+    report: Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionExplanationDifference:
+    """One stable, privacy-safe difference between verified attachments."""
+
+    field: str
+    baseline: Any
+    candidate: Any
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionExplanationComparison:
+    """Read-only drift record for two verified attachments of one action."""
+
+    action_digest: str
+    differences: tuple[DecisionExplanationDifference, ...]
+
+    @property
+    def matches(self) -> bool:
+        return not self.differences
 
 
 class _CliUsageError(ValueError):
@@ -259,6 +296,156 @@ def verify_evidence_bundle_document(
         integrity=integrity,
         authenticity=authenticity,
         outcome_verified=outcome_verified,
+    )
+
+
+def verify_decision_explanation_document(
+    document: Mapping[str, Any],
+    *,
+    expected_attachment_digest: str | None = None,
+    expected_action_digest: str | None = None,
+    expected_policy_version: str | None = None,
+    expected_policy_digest: str | None = None,
+    expected_evidence_bundle_digest: str | None = None,
+) -> dict[str, Any]:
+    """Verify one detached decision explanation without side effects.
+
+    The attachment is intentionally separate from Evidence Bundle v1. This
+    function shares the module and fail-closed report conventions used by the
+    bundle verifier, but it performs no policy execution, receipt lookup, or
+    network access.
+    """
+
+    try:
+        attachment = DecisionExplanationAttachment.from_dict(document)
+    except (DecisionExplanationValidationError, TypeError, ValueError):
+        return _decision_explanation_report(
+            integrity=_failed_level("attachment_invalid"),
+            binding=_not_evaluated_level("integrity_failed"),
+        )
+
+    integrity_reasons: list[str] = []
+    if expected_attachment_digest is not None:
+        if not _SHA256_HEX.fullmatch(expected_attachment_digest):
+            integrity_reasons.append("expected_attachment_digest_invalid")
+        elif expected_attachment_digest != attachment.attachment_digest:
+            integrity_reasons.append("attachment_digest_mismatch")
+    integrity = _level(
+        state="passed" if not integrity_reasons else "failed",
+        ok=not integrity_reasons,
+        reasons=integrity_reasons,
+        attachment_digest=attachment.attachment_digest,
+    )
+    if integrity_reasons:
+        return _decision_explanation_report(
+            integrity=integrity,
+            binding=_not_evaluated_level("integrity_failed"),
+        )
+
+    binding_reasons = _decision_explanation_binding_reasons(
+        attachment,
+        expected_action_digest=expected_action_digest,
+        expected_policy_version=expected_policy_version,
+        expected_policy_digest=expected_policy_digest,
+        expected_evidence_bundle_digest=expected_evidence_bundle_digest,
+    )
+    return _decision_explanation_report(
+        integrity=integrity,
+        binding=_level(
+            state="passed" if not binding_reasons else "failed",
+            ok=not binding_reasons,
+            reasons=binding_reasons,
+        ),
+    )
+
+
+def verify_decision_explanation(
+    attachment: DecisionExplanationAttachment,
+    *,
+    expected_attachment_digest: str | None = None,
+    expected_action_digest: str | None = None,
+    expected_policy_version: str | None = None,
+    expected_policy_digest: str | None = None,
+    expected_evidence_bundle_digest: str | None = None,
+) -> VerifiedDecisionExplanation:
+    """Return an attachment eligible for read-only comparison.
+
+    Calling this function is the only supported path to
+    :func:`compare_verified_decision_explanations`; comparison accepts no raw
+    documents and never replays a runtime.
+    """
+
+    if not isinstance(attachment, DecisionExplanationAttachment):
+        raise TypeError("attachment must be a DecisionExplanationAttachment")
+    report = verify_decision_explanation_document(
+        attachment.to_dict(),
+        expected_attachment_digest=expected_attachment_digest,
+        expected_action_digest=expected_action_digest,
+        expected_policy_version=expected_policy_version,
+        expected_policy_digest=expected_policy_digest,
+        expected_evidence_bundle_digest=expected_evidence_bundle_digest,
+    )
+    if not report["integrity"]["ok"] or not report["binding"]["ok"]:
+        raise DecisionExplanationVerificationError(
+            "decision explanation verification failed"
+        )
+    return VerifiedDecisionExplanation(attachment=attachment, report=report)
+
+
+def compare_verified_decision_explanations(
+    baseline: VerifiedDecisionExplanation,
+    candidate: VerifiedDecisionExplanation,
+) -> DecisionExplanationComparison:
+    """Compare verified explanations for the same action without execution."""
+
+    if not isinstance(baseline, VerifiedDecisionExplanation) or not isinstance(
+        candidate, VerifiedDecisionExplanation
+    ):
+        raise TypeError("comparison requires verified decision explanations")
+    _require_verified_decision_explanation(baseline)
+    _require_verified_decision_explanation(candidate)
+    if baseline.attachment.action_digest != candidate.attachment.action_digest:
+        raise DecisionExplanationValidationError(
+            "decision explanations must bind the same action_digest"
+        )
+
+    differences: list[DecisionExplanationDifference] = []
+    for field in (
+        "evidence_bundle_digest",
+        "policy_version",
+        "policy_digest",
+        "final_decision",
+        "risk_tier",
+        "requires_approval",
+    ):
+        baseline_value = getattr(baseline.attachment, field)
+        candidate_value = getattr(candidate.attachment, field)
+        if baseline_value != candidate_value:
+            differences.append(
+                DecisionExplanationDifference(field, baseline_value, candidate_value)
+            )
+
+    baseline_controls = {
+        control.identity: control.to_dict() for control in baseline.attachment.controls
+    }
+    candidate_controls = {
+        control.identity: control.to_dict() for control in candidate.attachment.controls
+    }
+    for identity in sorted(set(baseline_controls) | set(candidate_controls)):
+        baseline_value = baseline_controls.get(identity)
+        candidate_value = candidate_controls.get(identity)
+        if baseline_value != candidate_value:
+            control_id, control_version = identity
+            differences.append(
+                DecisionExplanationDifference(
+                    f"controls/{control_id}@{control_version}",
+                    baseline_value,
+                    candidate_value,
+                )
+            )
+    return DecisionExplanationComparison(
+        action_digest=baseline.attachment.action_digest,
+        differences=tuple(differences),
     )
 
 
@@ -1048,6 +1235,69 @@ def _stable_reason_codes(
         reason if isinstance(reason, str) and reason in allowed else fallback
         for reason in reasons
     )
+
+
+def _decision_explanation_binding_reasons(
+    attachment: DecisionExplanationAttachment,
+    *,
+    expected_action_digest: str | None,
+    expected_policy_version: str | None,
+    expected_policy_digest: str | None,
+    expected_evidence_bundle_digest: str | None,
+) -> list[str]:
+    expected_digests = (
+        ("action", expected_action_digest, attachment.action_digest),
+        ("policy", expected_policy_digest, attachment.policy_digest),
+        (
+            "evidence_bundle",
+            expected_evidence_bundle_digest,
+            attachment.evidence_bundle_digest,
+        ),
+    )
+    reasons: list[str] = []
+    for label, expected_digest, actual_digest in expected_digests:
+        if expected_digest is None:
+            continue
+        if not _SHA256_HEX.fullmatch(expected_digest):
+            reasons.append(f"expected_{label}_digest_invalid")
+        elif expected_digest != actual_digest:
+            reasons.append(f"{label}_digest_mismatch")
+    if (
+        expected_policy_version is not None
+        and expected_policy_version != attachment.policy_version
+    ):
+        reasons.append("policy_version_mismatch")
+    return reasons
+
+
+def _require_verified_decision_explanation(
+    verified: VerifiedDecisionExplanation,
+) -> None:
+    try:
+        integrity = verified.report["integrity"]
+        binding = verified.report["binding"]
+        integrity_ok = integrity["ok"]
+        binding_ok = binding["ok"]
+    except (KeyError, TypeError):
+        raise DecisionExplanationVerificationError(
+            "decision explanation verification report is invalid"
+        ) from None
+    if integrity_ok is not True or binding_ok is not True:
+        raise DecisionExplanationVerificationError(
+            "decision explanation verification did not pass"
+        )
+
+
+def _decision_explanation_report(
+    *,
+    integrity: dict[str, Any],
+    binding: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "report_schema_version": _REPORT_SCHEMA_VERSION,
+        "integrity": integrity,
+        "binding": binding,
+    }
 
 
 def _report(

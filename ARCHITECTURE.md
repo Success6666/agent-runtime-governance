@@ -85,6 +85,15 @@ and receipt verification run only through explicitly selected detached
 providers; without a supported provider, continuity and outcome verification
 remain `unsupported`.
 
+Decision explanations are a second detached public value boundary, not an
+extension of Evidence Bundle v1. `decision_explanations.py` owns the closed
+attachment schema, canonical commitment, and privacy-safe control DTOs.
+Built-in policy, YAML, rule, and explicitly structured OPA paths record only
+those DTOs in history; the attachment reconstructs them after an action is
+bound and checks policy identity against that action. `verify.py` remains the
+single offline verification surface. Its attachment comparison accepts only
+verified values and does not import the Runtime facade or replay policy.
+
 ## Invariants
 
 1. Identity and trace fields cannot be rewritten by middleware.

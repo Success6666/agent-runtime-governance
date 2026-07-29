@@ -24,7 +24,10 @@ class PolicyDocument:
     def middleware(self) -> PolicyMiddleware:
         """Build a compatibility middleware using the normalized semantic digest."""
         return PolicyMiddleware(
-            self.policy, version=self.version, digest=self.digest
+            self.policy,
+            version=self.version,
+            digest=self.digest,
+            explanation_namespace="yaml-policy",
         )
 
     def artifact_middleware(self) -> PolicyMiddleware:
@@ -32,7 +35,10 @@ class PolicyDocument:
         if self.artifact_digest is None:
             raise ValueError("policy artifact digest is unavailable")
         return PolicyMiddleware(
-            self.policy, version=self.version, digest=self.artifact_digest
+            self.policy,
+            version=self.version,
+            digest=self.artifact_digest,
+            explanation_namespace="yaml-policy",
         )
 
 
