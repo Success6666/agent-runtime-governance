@@ -127,6 +127,10 @@ def test_runtime_event_projection_is_versioned_immutable_and_redacted() -> None:
     with pytest.raises(FrozenInstanceError):
         event.action.action_digest = "b" * 64  # type: ignore[misc]
 
+    exported = event.to_dict()
+    exported["action"]["action_digest"] = "mutated-export"
+    assert event.to_dict()["action"]["action_digest"] == action.action_digest
+
     payload = json.dumps(event.to_dict(), sort_keys=True)
     for canary in (
         "user-canary",
@@ -138,6 +142,49 @@ def test_runtime_event_projection_is_versioned_immutable_and_redacted() -> None:
         "provider-receipt-canary",
     ):
         assert canary not in payload
+
+
+@pytest.mark.asyncio
+async def test_independent_debugger_and_replay_consumers_receive_detached_events() -> None:
+    debugger_events: list[RuntimeEvent] = []
+    replay_events: list[RuntimeEvent] = []
+    runtime = Runtime(event_subscribers=(debugger_events.append, replay_events.append))
+
+    @runtime.tool(execution_mode=ExecutionMode.READ_ONLY)
+    def inspect(secret: str) -> str:
+        return f"result-canary:{secret}"
+
+    try:
+        result = await runtime.arun(
+            "inspect",
+            "parameters-canary",
+            _governance=InvocationOptions(
+                input_text="input-canary",
+                user="user-canary",
+                tenant="tenant-canary",
+            ),
+        )
+        assert result.value == "result-canary:parameters-canary"
+        await _wait_until(lambda: len(debugger_events) == len(replay_events) == 1)
+
+        debugger_event = debugger_events[0]
+        replay_event = replay_events[0]
+        assert debugger_event is replay_event
+        assert debugger_event.status == ExecutionStatus.SUCCEEDED.value
+        assert not hasattr(debugger_event, "context")
+        assert not hasattr(debugger_event, "runtime")
+
+        payload = json.dumps(debugger_event.to_dict(), sort_keys=True)
+        for canary in (
+            "user-canary",
+            "tenant-canary",
+            "input-canary",
+            "parameters-canary",
+            "result-canary",
+        ):
+            assert canary not in payload
+    finally:
+        await runtime.aclose()
 
 
 def test_runtime_event_rejects_nonterminal_statuses() -> None:
