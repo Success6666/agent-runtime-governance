@@ -211,7 +211,13 @@ class _FixtureKeyProvider:
 
 
 class _FixtureDecisionMiddleware(DecisionMiddleware):
-    """Keeps evidence bytes deterministic across equivalent entry points."""
+    """Fix request expiry for cross-entry evidence comparisons.
+
+    ``DecisionMiddleware`` has no public clock seam, so this test fixture
+    deliberately overrides its private expiry hook. ``ConformanceHarness``
+    asserts the resulting request expiry below so a hook-contract change
+    fails deterministically instead of silently changing the evidence bytes.
+    """
 
     def _expires_at(self) -> str:
         return _FIXTURE_APPROVAL_EXPIRES_AT
@@ -276,6 +282,10 @@ class ConformanceHarness:
 
         assert context.bound_action is not None
         assert context.decision is not None
+        if context.decision.source == "human":
+            stored_approval = self._approval_store.get(context.request_id)
+            assert stored_approval is not None
+            assert stored_approval.request.expires_at == _FIXTURE_APPROVAL_EXPIRES_AT
         audit_events = self._audit_sink.read_verified()
         audit_safe = all(
             secret not in json.dumps(event, sort_keys=True) for event in audit_events

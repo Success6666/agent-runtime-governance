@@ -105,12 +105,16 @@ def test_runtime_facade_import_detection_catches_package_root_runtime() -> None:
     package_module = ast.parse(
         "from agent_runtime_governance import runtime"
     ).body[0]
+    root_relative_runtime = ast.parse("from .runtime import Runtime").body[0]
+    nested_relative_runtime = ast.parse("from ...runtime import Runtime").body[0]
     unrelated_import = ast.parse(
         "from agent_runtime_governance import Rule"
     ).body[0]
 
     assert _is_runtime_facade(package_runtime)
     assert _is_runtime_facade(package_module)
+    assert _is_runtime_facade(root_relative_runtime)
+    assert _is_runtime_facade(nested_relative_runtime)
     assert not _is_runtime_facade(unrelated_import)
 
 
@@ -134,8 +138,8 @@ def _is_runtime_facade(node: ast.AST) -> bool:
         return True
     if node.module == "agent_runtime_governance":
         return any(alias.name in {"runtime", "Runtime"} for alias in node.names)
-    return node.level == 3 and (
-        node.module == "runtime"
+    return node.level >= 1 and (
+        (node.module or "").split(".")[-1] == "runtime"
         or (
             node.module is None
             and any(alias.name in {"runtime", "Runtime"} for alias in node.names)
