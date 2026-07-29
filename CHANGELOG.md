@@ -41,8 +41,9 @@ All notable changes are documented here.
   snapshots, preserving public audit imports and v0.7 JSONL/SQLite bytes.
 - A versioned, immutable, redacted terminal-event stream for debugger and
   replay consumers. Event subscribers receive only an allowlisted DTO and are
-  delivered through the Runtime-owned extension dispatcher without becoming
-  governance-authoritative.
+  delivered through a Runtime-owned async-first boundary without becoming
+  governance-authoritative; synchronous consumers use isolated, bounded
+  best-effort delivery.
 - A privacy-safe, unsigned evidence bundle schema v1. Immutable allowlisted
   DTOs bind action, pseudonymous identity, policy, optional approval,
   receipt-free execution, reconciliation lineage, audit-anchor, and redaction

@@ -1,11 +1,9 @@
-"""Daemon-backed execution for abandonable, durably retried side work.
+"""Daemon-backed execution for abandonable, non-authoritative side work.
 
 This executor is intentionally not a general replacement for
-``ThreadPoolExecutor``.  It is used only for reconciliation audit delivery:
-the authoritative outbox remains pending until an acknowledgement is
-committed, and strict production requires the target sink to de-duplicate the
-stable source event ID.  A blocked third-party sink can therefore be abandoned
-at process shutdown without losing the delivery obligation.
+``ThreadPoolExecutor``. It is reserved for delivery whose caller can safely
+abandon work at process shutdown: reconciliation audit delivery has a durable
+outbox, while runtime-event subscribers are explicitly best effort.
 """
 
 from __future__ import annotations
@@ -29,12 +27,13 @@ class _WorkItem:
 
 
 class DaemonThreadPoolExecutor(Executor):
-    """A bounded daemon executor for safely replayable background delivery.
+    """A bounded daemon executor for safely abandonable background delivery.
 
     ``ThreadPoolExecutor`` workers are deliberately non-daemon and Python
     joins them during interpreter shutdown. That is correct for authoritative
-    work, but wrong for a delivery attempt whose durable outbox entry has not
-    yet been acknowledged. This executor makes that distinction explicit.
+    work, but this executor is reserved for delivery that can be safely
+    abandoned: durable outbox attempts remain pending for retry, while
+    runtime-event delivery is non-authoritative.
     """
 
     def __init__(self, *, max_workers: int, thread_name_prefix: str) -> None:
