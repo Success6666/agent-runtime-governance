@@ -189,9 +189,11 @@ async def test_independent_debugger_and_replay_consumers_receive_detached_events
 
 @pytest.mark.asyncio
 async def test_failing_event_subscriber_does_not_block_other_consumers() -> None:
+    failing_events: list[RuntimeEvent] = []
     replay_events: list[RuntimeEvent] = []
 
-    def failing(_event: RuntimeEvent) -> None:
+    def failing(event: RuntimeEvent) -> None:
+        failing_events.append(event)
         raise RuntimeError("debugger consumer failed")
 
     runtime = Runtime(event_subscribers=(failing, replay_events.append))
@@ -203,7 +205,7 @@ async def test_failing_event_subscriber_does_not_block_other_consumers() -> None
     try:
         result = await runtime.arun("inspect", "parameters-canary")
         assert result.value == "result-canary:parameters-canary"
-        await _wait_until(lambda: len(replay_events) == 1)
+        await _wait_until(lambda: len(failing_events) == len(replay_events) == 1)
     finally:
         await runtime.aclose()
 
