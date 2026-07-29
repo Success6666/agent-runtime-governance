@@ -1444,6 +1444,7 @@ class Runtime:
         **kwargs: Any,
     ) -> RunResult:
         self._assert_accepting_work()
+        durable_operation_capability = self._durable_operation_capability
         if self.production_profile is not None and not self._production_sealed:
             raise ProductionReadinessError(self.production_readiness())
         options = _governance or InvocationOptions()
@@ -1454,7 +1455,11 @@ class Runtime:
             )
             async with self._bulkhead.slot(admission_timeout):
                 return await self._arun_admitted(
-                    name, *args, _governance=options, **kwargs
+                    name,
+                    *args,
+                    _governance=options,
+                    _durable_operation_capability=durable_operation_capability,
+                    **kwargs,
                 )
         except (CapacityExceededError, StageTimeoutError) as exc:
             await self._record_admission_failure(
@@ -1471,9 +1476,15 @@ class Runtime:
         name: str,
         *args: Any,
         _governance: InvocationOptions,
+        _durable_operation_capability: DurableOperationCapability | None = None,
         **kwargs: Any,
     ) -> RunResult:
         spec = self.registry.get(name)
+        durable_operation_capability = (
+            self._durable_operation_capability
+            if _durable_operation_capability is None
+            else _durable_operation_capability
+        )
         started = perf_counter()
         context = await self._create_context(
             spec,
@@ -1562,7 +1573,7 @@ class Runtime:
                     context, spec.name, normalized_parameters
                 )
                 namespace = self._idempotency_namespace(context)
-                if self._supports_atomic_reconciliation_preparation():
+                if durable_operation_capability.supports_atomic_preparation:
                     prepared_action = self._prepared_unknown_action(
                         spec,
                         context,
@@ -1577,6 +1588,7 @@ class Runtime:
                         fingerprint,
                         context.deadline,
                         prepared_action=prepared_action,
+                        durable_operation_capability=durable_operation_capability,
                     )
                 except IdempotencyConflictError as exc:
                     decision = DecisionRecord(
@@ -1639,26 +1651,36 @@ class Runtime:
                 if context.denied:
                     denial = GovernanceDenied(context)
                     await self._finish_idempotency(
-                        claim, context, denial, spec=spec
+                        claim,
+                        context,
+                        denial,
+                        spec=spec,
+                        durable_operation_capability=durable_operation_capability,
                     )
                     claim = None
                     context = await self._run_observers(context, post=True)
                     raise denial
                 if (
-                    self._durable_operation_capability.supports_sqlite_reconciliation
+                    durable_operation_capability.supports_sqlite_reconciliation
                     and prepared_action is None
                 ):
                     # Compatibility path for non-co-located development adapters.
                     # Production sealing requires the atomic store/ledger path above.
                     prepared_action = self._unknown_action(spec, context, claim)
-                    await self._run_reconciliation_operation(
-                        self._durable_operation_capability.prepare_non_atomic_sqlite_action,
+                    prepared = await self._run_reconciliation_operation(
+                        durable_operation_capability.prepare_non_atomic_sqlite_action,
                         claim,
                         prepared_action,
                         deadline=context.deadline,
                         stage="reconciliation prepare action",
                     )
-                heartbeat_task = self._start_idempotency_heartbeat(claim)
+                    if prepared is not True:
+                        raise RuntimeError(
+                            "reconciliation recovery descriptor was not prepared"
+                        )
+                heartbeat_task = self._start_idempotency_heartbeat(
+                    claim, durable_operation_capability
+                )
             else:
                 context = await self._commit_approvals(context)
                 context = self._enforce_required_approval(context)
@@ -1754,7 +1776,14 @@ class Runtime:
                 heartbeat_task, raise_on_failure=True
             )
             heartbeat_task = None
-            await self._finish_idempotency(claim, context, None, value, spec=spec)
+            await self._finish_idempotency(
+                claim,
+                context,
+                None,
+                value,
+                spec=spec,
+                durable_operation_capability=durable_operation_capability,
+            )
             claim = None
         except ExecutionControlError as exc:
             await self._stop_idempotency_heartbeat(
@@ -1776,7 +1805,11 @@ class Runtime:
                 ),
             )
             context = await self._settle_idempotency(
-                claim, context, cause, spec=spec
+                claim,
+                context,
+                cause,
+                spec=spec,
+                durable_operation_capability=durable_operation_capability,
             )
             context = await self._emit_hook(
                 HookPoint.ON_ERROR, context, allow_critical=False
@@ -1788,7 +1821,11 @@ class Runtime:
                 heartbeat_task, raise_on_failure=False
             )
             context = await self._settle_idempotency(
-                claim, exc.context, exc, spec=spec
+                claim,
+                exc.context,
+                exc,
+                spec=spec,
+                durable_operation_capability=durable_operation_capability,
             )
             claim = None
             context = await self._run_observers(context, post=True)
@@ -1803,6 +1840,7 @@ class Runtime:
                 uncertain=execution_started,
                 claim=claim,
                 spec=spec,
+                durable_operation_capability=durable_operation_capability,
             )
             raise GovernanceCancelledError(context) from exc
         except Exception as exc:
@@ -1825,7 +1863,11 @@ class Runtime:
                 ),
             )
             context = await self._settle_idempotency(
-                claim, context, exc, spec=spec
+                claim,
+                context,
+                exc,
+                spec=spec,
+                durable_operation_capability=durable_operation_capability,
             )
             context = await self._emit_hook(
                 HookPoint.ON_ERROR, context, allow_critical=False
@@ -1848,7 +1890,12 @@ class Runtime:
             )
             context = await self._run_observers(context, post=True)
         except asyncio.CancelledError as exc:
-            context = await self._handle_cancellation(context, started, uncertain=True)
+            context = await self._handle_cancellation(
+                context,
+                started,
+                uncertain=True,
+                durable_operation_capability=durable_operation_capability,
+            )
             raise GovernanceCancelledError(context) from exc
         return RunResult(value=value, context=context)
 
@@ -2007,7 +2054,8 @@ class Runtime:
         self._assert_accepting_work()
         if self.production_profile is not None and not self._production_sealed:
             raise ProductionReadinessError(self.production_readiness())
-        ledger = self.reconciliation_ledger
+        durable_operation_capability = self._durable_operation_capability
+        ledger = durable_operation_capability.reconciliation_ledger
         if ledger is None:
             raise ReconciliationNotFoundError("reconciliation ledger is not configured")
         principal = await self._verify_reconciliation_principal(
@@ -2039,6 +2087,7 @@ class Runtime:
                     outcome=outcome,
                     finding=finding,
                     deadline=deadline,
+                    durable_operation_capability=durable_operation_capability,
                 )
             return current
 
@@ -2049,8 +2098,9 @@ class Runtime:
             stage="reconciliation read head",
         )
         self._assert_reconciliation_tenant_access(principal, head.action)
-        if self._durable_operation_capability.supports_audit_outbox:
+        if durable_operation_capability.supports_audit_outbox:
             await self._drain_reconciliation_audit_outbox(
+                durable_operation_capability,
                 execution_record_id=execution_record_id,
                 deadline=deadline,
             )
@@ -2068,6 +2118,7 @@ class Runtime:
                     recovered,
                     event_type="recovery_transition_recorded",
                     deadline=deadline,
+                    durable_operation_capability=durable_operation_capability,
                 )
             return recovered
         # A concurrent runtime may have finalized or quarantined the action
@@ -2217,6 +2268,7 @@ class Runtime:
                 outcome=ReconciliationAttemptOutcome.SUCCESS,
                 finding=finding,
                 deadline=deadline,
+                durable_operation_capability=durable_operation_capability,
             )
             return transitioned
         except ReconciliationConflictError:
@@ -2264,7 +2316,8 @@ class Runtime:
             raise ProductionReadinessError(self.production_readiness())
         if type(limit) is not int or not 1 <= limit <= 1_000:
             raise ValueError("audit outbox limit must be between 1 and 1000")
-        if not self._durable_operation_capability.supports_audit_outbox:
+        durable_operation_capability = self._durable_operation_capability
+        if not durable_operation_capability.supports_audit_outbox:
             raise ReconciliationNotFoundError(
                 "a durable SQLite reconciliation ledger is required for audit delivery"
             )
@@ -2274,7 +2327,9 @@ class Runtime:
             operation="drain",
         )
         return await self._drain_reconciliation_audit_outbox(
-            limit=limit, deadline=deadline
+            durable_operation_capability,
+            limit=limit,
+            deadline=deadline,
         )
 
     async def aresolve_reconciliation(
@@ -2335,7 +2390,8 @@ class Runtime:
         self._assert_accepting_work()
         if self.production_profile is not None and not self._production_sealed:
             raise ProductionReadinessError(self.production_readiness())
-        ledger = self.reconciliation_ledger
+        durable_operation_capability = self._durable_operation_capability
+        ledger = durable_operation_capability.reconciliation_ledger
         if ledger is None:
             raise ReconciliationNotFoundError("reconciliation ledger is not configured")
         profile = self.production_profile
@@ -2414,6 +2470,7 @@ class Runtime:
             evidence=resolution.evidence,
             operator_identity_digest=operator_digest,
             deadline=deadline,
+            durable_operation_capability=durable_operation_capability,
         )
         return head
 
@@ -2552,9 +2609,16 @@ class Runtime:
         evidence: Mapping[str, Any] | None = None,
         operator_identity_digest: str | None = None,
         deadline: datetime | None = None,
+        durable_operation_capability: DurableOperationCapability | None = None,
     ) -> None:
-        if self._durable_operation_capability.supports_audit_outbox:
+        durable_operation_capability = (
+            self._durable_operation_capability
+            if durable_operation_capability is None
+            else durable_operation_capability
+        )
+        if durable_operation_capability.supports_audit_outbox:
             await self._drain_reconciliation_audit_outbox(
+                durable_operation_capability,
                 execution_record_id=head.execution_record_id,
                 deadline=deadline,
             )
@@ -3468,7 +3532,13 @@ class Runtime:
         deadline: datetime | None,
         *,
         prepared_action: UnknownAction | None = None,
+        durable_operation_capability: DurableOperationCapability | None = None,
     ) -> IdempotencyClaim:
+        durable_operation_capability = (
+            self._durable_operation_capability
+            if durable_operation_capability is None
+            else durable_operation_capability
+        )
         self._raise_if_idempotency_store_poisoned()
         timeout = self._bounded_timeout(
             deadline,
@@ -3486,7 +3556,7 @@ class Runtime:
                 timeout >= self.limits.idempotency_operation_timeout_seconds
             )
             future = self._idempotency_executor.submit(
-                self._durable_operation_capability.acquire,
+                durable_operation_capability.acquire,
                 namespace,
                 key,
                 fingerprint,
@@ -3506,7 +3576,7 @@ class Runtime:
                 return
             try:
                 error = TimeoutError("request stopped waiting during acquisition")
-                if self._durable_operation_capability.record_orphaned_prepared_claim_unknown(
+                if durable_operation_capability.record_orphaned_prepared_claim_unknown(
                     claim,
                     prepared_action,
                     error,
@@ -3514,7 +3584,9 @@ class Runtime:
                     # The descriptor and claim were committed together. Preserve
                     # that invariant when an abandoned acquisition is settled.
                     return
-                self.idempotency_store.mark_unknown(claim, error)
+                durable_operation_capability.idempotency_store.mark_unknown(
+                    claim, error
+                )
             except BaseException:
                 return
 
@@ -3809,12 +3881,18 @@ class Runtime:
         value: Any = None,
         *,
         spec: ToolSpec[Any, Any] | None = None,
+        durable_operation_capability: DurableOperationCapability | None = None,
     ) -> ReconciliationHead | None:
+        durable_operation_capability = (
+            self._durable_operation_capability
+            if durable_operation_capability is None
+            else durable_operation_capability
+        )
         if claim is None:
             return None
         if error is None:
             await self._run_critical_store_operation(
-                self.idempotency_store.complete,
+                durable_operation_capability.idempotency_store.complete,
                 claim,
                 value,
                 deadline=context.deadline,
@@ -3822,12 +3900,19 @@ class Runtime:
             )
             return None
         if context.status is ExecutionStatus.UNKNOWN:
-            if spec is not None and self.reconciliation_ledger is not None:
+            if (
+                spec is not None
+                and durable_operation_capability.reconciliation_ledger is not None
+            ):
                 return await self._record_unknown_reconciliation(
-                    claim, spec, context, error
+                    claim,
+                    spec,
+                    context,
+                    error,
+                    durable_operation_capability=durable_operation_capability,
                 )
             await self._run_critical_store_operation(
-                self.idempotency_store.mark_unknown,
+                durable_operation_capability.idempotency_store.mark_unknown,
                 claim,
                 error,
                 deadline=context.deadline,
@@ -3835,7 +3920,7 @@ class Runtime:
             )
             return None
         await self._run_critical_store_operation(
-            self.idempotency_store.fail,
+            durable_operation_capability.idempotency_store.fail,
             claim,
             error,
             deadline=context.deadline,
@@ -3849,13 +3934,20 @@ class Runtime:
         spec: ToolSpec[Any, Any],
         context: ExecutionContext,
         error: BaseException,
+        *,
+        durable_operation_capability: DurableOperationCapability | None = None,
     ) -> ReconciliationHead:
-        ledger = self.reconciliation_ledger
+        durable_operation_capability = (
+            self._durable_operation_capability
+            if durable_operation_capability is None
+            else durable_operation_capability
+        )
+        ledger = durable_operation_capability.reconciliation_ledger
         assert ledger is not None
         action = self._unknown_action(spec, context, claim, error)
-        if self._durable_operation_capability.supports_sqlite_reconciliation:
+        if durable_operation_capability.supports_sqlite_reconciliation:
             head = await self._run_reconciliation_operation(
-                self._durable_operation_capability.record_unknown,
+                durable_operation_capability.record_unknown,
                 claim,
                 action,
                 error,
@@ -3867,7 +3959,7 @@ class Runtime:
             # durable atomic boundary. They retain compatibility for local
             # development, while production sealing rejects them.
             await self._run_critical_store_operation(
-                self.idempotency_store.mark_unknown,
+                durable_operation_capability.idempotency_store.mark_unknown,
                 claim,
                 error,
                 deadline=context.deadline,
@@ -3883,6 +3975,7 @@ class Runtime:
             head,
             event_type="unknown_recorded",
             deadline=context.deadline,
+            durable_operation_capability=durable_operation_capability,
         )
         return head
 
@@ -3964,17 +4057,24 @@ class Runtime:
         )
 
     def _start_idempotency_heartbeat(
-        self, claim: IdempotencyClaim
+        self,
+        claim: IdempotencyClaim,
+        durable_operation_capability: DurableOperationCapability | None = None,
     ) -> asyncio.Task[None] | None:
         if not claim.owner or claim.lease_seconds is None:
             return None
+        durable_operation_capability = (
+            self._durable_operation_capability
+            if durable_operation_capability is None
+            else durable_operation_capability
+        )
 
         async def heartbeat() -> None:
             interval = max(0.001, min(30.0, claim.lease_seconds / 3))
             while True:
                 await asyncio.sleep(interval)
                 await self._run_critical_store_operation(
-                    self.idempotency_store.renew,
+                    durable_operation_capability.idempotency_store.renew,
                     claim,
                     stage="idempotency renew",
                 )
@@ -4013,10 +4113,16 @@ class Runtime:
         value: Any = None,
         *,
         spec: ToolSpec[Any, Any] | None = None,
+        durable_operation_capability: DurableOperationCapability | None = None,
     ) -> ExecutionContext:
         try:
             head = await self._finish_idempotency(
-                claim, context, error, value, spec=spec
+                claim,
+                context,
+                error,
+                value,
+                spec=spec,
+                durable_operation_capability=durable_operation_capability,
             )
         except Exception as settlement_error:
             changes: dict[str, Any] = {
@@ -4358,6 +4464,7 @@ class Runtime:
         uncertain: bool,
         claim: IdempotencyClaim | None = None,
         spec: ToolSpec[Any, Any] | None = None,
+        durable_operation_capability: DurableOperationCapability | None = None,
     ) -> ExecutionContext:
         if not context.denied:
             context = context.evolve(
@@ -4386,7 +4493,11 @@ class Runtime:
             )
         )
         context = await self._settle_idempotency(
-            claim, context, asyncio.CancelledError(), spec=spec
+            claim,
+            context,
+            asyncio.CancelledError(),
+            spec=spec,
+            durable_operation_capability=durable_operation_capability,
         )
         context = await self._abort_observers(context)
         try:

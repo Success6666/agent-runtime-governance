@@ -820,6 +820,154 @@ async def test_runtime_atomically_prepares_recovery_descriptor_before_dispatch(
 
 
 @pytest.mark.asyncio
+async def test_unknown_settlement_uses_operation_snapshot_after_ledger_reassignment(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "unknown-snapshot.db"
+    reassigned_path = tmp_path / "unknown-reassigned.db"
+    runtime = _runtime(path)
+    original_ledger = runtime.reconciliation_ledger
+    assert isinstance(original_ledger, SQLiteReconciliationLedger)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    @runtime.tool(execution_mode=ExecutionMode.IDEMPOTENT)
+    async def charge() -> None:
+        started.set()
+        await release.wait()
+        raise TimeoutError("payment outcome is uncertain")
+
+    task = asyncio.create_task(
+        runtime.arun("charge", _governance=InvocationOptions(idempotency_key="request-1"))
+    )
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        runtime.reconciliation_ledger = SQLiteReconciliationLedger(reassigned_path)
+        release.set()
+
+        with pytest.raises(ToolExecutionError) as failed:
+            await task
+
+        execution_record_id = failed.value.execution_record_id
+        assert execution_record_id is not None
+        assert original_ledger.current(execution_record_id).state is ReconciliationState.UNKNOWN
+        with closing(sqlite3.connect(reassigned_path)) as connection:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM reconciliation_heads"
+            ).fetchone()[0] == 0
+    finally:
+        release.set()
+        if not task.done():
+            await asyncio.gather(task, return_exceptions=True)
+        await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_non_colocated_snapshot_prepares_descriptor_before_dispatch_after_reassignment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RecordingLedger(SQLiteReconciliationLedger):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.prepared_actions: list[UnknownAction] = []
+
+        def prepare_action(self, _claim: object, action: UnknownAction) -> None:
+            self.prepared_actions.append(action)
+
+    store_path = tmp_path / "descriptor-store.db"
+    recording_ledger = RecordingLedger(tmp_path / "descriptor-ledger.db")
+    runtime = Runtime(
+        idempotency_store=SQLiteIdempotencyStore(store_path),
+        reconciliation_ledger=recording_ledger,
+    )
+    original_acquire = runtime._acquire_idempotency
+
+    async def reconfigure_before_acquire(*args: object, **kwargs: object):
+        runtime.reconciliation_ledger = SQLiteReconciliationLedger(store_path)
+        return await original_acquire(*args, **kwargs)
+
+    monkeypatch.setattr(runtime, "_acquire_idempotency", reconfigure_before_acquire)
+
+    @runtime.tool(execution_mode=ExecutionMode.IDEMPOTENT)
+    async def charge() -> dict[str, bool]:
+        assert len(recording_ledger.prepared_actions) == 1
+        return {"ok": True}
+
+    try:
+        result = await runtime.ainvoke(
+            "charge", _governance=InvocationOptions(idempotency_key="request-1")
+        )
+        assert result == {"ok": True}
+        assert recording_ledger.prepared_actions[0].execution_record_id
+    finally:
+        await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_areconcile_drains_original_outbox_after_ledger_reassignment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ToggleAuditSink:
+        def __init__(self) -> None:
+            self.fail = True
+            self.events: list[dict[str, object]] = []
+
+        def write(self, event: object) -> None:
+            if self.fail:
+                raise RuntimeError("audit delivery is temporarily unavailable")
+            assert isinstance(event, dict)
+            self.events.append(event)
+
+    path = tmp_path / "outbox-snapshot.db"
+    reassigned_path = tmp_path / "outbox-reassigned.db"
+    sink = ToggleAuditSink()
+    runtime = Runtime(
+        [AuditMiddleware(sink, fail_closed=False)],
+        idempotency_store=SQLiteIdempotencyStore(path),
+        reconciliation_ledger=SQLiteReconciliationLedger(path),
+    )
+    original_ledger = runtime.reconciliation_ledger
+    assert isinstance(original_ledger, SQLiteReconciliationLedger)
+
+    @runtime.tool(execution_mode=ExecutionMode.IDEMPOTENT)
+    async def charge() -> None:
+        raise TimeoutError("payment outcome is uncertain")
+
+    try:
+        with pytest.raises(ToolExecutionError) as failed:
+            await runtime.arun(
+                "charge", _governance=InvocationOptions(idempotency_key="request-1")
+            )
+        execution_record_id = failed.value.execution_record_id
+        assert execution_record_id is not None
+        assert original_ledger.pending_audit_events(
+            execution_record_id=execution_record_id
+        )
+
+        original_verify = runtime._verify_reconciliation_principal
+
+        async def reconfigure_before_probe(*args: object, **kwargs: object):
+            runtime.reconciliation_ledger = SQLiteReconciliationLedger(reassigned_path)
+            return await original_verify(*args, **kwargs)
+
+        monkeypatch.setattr(
+            runtime, "_verify_reconciliation_principal", reconfigure_before_probe
+        )
+        sink.fail = False
+
+        await runtime.areconcile(execution_record_id)
+
+        assert sink.events
+        assert not original_ledger.pending_audit_events(
+            execution_record_id=execution_record_id
+        )
+    finally:
+        await runtime.aclose()
+
+
+@pytest.mark.asyncio
 async def test_missing_provider_is_recorded_and_never_auto_dispatches(
     tmp_path: Path,
 ) -> None:
