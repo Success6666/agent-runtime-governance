@@ -206,10 +206,16 @@ def _same_sqlite_database(
     idempotency_store: SQLiteIdempotencyStore,
     reconciliation_ledger: SQLiteReconciliationLedger,
 ) -> bool:
-    return (
-        Path(idempotency_store.path).resolve()
-        == Path(reconciliation_ledger.path).resolve()
-    )
+    idempotency_path = Path(idempotency_store.path)
+    reconciliation_path = Path(reconciliation_ledger.path)
+    if (
+        str(idempotency_path) == ":memory:"
+        or str(reconciliation_path) == ":memory:"
+        or not idempotency_path.is_file()
+        or not reconciliation_path.is_file()
+    ):
+        return False
+    return idempotency_path.resolve() == reconciliation_path.resolve()
 
 
 __all__ = ["DurableOperationCapability"]

@@ -957,10 +957,32 @@ async def test_areconcile_drains_original_outbox_after_ledger_reassignment(
         )
         sink.fail = False
 
+        expected_outbox_ids = {
+            envelope.outbox_id
+            for envelope in original_ledger.pending_audit_events(
+                execution_record_id=execution_record_id
+            )
+        }
+        assert expected_outbox_ids
+
         await runtime.areconcile(execution_record_id)
 
-        assert sink.events
+        delivered = [
+            event
+            for event in sink.events
+            if event.get("execution_record_id") == execution_record_id
+        ]
+        delivered_outbox_ids = [
+            event["reconciliation_audit_id"] for event in delivered
+        ]
+        assert expected_outbox_ids <= set(delivered_outbox_ids)
+        assert len(delivered_outbox_ids) == len(set(delivered_outbox_ids))
         assert not original_ledger.pending_audit_events(
+            execution_record_id=execution_record_id
+        )
+        reassigned_ledger = runtime.reconciliation_ledger
+        assert isinstance(reassigned_ledger, SQLiteReconciliationLedger)
+        assert not reassigned_ledger.pending_audit_events(
             execution_record_id=execution_record_id
         )
     finally:
@@ -2110,7 +2132,11 @@ async def test_reconciliation_outbox_acknowledges_after_async_idempotent_write()
     ledger = RecordingLedger(sink)
     runtime = Runtime([AuditMiddleware(sink, fail_closed=True)])  # type: ignore[arg-type]
     try:
-        drain = asyncio.create_task(runtime._drain_reconciliation_audit_outbox(ledger))
+        drain = asyncio.create_task(
+            runtime._drain_reconciliation_audit_outbox(
+                ledger  # type: ignore[arg-type]
+            )
+        )
         await asyncio.wait_for(sink.started.wait(), timeout=1)
         assert not ledger.delivered
         assert not drain.done()

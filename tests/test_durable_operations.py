@@ -66,6 +66,7 @@ def test_capability_routes_sqlite_compatibility_and_atomic_unknown_paths(
     tmp_path: Path,
 ) -> None:
     compatibility_path = tmp_path / "compatibility.db"
+    # Initializes the idempotency schema required by _RecordingLedger preflight.
     SQLiteIdempotencyStore(compatibility_path)
     compatibility_ledger = _RecordingLedger(compatibility_path)
     memory_store = InMemoryIdempotencyStore()
@@ -96,3 +97,21 @@ def test_capability_routes_sqlite_compatibility_and_atomic_unknown_paths(
         atomic_claim, atomic_action, error
     )
     assert atomic_ledger.unknown == (atomic_claim, atomic_action, error)
+
+
+def test_capability_rejects_independent_in_memory_sqlite_adapters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Use adapter shells to isolate static path classification from database setup.
+    store = object.__new__(SQLiteIdempotencyStore)
+    store.path = Path(":memory:")
+    ledger = object.__new__(SQLiteReconciliationLedger)
+    ledger.path = Path(":memory:")
+    monkeypatch.setattr(Path, "is_file", lambda _path: True)
+    capability = DurableOperationCapability(store, ledger)
+
+    assert capability.supports_atomic_preparation is False
+    assert (
+        capability.reconciliation_durability
+        is _ReconciliationDurability.COLOCATED_DATABASE_REQUIRED
+    )
