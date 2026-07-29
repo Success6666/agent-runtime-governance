@@ -141,6 +141,10 @@ _ACTIVE_RUNTIME_IDS: ContextVar[frozenset[int]] = ContextVar(
     "agent_runtime_governance_active_runtime_ids",
     default=frozenset(),
 )
+_EVENT_DELIVERY_RUNTIME_IDS: ContextVar[frozenset[int]] = ContextVar(
+    "agent_runtime_governance_event_delivery_runtime_ids",
+    default=frozenset(),
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -371,6 +375,7 @@ class Runtime:
     def close(self, *, wait: bool = True) -> None:
         """Stop accepting work and release the owned synchronous executor."""
 
+        self._assert_not_runtime_event_reentry()
         if id(self) in _ACTIVE_RUNTIME_IDS.get():
             raise RuntimeError(
                 "close() cannot be called from an active runtime operation"
@@ -445,6 +450,7 @@ class Runtime:
     async def aclose(self) -> None:
         """Close the Runtime from any caller loop without crossing Task ownership."""
 
+        self._assert_not_runtime_event_reentry()
         current_loop = asyncio.get_running_loop()
         with self._lifecycle_lock:
             if self._closed:
@@ -751,6 +757,7 @@ class Runtime:
     ) -> _ActiveOperation:
         """Atomically admit and track one public runtime operation."""
 
+        self._assert_not_runtime_event_reentry()
         task = asyncio.current_task()
         with self._lifecycle_lock:
             if self._closed or self._closing:
@@ -900,13 +907,26 @@ class Runtime:
             event = RuntimeEvent.from_context(context)
             delivery = self._runtime_event_hub.publish(
                 event,
-                self._invoke_extension,
+                self._invoke_runtime_event_subscriber,
                 subscribers,
             )
             self._schedule_extension_cleanup(delivery)
         except Exception:
             if delivery is not None:
                 _discard_unstarted_awaitable(delivery)
+
+    async def _invoke_runtime_event_subscriber(
+        self,
+        subscriber: RuntimeEventSubscriber,
+        event: RuntimeEvent,
+    ) -> Any:
+        token = _EVENT_DELIVERY_RUNTIME_IDS.set(
+            _EVENT_DELIVERY_RUNTIME_IDS.get() | frozenset({id(self)})
+        )
+        try:
+            return await self._invoke_extension(subscriber, event)
+        finally:
+            _EVENT_DELIVERY_RUNTIME_IDS.reset(token)
 
     def _forget_detached_stage(self, task: asyncio.Future[Any]) -> None:
         with self._lifecycle_lock:
@@ -930,9 +950,16 @@ class Runtime:
     def _assert_accepting_work(self) -> None:
         """Atomically reject public work once shutdown starts."""
 
+        self._assert_not_runtime_event_reentry()
         with self._lifecycle_lock:
             if self._closed or self._closing:
                 raise RuntimeError("runtime is closed")
+
+    def _assert_not_runtime_event_reentry(self) -> None:
+        if id(self) in _EVENT_DELIVERY_RUNTIME_IDS.get():
+            raise RuntimeError(
+                "runtime work cannot be called from a runtime event subscriber"
+            )
 
     def _shutdown_executors(self, *, wait: bool) -> None:
         with self._production_seal_lock:
@@ -1294,6 +1321,7 @@ class Runtime:
         return decorator
 
     def invoke(self, name: str, *args: Any, **kwargs: Any) -> Any:
+        self._assert_not_runtime_event_reentry()
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -1340,11 +1368,15 @@ class Runtime:
                 )
             except (
                 AuditDeliveryError,
+                CapacityExceededError,
                 GovernanceCancelledError,
                 GovernanceDenied,
+                StageTimeoutError,
                 ToolExecutionError,
             ) as exc:
-                self._schedule_runtime_event(exc.context)
+                context = getattr(exc, "context", None)
+                if isinstance(context, ExecutionContext):
+                    self._schedule_runtime_event(context)
                 raise
             self._schedule_runtime_event(result.context)
             return result

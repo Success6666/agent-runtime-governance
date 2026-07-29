@@ -14,10 +14,18 @@ from threading import Lock
 from typing import Any, Awaitable, Protocol
 
 from .action_contracts import BoundAction
-from .context import ExecutionContext
+from .context import ExecutionContext, ExecutionStatus
 
 RUNTIME_EVENT_SCHEMA_V1 = "arg.runtime-event.v1"
 _TRACE_DIGEST_DOMAIN = b"agent-runtime-governance.runtime-event.trace.v1\0"
+_TERMINAL_EXECUTION_STATUSES = frozenset(
+    {
+        ExecutionStatus.DENIED.value,
+        ExecutionStatus.FAILED.value,
+        ExecutionStatus.SUCCEEDED.value,
+        ExecutionStatus.UNKNOWN.value,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +111,8 @@ class RuntimeEvent:
             raise ValueError("unsupported runtime event schema version")
         if self.event_type != "terminal":
             raise ValueError("runtime event type must be terminal")
+        if self.status not in _TERMINAL_EXECUTION_STATUSES:
+            raise ValueError("runtime terminal event status must be terminal")
 
     @classmethod
     def from_context(cls, context: ExecutionContext) -> "RuntimeEvent":

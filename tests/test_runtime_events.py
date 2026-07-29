@@ -4,6 +4,7 @@ import asyncio
 import json
 import threading
 from dataclasses import FrozenInstanceError
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -11,6 +12,7 @@ import pytest
 from agent_runtime_governance import (
     ActionContract,
     BoundAction,
+    CapacityExceededError,
     ExecutionContext,
     ExecutionMode,
     ExecutionStatus,
@@ -22,6 +24,7 @@ from agent_runtime_governance import (
     RuntimeEvent,
     RuntimeEventAction,
     RuntimeLimits,
+    StageTimeoutError,
     ToolCall,
 )
 from agent_runtime_governance.decisions import DecisionOutcome, DecisionRecord
@@ -136,6 +139,27 @@ def test_runtime_event_projection_is_versioned_immutable_and_redacted() -> None:
         assert canary not in payload
 
 
+def test_runtime_event_rejects_nonterminal_statuses() -> None:
+    action = RuntimeEventAction.from_bound_action(None)
+    with pytest.raises(ValueError, match="status must be terminal"):
+        RuntimeEvent(
+            schema_version=RUNTIME_EVENT_SCHEMA_V1,
+            event_type="terminal",
+            trace_digest="trace-digest",
+            tool_name="emit_event",
+            status=ExecutionStatus.PENDING.value,
+            execution_mode=ExecutionMode.MUTATING.value,
+            risk_tier="LOW",
+            requires_approval=False,
+            approval_granted=False,
+            decision_outcome=None,
+            cancelled=False,
+            action=action,
+        )
+    with pytest.raises(ValueError, match="status must be terminal"):
+        RuntimeEvent.from_context(ExecutionContext.create(ToolCall("emit_event")))
+
+
 @pytest.mark.asyncio
 async def test_runtime_event_stream_captures_all_terminal_outcomes() -> None:
     events: list[RuntimeEvent] = []
@@ -243,6 +267,131 @@ async def test_runtime_event_subscriber_failure_cannot_change_tool_result() -> N
         assert caught.value.context.status is ExecutionStatus.DENIED
     finally:
         await asyncio.gather(runtime.aclose(), denied.aclose())
+
+
+@pytest.mark.asyncio
+async def test_runtime_event_subscribers_cannot_reenter_their_runtime() -> None:
+    async_errors: list[str] = []
+    preview_errors: list[str] = []
+    sync_errors: list[str] = []
+    observed: list[RuntimeEvent] = []
+    calls: list[str] = []
+
+    async def reenter_async(_event: RuntimeEvent) -> None:
+        nested = asyncio.create_task(runtime.ainvoke("work"))
+        try:
+            await nested
+        except RuntimeError as exc:
+            async_errors.append(str(exc))
+        else:
+            async_errors.append("accepted")
+        try:
+            await runtime.apreview("work")
+        except RuntimeError as exc:
+            preview_errors.append(str(exc))
+        else:
+            preview_errors.append("accepted")
+
+    def reenter_sync(_event: RuntimeEvent) -> None:
+        try:
+            runtime.invoke("work")
+        except RuntimeError as exc:
+            sync_errors.append(str(exc))
+        else:
+            sync_errors.append("accepted")
+
+    runtime = Runtime(
+        event_subscribers=(reenter_async, reenter_sync, observed.append)
+    )
+
+    @runtime.tool()
+    def work() -> str:
+        calls.append("work")
+        return "ok"
+
+    try:
+        assert await runtime.ainvoke("work") == "ok"
+        await _wait_until(
+            lambda: (
+                len(async_errors)
+                == len(preview_errors)
+                == len(sync_errors)
+                == len(observed)
+                == 1
+            )
+        )
+        assert calls == ["work"]
+        assert "runtime event subscriber" in async_errors[0]
+        assert "runtime event subscriber" in preview_errors[0]
+        assert "runtime event subscriber" in sync_errors[0]
+    finally:
+        await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runtime_event_stream_captures_capacity_failure_once() -> None:
+    events: list[RuntimeEvent] = []
+    runtime = Runtime(
+        limits=RuntimeLimits(max_in_flight=1, admission_timeout_seconds=0.05),
+        event_subscribers=(events.append,),
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+    first: asyncio.Task[Any] | None = None
+
+    @runtime.tool(execution_mode=ExecutionMode.READ_ONLY)
+    async def hold() -> None:
+        started.set()
+        await release.wait()
+
+    try:
+        first = asyncio.create_task(runtime.ainvoke("hold"))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        with pytest.raises(CapacityExceededError) as caught:
+            await runtime.ainvoke("hold")
+        assert caught.value.context.status is ExecutionStatus.FAILED
+        await _wait_until(
+            lambda: any(
+                event.status == ExecutionStatus.FAILED.value for event in events
+            )
+        )
+        release.set()
+        await first
+        await runtime.aclose()
+        assert sum(
+            event.status == ExecutionStatus.FAILED.value for event in events
+        ) == 1
+    finally:
+        release.set()
+        if first is not None:
+            await asyncio.gather(first, return_exceptions=True)
+        if not runtime._closed:
+            await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runtime_event_stream_captures_admission_deadline_failure_once() -> None:
+    events: list[RuntimeEvent] = []
+    runtime = Runtime(event_subscribers=(events.append,))
+
+    @runtime.tool()
+    def work() -> str:
+        return "unreachable"
+
+    try:
+        with pytest.raises(StageTimeoutError) as caught:
+            await runtime.arun(
+                "work",
+                _governance=InvocationOptions(
+                    deadline=datetime.now(timezone.utc) - timedelta(seconds=1)
+                ),
+            )
+        assert caught.value.context.status is ExecutionStatus.FAILED
+        await runtime.aclose()
+        assert [event.status for event in events] == [ExecutionStatus.FAILED.value]
+    finally:
+        if not runtime._closed:
+            await runtime.aclose()
 
 
 @pytest.mark.asyncio
