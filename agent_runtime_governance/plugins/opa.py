@@ -5,7 +5,7 @@ import json
 import re
 import ssl
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Protocol
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
@@ -13,6 +13,12 @@ from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_ope
 from .._internal.runtime.blocking import invoke_extension
 from .._internal.runtime.extensions import is_native_async_callable
 from ..context import ExecutionContext, HistoryEntry
+from ..decision_explanations import (
+    DecisionControl,
+    DecisionExplanationValidationError,
+    decision_controls_history_data,
+    unavailable_decision_controls_history_data,
+)
 from ..decisions import DecisionOutcome, DecisionRecord
 from ..middleware.base import GatingMiddleware
 from ..resilience import CircuitBreaker
@@ -23,6 +29,24 @@ from .core import RuntimeBuilder
 class OPADecision:
     allow: bool
     reason: str
+    controls: tuple[DecisionControl, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        if type(self.allow) is not bool:
+            raise TypeError("OPA allow must be a boolean")
+        if not isinstance(self.reason, str):
+            raise TypeError("OPA reason must be a string")
+        controls = tuple(self.controls)
+        if any(not isinstance(item, DecisionControl) for item in controls):
+            raise TypeError("OPA controls must contain DecisionControl values")
+        identities = tuple(item.identity for item in controls)
+        if len(set(identities)) != len(identities) or identities != tuple(
+            sorted(identities)
+        ):
+            raise DecisionExplanationValidationError(
+                "OPA controls must be ordered and unique"
+            )
+        object.__setattr__(self, "controls", controls)
 
 
 OPATransport = Callable[
@@ -171,6 +195,7 @@ class OPAClient:
             return OPADecision(
                 bool(result["allow"]),
                 str(result.get("reason", "OPA structured decision")),
+                _structured_controls(result),
             )
         raise ValueError("OPA response must contain result bool or result.allow bool")
 
@@ -259,11 +284,37 @@ class OPAMiddleware(GatingMiddleware):
             return context.with_decision(
                 DecisionRecord(DecisionOutcome.DENY, decision.reason, self.name)
             ).append_history(
-                HistoryEntry(self.name, "deny", decision.reason)
+                HistoryEntry(
+                    self.name,
+                    "deny",
+                    decision.reason,
+                    data={
+                        **self._policy_metadata(),
+                        **_decision_controls_history_data(decision),
+                    },
+                )
             )
         return context.append_history(
-            HistoryEntry(self.name, "allow", decision.reason)
+            HistoryEntry(
+                self.name,
+                "allow",
+                decision.reason,
+                data={
+                    **self._policy_metadata(),
+                    **_decision_controls_history_data(decision),
+                },
+            )
         )
+
+    def _policy_metadata(self) -> dict[str, str]:
+        return {
+            key: value
+            for key, value in {
+                "policy_version": self.policy_version,
+                "policy_digest": self.policy_digest,
+            }.items()
+            if value is not None
+        }
 
 
 class OPAPlugin:
@@ -300,6 +351,29 @@ def _encode_json(payload: Mapping[str, Any], max_bytes: int) -> bytes:
     if len(encoded) > max_bytes:
         raise ValueError("OPA request exceeded byte limit")
     return encoded
+
+
+def _structured_controls(result: Mapping[str, Any]) -> tuple[DecisionControl, ...]:
+    """Parse only the documented machine-readable OPA explanation contract."""
+
+    if "decision_explanation" not in result:
+        return ()
+    explanation = result["decision_explanation"]
+    if not isinstance(explanation, Mapping) or set(explanation) != {"controls"}:
+        raise ValueError("OPA decision_explanation must contain only controls")
+    raw_controls = explanation["controls"]
+    if not isinstance(raw_controls, list):
+        raise ValueError("OPA decision_explanation controls must be a list")
+    try:
+        return tuple(DecisionControl.from_dict(item) for item in raw_controls)
+    except (DecisionExplanationValidationError, TypeError, ValueError) as exc:
+        raise ValueError("OPA decision_explanation controls are invalid") from exc
+
+
+def _decision_controls_history_data(decision: OPADecision) -> dict[str, object]:
+    if decision.controls:
+        return decision_controls_history_data(decision.controls)
+    return unavailable_decision_controls_history_data()
 
 
 def _safe_headers(headers: Mapping[str, str]) -> dict[str, str]:

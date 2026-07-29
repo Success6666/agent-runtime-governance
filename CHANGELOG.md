@@ -4,6 +4,20 @@ All notable changes are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- Detached, canonical v1 policy-decision explanation attachments bound to the
+  action and policy identities, with privacy-safe ordered control results and
+  optional Evidence Bundle references. Python, YAML, rule, and explicitly
+  structured OPA policy paths can project the attachment without recording raw
+  inputs or free-text remote reasons.
+- Offline decision-explanation verification, an inspect command, and
+  read-only comparison for already verified attachments of the same action.
+  The comparison is separate from runtime policy-drift replay and does not
+  execute tools or redefine the v0.8 receipt-verification protocol.
+- A committed paired projection-versus-verification benchmark and budget for
+  the attachment path on the recorded Windows/Python 3.14 host.
+
 ## [0.8.1] - 2026-07-29
 
 ### Fixed
@@ -466,7 +480,7 @@ All notable changes are documented here.
 - Redacted JSONL audit records with optional HMAC verification.
 - Basic trace replay, LangGraph integration example, tests, and CI.
 
-[Unreleased]: https://github.com/Success6666/agent-runtime-governance/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/Success6666/agent-runtime-governance/compare/v0.8.1...HEAD
 [0.8.1]: https://github.com/Success6666/agent-runtime-governance/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/Success6666/agent-runtime-governance/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/Success6666/agent-runtime-governance/compare/v0.6.0...v0.7.0

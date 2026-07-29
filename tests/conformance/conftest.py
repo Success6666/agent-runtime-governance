@@ -12,6 +12,7 @@ import pytest
 from agent_runtime_governance import (
     ActionContract,
     AuditMiddleware,
+    DecisionExplanationAttachment,
     DecisionMiddleware,
     EvidenceBundle,
     EvidenceExecution,
@@ -28,6 +29,7 @@ from agent_runtime_governance import (
     SQLiteAuditSink,
     StaticIdentityProvider,
     VerifiedPrincipal,
+    verify_decision_explanation_document,
 )
 from agent_runtime_governance.decisions import DecisionOutcome, DecisionRecord
 
@@ -133,6 +135,9 @@ class ConformanceObservation:
     policy_digest: str | None
     safe_action: dict[str, Any]
     safe_evidence: dict[str, Any] | None
+    decision_explanation: dict[str, Any]
+    decision_explanation_digest: str
+    decision_explanation_report: dict[str, Any]
     context_snapshot: dict[str, Any]
     audit_records: tuple[dict[str, Any], ...]
     evidence_bytes: str | None
@@ -160,6 +165,9 @@ class ConformanceObservation:
                 "policy_digest": self.policy_digest,
                 "safe_action": self.safe_action,
                 "safe_evidence": self.safe_evidence,
+                "decision_explanation": self.decision_explanation,
+                "decision_explanation_digest": self.decision_explanation_digest,
+                "decision_explanation_report": self.decision_explanation_report,
                 "context_snapshot": self.context_snapshot,
                 "audit_records": list(self.audit_records),
                 "evidence_bytes": self.evidence_bytes,
@@ -191,6 +199,9 @@ class ConformanceObservation:
             policy_digest=data["policy_digest"],
             safe_action=data["safe_action"],
             safe_evidence=data["safe_evidence"],
+            decision_explanation=data["decision_explanation"],
+            decision_explanation_digest=data["decision_explanation_digest"],
+            decision_explanation_report=data["decision_explanation_report"],
             context_snapshot=data["context_snapshot"],
             audit_records=tuple(data["audit_records"]),
             evidence_bytes=data["evidence_bytes"],
@@ -301,6 +312,14 @@ class ConformanceHarness:
             if value is not None
             else (None, None, None, None)
         )
+        decision_explanation = DecisionExplanationAttachment.from_context(context)
+        decision_explanation_document = decision_explanation.to_dict()
+        decision_explanation_report = verify_decision_explanation_document(
+            decision_explanation_document,
+            expected_action_digest=context.bound_action.action_digest,
+            expected_policy_version="fixture-policy-v1",
+            expected_policy_digest=_TRUSTED_POLICY_DIGEST,
+        )
         executions_before_replay = len(self._executions)
         replayed = await self._runtime.areplay(context)
         assert len(self._executions) == executions_before_replay
@@ -320,6 +339,9 @@ class ConformanceHarness:
             policy_digest=context.metadata.get("policy_digest"),
             safe_action=context.bound_action.to_evidence_dict(),
             safe_evidence=safe_evidence,
+            decision_explanation=decision_explanation_document,
+            decision_explanation_digest=decision_explanation.attachment_digest,
+            decision_explanation_report=decision_explanation_report,
             context_snapshot=_safe_context_snapshot(context),
             audit_records=tuple(_safe_audit_record(event) for event in audit_events),
             evidence_bytes=evidence_bytes,
@@ -584,6 +606,23 @@ def _assert_protected_semantics(
     assert observation.parameters_digest == observation.safe_action["parameters_digest"]
     assert "parameters" not in observation.safe_action
     assert "caller-secret" not in json.dumps(observation.safe_action, sort_keys=True)
+    assert (
+        DecisionExplanationAttachment.from_dict(
+            observation.decision_explanation
+        ).attachment_digest
+        == observation.decision_explanation_digest
+    )
+    assert observation.decision_explanation["action_digest"] == observation.action_digest
+    assert observation.decision_explanation["policy_version"] == "fixture-policy-v1"
+    assert observation.decision_explanation["policy_digest"] == _TRUSTED_POLICY_DIGEST
+    assert observation.decision_explanation_report["integrity"]["ok"] is True
+    assert observation.decision_explanation_report["binding"]["ok"] is True
+    assert observation.decision_explanation["final_decision"] == (
+        "deny" if case.name == "policy_denied" else "allow"
+    )
+    assert "caller-secret" not in json.dumps(
+        observation.decision_explanation, sort_keys=True
+    )
     assert observation.audit_safe is True
     assert observation.context_snapshot["status"] == case.expected_status
     assert observation.context_snapshot["bound_action"] == observation.safe_action

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import json
 import math
+from pathlib import Path
 
 import pytest
 
 from scripts.check_benchmark_budget import evaluate
+
+_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _result(candidate_mean: float = 2.0) -> dict:
@@ -282,3 +286,21 @@ def test_extension_dispatch_budget_rejects_missing_or_invalid_ratio_limits() -> 
     assert evaluate(_dispatch_result(), budget) == [
         "dispatch ratio limits must be objects at 5 ms / 1 concurrency"
     ]
+
+
+def test_v090_decision_explanation_measurement_meets_its_recorded_budget() -> None:
+    result = json.loads(
+        (_ROOT / "benchmarks" / "results" / "v0.9.0-windows-python314.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    budget = json.loads(
+        (
+            _ROOT
+            / "benchmarks"
+            / "budgets"
+            / "v0.9.0-decision-explanations.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert evaluate(result, budget) == []

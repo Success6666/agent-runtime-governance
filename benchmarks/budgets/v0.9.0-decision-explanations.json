@@ -1,0 +1,13 @@
+{
+  "comparison": {
+    "baseline": "attachment_projection",
+    "candidate": "attachment_projection_and_verification"
+  },
+  "limits": {
+    "mean_ms_ratio": 13.0,
+    "p95_ms_ratio": 13.0,
+    "p99_ms_ratio": 12.0,
+    "peak_memory_kib_ratio": 1.2
+  },
+  "minimum_requests": 1000
+}

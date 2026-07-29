@@ -1,3 +1,6 @@
+from importlib import import_module
+from typing import TYPE_CHECKING
+
 from ._sqlite import (
     SQLiteJournalCapabilities,
     SQLiteJournalModeError,
@@ -23,6 +26,13 @@ from .context import (
     ToolCall,
 )
 from .debugger import DiffEntry, ReplayDebugger, diff_values
+from .decision_explanations import (
+    DECISION_EXPLANATION_ATTACHMENT_SCHEMA_V1,
+    DecisionControl,
+    DecisionExplanationAttachment,
+    DecisionExplanationValidationError,
+    controls_from_context,
+)
 from .decisions import (
     ApprovalRequest,
     DecisionOutcome,
@@ -219,7 +229,39 @@ from .telemetry import OpenTelemetryMiddleware
 from .visualization import trace_to_mermaid
 from .yaml_policy import PolicyDocument, PolicyValidationError, YAMLPolicyLoader
 
-__version__ = "0.8.1"
+if TYPE_CHECKING:
+    from .verify import (
+        DecisionExplanationComparison,
+        DecisionExplanationDifference,
+        DecisionExplanationVerificationError,
+        VerifiedDecisionExplanation,
+        compare_verified_decision_explanations,
+        verify_decision_explanation,
+        verify_decision_explanation_document,
+    )
+
+__version__ = "0.9.0"
+
+_LAZY_VERIFY_EXPORTS = frozenset(
+    {
+        "DecisionExplanationComparison",
+        "DecisionExplanationDifference",
+        "DecisionExplanationVerificationError",
+        "VerifiedDecisionExplanation",
+        "compare_verified_decision_explanations",
+        "verify_decision_explanation",
+        "verify_decision_explanation_document",
+    }
+)
+
+
+def __getattr__(name: str) -> object:
+    """Load verification exports without preloading the verifier CLI module."""
+    if name not in _LAZY_VERIFY_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(".verify", __name__), name)
+    globals()[name] = value
+    return value
 
 __all__ = [
     "ActionContract",
@@ -247,6 +289,12 @@ __all__ = [
     "CircuitOpenError",
     "CircuitState",
     "DecisionMiddleware",
+    "DecisionControl",
+    "DecisionExplanationAttachment",
+    "DecisionExplanationComparison",
+    "DecisionExplanationDifference",
+    "DecisionExplanationValidationError",
+    "DecisionExplanationVerificationError",
     "DecisionOutcome",
     "DecisionProvider",
     "DecisionRecord",
@@ -257,6 +305,7 @@ __all__ = [
     "ExecutionMode",
     "ExecutionStatus",
     "EVIDENCE_BUNDLE_SCHEMA_V1",
+    "DECISION_EXPLANATION_ATTACHMENT_SCHEMA_V1",
     "EVIDENCE_SIGNATURE_ATTACHMENT_SCHEMA_V1",
     "EVIDENCE_TRUST_ROOTS_SCHEMA_V1",
     "Ed25519EvidenceSigner",
@@ -402,9 +451,12 @@ __all__ = [
     "ToolExecutionError",
     "UnknownAction",
     "UnsupportedReceiptVerifier",
+    "VerifiedDecisionExplanation",
     "VerifiedPrincipal",
     "YAMLPolicyLoader",
     "diff_values",
+    "compare_verified_decision_explanations",
+    "controls_from_context",
     "trace_to_mermaid",
     "IdempotencyConflictError",
     "IdempotencyAlreadyAppliedError",
@@ -415,6 +467,8 @@ __all__ = [
     "idempotency_namespace_digest",
     "new_execution_record_id",
     "tenant_partition_digest",
+    "verify_decision_explanation",
+    "verify_decision_explanation_document",
     "sqlite_journal_capabilities",
     "sqlite_wal_is_safe",
     "sign_evidence_bundle",
