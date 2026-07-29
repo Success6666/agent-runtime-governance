@@ -228,8 +228,9 @@ and replay consumers. It publishes only frozen, versioned allowlist projections:
 the tool identity, terminal status, approval state, cancellation marker, and
 bound-action digests. It never exposes a live `Runtime` or `ExecutionContext`,
 nor raw user or tenant values, input, parameters, result, approval reason, or
-provider receipt. Consumer delivery is non-authoritative and uses the
-Runtime-owned async-first extension dispatcher.
+provider receipt. Consumer delivery is non-authoritative: native async
+consumers use the Runtime-owned async-first extension boundary, while
+synchronous consumers use isolated bounded best-effort delivery.
 
 Policy documents expose a formatting-independent semantic digest and an exact
 artifact-byte digest. Strict production identity uses the artifact digest;

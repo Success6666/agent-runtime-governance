@@ -184,7 +184,13 @@ class RuntimeEventStream:
     __slots__ = ("_hub",)
 
     def __init__(self, hub: "_RuntimeEventHub") -> None:
-        self._hub = hub
+        object.__setattr__(self, "_hub", hub)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError("RuntimeEventStream is immutable")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("RuntimeEventStream is immutable")
 
     def subscribe(self, subscriber: RuntimeEventSubscriber) -> RuntimeEventSubscription:
         """Subscribe a detached event consumer without exposing ``Runtime``."""

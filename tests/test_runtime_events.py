@@ -274,6 +274,7 @@ async def test_runtime_event_subscribers_cannot_reenter_their_runtime() -> None:
     async_errors: list[str] = []
     preview_errors: list[str] = []
     sync_errors: list[str] = []
+    sync_awaitable_errors: list[str] = []
     observed: list[RuntimeEvent] = []
     calls: list[str] = []
 
@@ -292,13 +293,23 @@ async def test_runtime_event_subscribers_cannot_reenter_their_runtime() -> None:
         else:
             preview_errors.append("accepted")
 
-    def reenter_sync(_event: RuntimeEvent) -> None:
+    def reenter_sync(_event: RuntimeEvent) -> Any:
         try:
             runtime.invoke("work")
         except RuntimeError as exc:
             sync_errors.append(str(exc))
         else:
             sync_errors.append("accepted")
+
+        async def reenter_from_awaitable() -> None:
+            try:
+                await runtime.ainvoke("work")
+            except RuntimeError as exc:
+                sync_awaitable_errors.append(str(exc))
+            else:
+                sync_awaitable_errors.append("accepted")
+
+        return reenter_from_awaitable()
 
     runtime = Runtime(
         event_subscribers=(reenter_async, reenter_sync, observed.append)
@@ -316,6 +327,7 @@ async def test_runtime_event_subscribers_cannot_reenter_their_runtime() -> None:
                 len(async_errors)
                 == len(preview_errors)
                 == len(sync_errors)
+                == len(sync_awaitable_errors)
                 == len(observed)
                 == 1
             )
@@ -324,6 +336,7 @@ async def test_runtime_event_subscribers_cannot_reenter_their_runtime() -> None:
         assert "runtime event subscriber" in async_errors[0]
         assert "runtime event subscriber" in preview_errors[0]
         assert "runtime event subscriber" in sync_errors[0]
+        assert "runtime event subscriber" in sync_awaitable_errors[0]
     finally:
         await runtime.aclose()
 
@@ -416,21 +429,108 @@ async def test_unsubscribed_runtime_event_consumer_does_not_block_sync_close() -
 
 
 @pytest.mark.asyncio
-async def test_sync_runtime_event_subscriber_uses_owned_extension_dispatcher() -> None:
+async def test_runtime_event_stream_cannot_be_rebound() -> None:
+    runtime = Runtime()
+
+    try:
+        with pytest.raises(AttributeError, match="RuntimeEventStream is immutable"):
+            runtime.events._hub = object()  # type: ignore[misc, assignment]
+        with pytest.raises(AttributeError, match="RuntimeEventStream is immutable"):
+            del runtime.events._hub
+    finally:
+        await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_sync_runtime_event_subscriber_uses_isolated_daemon_dispatcher() -> None:
     entered = threading.Event()
     release = threading.Event()
-    worker_names: list[str] = []
+    later_subscriber_called = asyncio.Event()
+    event_worker_names: list[str] = []
+    extension_worker_names: list[str] = []
     runtime = Runtime(
         limits=RuntimeLimits(
+            observer_timeout_seconds=0.05,
+            cancellation_grace_seconds=0.01,
             max_blocking_extension_workers=1,
             max_blocking_extension_in_flight=1,
         )
     )
 
     def block(_event: RuntimeEvent) -> None:
-        worker_names.append(threading.current_thread().name)
+        event_worker_names.append(threading.current_thread().name)
         entered.set()
         assert release.wait(timeout=1)
+
+    def governance_extension() -> str:
+        extension_worker_names.append(threading.current_thread().name)
+        return "governance extension"
+
+    async def later_subscriber(_event: RuntimeEvent) -> None:
+        later_subscriber_called.set()
+
+    runtime.events.subscribe(block)
+    runtime.events.subscribe(later_subscriber)
+
+    @runtime.tool()
+    def work() -> str:
+        return "ok"
+
+    try:
+        assert await runtime.ainvoke("work") == "ok"
+        await asyncio.wait_for(asyncio.to_thread(entered.wait, 1), timeout=1.1)
+        assert event_worker_names and event_worker_names[0].startswith(
+            "arg-runtime-event"
+        )
+        assert await runtime.ainvoke("work") == "ok"
+        await asyncio.wait_for(later_subscriber_called.wait(), timeout=0.2)
+        assert len(event_worker_names) == 1
+        assert (
+            await asyncio.wait_for(runtime._invoke_extension(governance_extension), 0.2)
+            == "governance extension"
+        )
+        assert extension_worker_names and extension_worker_names[0].startswith(
+            "arg-extension"
+        )
+
+        await asyncio.wait_for(runtime.aclose(), timeout=0.5)
+        release.set()
+        await _wait_until(
+            lambda: not runtime._runtime_event_executor._threads,
+            timeout_seconds=0.5,
+        )
+        assert len(event_worker_names) == 1
+    finally:
+        release.set()
+        if not runtime._closed:
+            await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_timed_out_sync_runtime_event_subscriber_discards_late_coroutine() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    late_coroutine: Any = None
+    late_coroutine_started = False
+    runtime = Runtime(
+        limits=RuntimeLimits(
+            observer_timeout_seconds=0.02,
+            cancellation_grace_seconds=0.01,
+        )
+    )
+
+    def block(_event: RuntimeEvent) -> Any:
+        nonlocal late_coroutine, late_coroutine_started
+        entered.set()
+        assert release.wait(timeout=1)
+
+        async def late_result() -> None:
+            nonlocal late_coroutine_started
+            late_coroutine_started = True
+            return None
+
+        late_coroutine = late_result()
+        return late_coroutine
 
     runtime.events.subscribe(block)
 
@@ -441,14 +541,19 @@ async def test_sync_runtime_event_subscriber_uses_owned_extension_dispatcher() -
     try:
         assert await runtime.ainvoke("work") == "ok"
         await asyncio.wait_for(asyncio.to_thread(entered.wait, 1), timeout=1.1)
-        assert worker_names and worker_names[0].startswith("arg-extension")
-
-        closing = asyncio.create_task(runtime.aclose())
-        await asyncio.sleep(0.02)
-        assert not closing.done()
+        await asyncio.wait_for(runtime.aclose(), timeout=0.5)
         release.set()
-        await closing
+        await _wait_until(
+            lambda: not runtime._runtime_event_executor._threads,
+            timeout_seconds=0.5,
+        )
+        assert late_coroutine is not None
+        with pytest.raises(RuntimeError):
+            late_coroutine.send(None)
+        assert not late_coroutine_started
     finally:
         release.set()
+        if late_coroutine is not None:
+            late_coroutine.close()
         if not runtime._closed:
             await runtime.aclose()

@@ -11,7 +11,7 @@ from contextvars import ContextVar, Token, copy_context
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import partial
-from threading import Event, Lock, Thread, current_thread
+from threading import BoundedSemaphore, Event, Lock, Thread, current_thread
 from time import perf_counter
 from typing import Any, Awaitable, Callable, Iterable, Mapping, ParamSpec, TypeVar
 from uuid import uuid4
@@ -38,7 +38,10 @@ from ._internal.runtime.context_boundaries import validate_middleware_transition
 from ._internal.runtime.daemon_executor import DaemonThreadPoolExecutor
 from ._internal.runtime.extensions import (
     ExtensionDispatchSnapshot,
+    _discard_unawaited_result,
     _ExtensionDispatcher,
+    is_native_async_callable,
+    resolve_extension_result,
 )
 from ._internal.runtime.metadata import metadata_text as _metadata_text
 from ._internal.runtime.pipeline_runner import PipelineRunner
@@ -302,6 +305,11 @@ class Runtime:
         self._runtime_event_hub = _RuntimeEventHub(event_subscribers)
         self._event_stream = RuntimeEventStream(self._runtime_event_hub)
         self.limits = limits or RuntimeLimits()
+        self._runtime_event_executor = DaemonThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="arg-runtime-event",
+        )
+        self._runtime_event_sync_slot = BoundedSemaphore(value=1)
         self._lifecycle_lock = Lock()
         self._closing = False
         self._closed = False
@@ -924,9 +932,42 @@ class Runtime:
             _EVENT_DELIVERY_RUNTIME_IDS.get() | frozenset({id(self)})
         )
         try:
-            return await self._invoke_extension(subscriber, event)
+            return await await_stage(
+                self._dispatch_runtime_event_subscriber(subscriber, event),
+                stage="runtime event subscriber",
+                timeout_seconds=self.limits.observer_timeout_seconds,
+                cancellation_grace_seconds=self.limits.cancellation_grace_seconds,
+            )
         finally:
             _EVENT_DELIVERY_RUNTIME_IDS.reset(token)
+
+    async def _dispatch_runtime_event_subscriber(
+        self,
+        subscriber: RuntimeEventSubscriber,
+        event: RuntimeEvent,
+    ) -> Any:
+        """Deliver one best-effort event without consuming governance capacity."""
+
+        if is_native_async_callable(subscriber):
+            return await self._invoke_extension(subscriber, event)
+        event_sync_slot = self._runtime_event_sync_slot
+        if not event_sync_slot.acquire(blocking=False):
+            return None
+        try:
+            future = self._runtime_event_executor.submit(
+                copy_context().run, subscriber, event
+            )
+        except BaseException:
+            event_sync_slot.release()
+            raise
+        future.add_done_callback(lambda _completed: event_sync_slot.release())
+        try:
+            value = await asyncio.wrap_future(future)
+        except asyncio.CancelledError:
+            if not future.cancel():
+                future.add_done_callback(_discard_unawaited_result)
+            raise
+        return await resolve_extension_result(value)
 
     def _forget_detached_stage(self, task: asyncio.Future[Any]) -> None:
         with self._lifecycle_lock:
@@ -964,6 +1005,10 @@ class Runtime:
     def _shutdown_executors(self, *, wait: bool) -> None:
         with self._production_seal_lock:
             self._detach_extension_dispatch_metrics()
+        # Runtime events are best-effort observer delivery. A subscriber may
+        # block forever, so it cannot own a non-daemon worker or hold process
+        # shutdown after its delivery task has been abandoned.
+        self._runtime_event_executor.shutdown(wait=False, cancel_futures=True)
         if self._owns_reconciliation_audit_executor:
             # A synchronous third-party sink cannot be force-cancelled once it
             # has entered a blocking write. This dedicated executor has daemon
