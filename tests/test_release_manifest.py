@@ -22,6 +22,8 @@ SERVICE_IMAGES = {
     "opa": "openpolicyagent/opa@sha256:" + "1" * 64,
     "otel": "otel/opentelemetry-collector-contrib@sha256:" + "2" * 64,
 }
+V070_PACKAGE_VERSION = "0.7.0"
+V070_RELEASE_TAG = f"v{V070_PACKAGE_VERSION}"
 CURRENT_RELEASE_TAG = f"v{__version__}"
 
 
@@ -43,7 +45,11 @@ def release_manifest() -> ModuleType:
     return _load_release_manifest()
 
 
-def _write_release_inputs(root: Path, *, package_version: str = "0.7.0") -> None:
+def _write_release_inputs(
+    root: Path,
+    *,
+    artifact_package_version: str = V070_PACKAGE_VERSION,
+) -> None:
     evidence = root / "release-evidence"
     dist = root / "dist"
     evidence.mkdir()
@@ -76,19 +82,21 @@ def _write_release_inputs(root: Path, *, package_version: str = "0.7.0") -> None
         json.dumps([{"name": "example", "version": "1.0", "vulns": []}]),
         encoding="utf-8",
     )
-    (dist / f"agent_runtime_governance-{package_version}-py3-none-any.whl").write_bytes(
+    (dist / f"agent_runtime_governance-{artifact_package_version}-py3-none-any.whl").write_bytes(
         b"wheel"
     )
-    (dist / f"agent_runtime_governance-{package_version}.tar.gz").write_bytes(b"sdist")
+    (dist / f"agent_runtime_governance-{artifact_package_version}.tar.gz").write_bytes(
+        b"sdist"
+    )
     (dist / "sbom.spdx.json").write_text("{}\n", encoding="utf-8")
 
 
 def _manifest(release_manifest: ModuleType, root: Path) -> dict[str, Any]:
     return release_manifest.generate_manifest(
         root,
-        release_tag="v0.7.0",
+        release_tag=V070_RELEASE_TAG,
         source_commit=SOURCE_COMMIT,
-        package_version="0.7.0",
+        package_version=V070_PACKAGE_VERSION,
         service_images=SERVICE_IMAGES,
     )
 
@@ -444,13 +452,13 @@ def test_rejects_manifest_not_bound_to_the_trusted_release_source(
             document,
             root=tmp_path,
             service_images=SERVICE_IMAGES,
-            expected_release_tag="v0.7.0",
+            expected_release_tag=V070_RELEASE_TAG,
             expected_source_commit="b" * 40,
         )
 
 
 def test_cli_records_generates_and_validates_manifest(tmp_path: Path) -> None:
-    _write_release_inputs(tmp_path, package_version=__version__)
+    _write_release_inputs(tmp_path, artifact_package_version=__version__)
     record = subprocess.run(
         [
             sys.executable,
