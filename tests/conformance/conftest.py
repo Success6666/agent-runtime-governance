@@ -617,9 +617,13 @@ def _assert_protected_semantics(
     assert observation.decision_explanation["policy_digest"] == _TRUSTED_POLICY_DIGEST
     assert observation.decision_explanation_report["integrity"]["ok"] is True
     assert observation.decision_explanation_report["binding"]["ok"] is True
-    assert observation.decision_explanation["final_decision"] == (
-        "deny" if case.name == "policy_denied" else "allow"
+    expected_final_decision = (
+        "deny"
+        if case.expected_decision == "deny"
+        and case.expected_decision_source != "human"
+        else "allow"
     )
+    assert observation.decision_explanation["final_decision"] == expected_final_decision
     assert "caller-secret" not in json.dumps(
         observation.decision_explanation, sort_keys=True
     )

@@ -17,6 +17,7 @@ from agent_runtime_governance import (
     DecisionControl,
     DecisionExplanationAttachment,
     DecisionExplanationValidationError,
+    DecisionExplanationVerificationError,
     EvidenceBundle,
     EvidenceExecution,
     ExecutionContext,
@@ -39,6 +40,7 @@ from agent_runtime_governance import (
     verify_decision_explanation,
     verify_decision_explanation_document,
 )
+from agent_runtime_governance.inspect import main as inspect_main
 from agent_runtime_governance.verify import verify_evidence_bundle_document
 
 _IDENTITY_KEY = b"0123456789abcdef0123456789abcdef"
@@ -165,6 +167,11 @@ class _OPAClient:
         return self._decision
 
 
+class _FailingOPAClient:
+    def evaluate(self, _context: ExecutionContext) -> OPADecision:
+        raise RuntimeError("provider unavailable")
+
+
 @pytest.mark.asyncio
 async def test_opa_requires_explicit_structured_controls_for_an_attachment() -> None:
     action = _action()
@@ -197,6 +204,17 @@ async def test_opa_requires_explicit_structured_controls_for_an_attachment() -> 
         policy_digest=_POLICY_DIGEST,
     )
     context = await plain.process(_context(action))
+    with pytest.raises(DecisionExplanationValidationError, match="controls"):
+        DecisionExplanationAttachment.from_context(context)
+
+    fail_open = OPAMiddleware(
+        _FailingOPAClient(),
+        fail_closed=False,
+        policy_version="policy-v1",
+        policy_digest=_POLICY_DIGEST,
+    )
+    context = await fail_open.process(_context(action))
+    assert context.history[-1].data["decision_explanation_unavailable"] is True
     with pytest.raises(DecisionExplanationValidationError, match="controls"):
         DecisionExplanationAttachment.from_context(context)
 
@@ -243,6 +261,44 @@ async def test_attachment_rejects_reordering_tampering_and_policy_substitution()
     }
 
 
+def test_attachment_validation_rejects_invalid_values_and_ambiguous_controls() -> None:
+    action = _action()
+    allow = DecisionControl(
+        control_id="policy.allow",
+        control_version=1,
+        effect="allow",
+        result="matched",
+        reason_code="policy_allowed",
+    )
+    common = {
+        "action_digest": action.action_digest,
+        "policy_version": "policy-v1",
+        "policy_digest": _POLICY_DIGEST,
+        "final_decision": "allow",
+        "risk_tier": "LOW",
+        "requires_approval": False,
+        "controls": (allow,),
+    }
+
+    with pytest.raises(DecisionExplanationValidationError, match="object"):
+        DecisionControl.from_dict("not-a-control")  # type: ignore[arg-type]
+    with pytest.raises(DecisionExplanationValidationError, match="final_decision"):
+        DecisionExplanationAttachment(**{**common, "final_decision": "pending"})
+    with pytest.raises(DecisionExplanationValidationError, match="risk_tier"):
+        DecisionExplanationAttachment(**{**common, "risk_tier": "UNSET"})
+    with pytest.raises(DecisionExplanationValidationError, match="boolean"):
+        DecisionExplanationAttachment(**{**common, "requires_approval": 1})
+    with pytest.raises(DecisionExplanationValidationError, match="duplicates"):
+        DecisionExplanationAttachment.from_context(
+            _context(action), controls=(allow, allow)
+        )
+
+    attachment = DecisionExplanationAttachment.from_context(
+        _context(action), controls=(allow,)
+    )
+    assert attachment.digest == attachment.attachment_digest
+
+
 @pytest.mark.asyncio
 async def test_attachment_rejects_recorded_policy_identity_drift() -> None:
     context = await PolicyMiddleware(
@@ -277,6 +333,17 @@ async def test_comparison_only_accepts_verified_same_action_attachments() -> Non
         compare_verified_decision_explanations(
             verify_decision_explanation(baseline), verify_decision_explanation(other)
         )
+    with pytest.raises(TypeError, match="verified"):
+        compare_verified_decision_explanations(object(), object())  # type: ignore[arg-type]
+
+    invalid = verify_decision_explanation_document({"schema_version": "1"})
+    assert invalid["integrity"]["state"] == "failed"
+    bad_expectation = verify_decision_explanation_document(
+        baseline.to_dict(), expected_attachment_digest="not-a-digest"
+    )
+    assert bad_expectation["integrity"]["reasons"] == [
+        "expected_attachment_digest_invalid"
+    ]
 
 
 @pytest.mark.asyncio
@@ -309,6 +376,22 @@ async def test_inspect_command_only_renders_a_verified_attachment(tmp_path: Path
     assert "Decision explanation verification: passed" in completed.stdout
     assert f"Action digest: {action.action_digest}" in completed.stdout
     assert "secret input" not in completed.stdout
+
+    assert inspect_main(
+        [
+            str(path),
+            "--expected-attachment-digest",
+            attachment.attachment_digest,
+        ]
+    ) == 0
+    assert inspect_main(
+        [
+            str(path),
+            "--expected-action-digest",
+            "b" * 64,
+        ]
+    ) == 1
+    assert inspect_main([]) == 2
 
 
 @pytest.mark.asyncio
@@ -422,3 +505,25 @@ async def test_comparison_has_no_runtime_or_tool_side_effect(
     )
 
     assert comparison.matches is False
+
+
+@pytest.mark.asyncio
+async def test_verification_and_rule_construction_fail_closed_for_invalid_inputs() -> None:
+    action = _action()
+    context = await PolicyMiddleware(
+        SimplePolicy(), version="policy-v1", digest=_POLICY_DIGEST
+    ).process(_context(action))
+    attachment = DecisionExplanationAttachment.from_context(context)
+
+    with pytest.raises(DecisionExplanationVerificationError, match="failed"):
+        verify_decision_explanation(
+            attachment,
+            expected_action_digest="b" * 64,
+        )
+    with pytest.raises(ValueError, match="unique"):
+        RuleMiddleware(
+            [
+                Rule("duplicate", "first", "first reason"),
+                Rule("duplicate", "second", "second reason"),
+            ]
+        )

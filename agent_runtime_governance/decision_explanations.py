@@ -290,9 +290,8 @@ class DecisionExplanationAttachment:
     def canonical_bytes(self) -> bytes:
         """Return the RFC 8785 bytes committed by :attr:`attachment_digest`."""
 
-        self._validate_for_serialization()
         try:
-            return rfc8785_json_bytes(self.to_dict())
+            return rfc8785_json_bytes(self.to_dict_unchecked())
         except CanonicalJsonError as exc:
             raise DecisionExplanationValidationError(
                 "attachment is not RFC 8785 canonicalizable"
@@ -304,19 +303,9 @@ class DecisionExplanationAttachment:
         return _ATTACHMENT_DOMAIN + self.canonical_bytes()
 
     def to_dict(self) -> dict[str, Any]:
-        document = {
-            "schema_version": self.schema_version,
-            "action_digest": self.action_digest,
-            "evidence_bundle_digest": self.evidence_bundle_digest,
-            "policy_version": self.policy_version,
-            "policy_digest": self.policy_digest,
-            "final_decision": self.final_decision,
-            "risk_tier": self.risk_tier,
-            "requires_approval": self.requires_approval,
-            "controls": [item.to_dict() for item in self.controls],
-        }
-        self._validate_for_serialization(document)
-        return document
+        """Return the already-validated closed v1 representation."""
+
+        return self.to_dict_unchecked()
 
     def _validate_for_serialization(
         self, document: dict[str, Any] | None = None

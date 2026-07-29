@@ -26,11 +26,15 @@ class RuleMiddleware(GatingMiddleware):
     name = "rule"
 
     def __init__(self, rules: list[Rule] | tuple[Rule, ...]) -> None:
+        names = [rule.name for rule in rules]
+        if len(set(names)) != len(names):
+            raise ValueError("rule names must be unique")
         self._rules = tuple((rule, rule.compiled()) for rule in rules)
 
     async def process(self, context: ExecutionContext) -> ExecutionContext:
         controls: list[DecisionControl] = []
         for rule, pattern in self._rules:
+            matched = pattern.search(context.input_text) is not None
             control = DecisionControl(
                 control_id=(
                     "rule."
@@ -38,8 +42,8 @@ class RuleMiddleware(GatingMiddleware):
                 ),
                 control_version=1,
                 effect="deny",
-                result="matched" if pattern.search(context.input_text) else "not_matched",
-                reason_code="rule_matched" if pattern.search(context.input_text) else "rule_not_matched",
+                result="matched" if matched else "not_matched",
+                reason_code="rule_matched" if matched else "rule_not_matched",
             )
             controls.append(control)
             if control.result == "matched":
