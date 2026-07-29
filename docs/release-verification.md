@@ -23,6 +23,20 @@ The workflow runs after GitHub records a published release, so a missing or
 invalid manifest blocks release assets and PyPI publication. It does not claim
 to retract an already-created GitHub Release object.
 
+## v0.8.0 (withdrawn before distribution)
+
+The v0.8.0 GitHub Release was created on 2026-07-29 (UTC) from protected
+`main` commit `f9bb37f15036080dd6f3301fd49f9e7ac837f98d`. Its
+[release-artifact workflow](https://github.com/Success6666/agent-runtime-governance/actions/runs/30449591555)
+passed its preceding release-verification test, isolated dependency-audit,
+package-build, isolated-install, and SBOM steps, but the manifest rejected a
+skipped local root-package audit entry. No package asset, checksum, SBOM,
+manifest, or provenance was attached, and no PyPI distribution was published.
+
+The GitHub Release is retained as a withdrawn prerelease rather than being
+rewritten. The corrective verification path and v0.8.1 replacement release are
+tracked in [#89](https://github.com/Success6666/agent-runtime-governance/issues/89).
+
 ## v0.7.0
 
 v0.7.0 was released on 2026-07-27 (UTC) from protected `main` commit
