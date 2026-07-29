@@ -1189,7 +1189,7 @@ async def test_late_provider_result_is_discarded_and_provider_is_poisoned(
     ) -> ReconciliationFinding:
         entered.set()
         try:
-            await asyncio.sleep(1)
+            await asyncio.Event().wait()
         except asyncio.CancelledError:
             await asyncio.sleep(0.03)
             late_results.append(context.attempt_id)
@@ -1206,7 +1206,7 @@ async def test_late_provider_result_is_discarded_and_provider_is_poisoned(
     runtime = _runtime(
         path,
         limits=RuntimeLimits(
-            reconciliation_provider_timeout_seconds=0.25,
+            reconciliation_provider_timeout_seconds=1.0,
             cancellation_grace_seconds=0.005,
         ),
     )
@@ -1230,9 +1230,10 @@ async def test_late_provider_result_is_discarded_and_provider_is_poisoned(
                 "charge", _governance=InvocationOptions(idempotency_key="request-1")
             )
         execution_record_id = failed.value.context.metadata["execution_record_id"]
-        first = await runtime.areconcile(execution_record_id)
+        reconciliation = asyncio.create_task(runtime.areconcile(execution_record_id))
+        await asyncio.wait_for(entered.wait(), timeout=2.0)
+        first = await reconciliation
         assert first.state is ReconciliationState.UNKNOWN
-        await asyncio.wait_for(entered.wait(), timeout=0.2)
         await asyncio.wait_for(late_result_observed.wait(), timeout=3.0)
         assert late_results
         assert runtime.reconciliation_ledger.current(  # type: ignore[union-attr]
@@ -1672,10 +1673,11 @@ async def test_caller_deadline_expiry_still_finishes_started_attempt(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "deadline-finalization.db"
+    entered = asyncio.Event()
     runtime = _runtime(
         path,
         limits=RuntimeLimits(
-            reconciliation_provider_timeout_seconds=1.0,
+            reconciliation_provider_timeout_seconds=2.0,
             reconciliation_finalization_timeout_seconds=0.1,
         ),
     )
@@ -1683,8 +1685,9 @@ async def test_caller_deadline_expiry_still_finishes_started_attempt(
     async def provider(
         context: ReconciliationAttemptContext,
     ) -> ReconciliationFinding:
+        entered.set()
         try:
-            await asyncio.sleep(1)
+            await asyncio.Event().wait()
         except asyncio.CancelledError:
             # Let the original request deadline elapse before the provider
             # acknowledges cancellation. The persisted finish must still use
@@ -1712,13 +1715,22 @@ async def test_caller_deadline_expiry_still_finishes_started_attempt(
         execution_record_id = failed.value.execution_record_id
         assert execution_record_id is not None
 
-        with pytest.raises(StageTimeoutError):
-            await runtime.areconcile(
+        reconciliation = asyncio.create_task(
+            runtime.areconcile(
                 execution_record_id,
-                deadline=datetime.now(timezone.utc) + timedelta(seconds=0.25),
+                deadline=datetime.now(timezone.utc) + timedelta(seconds=1.0),
             )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=2.0)
+        with pytest.raises(StageTimeoutError):
+            await reconciliation
 
         assert runtime.reconciliation_ledger is not None
+        await _wait_until(
+            lambda: len(runtime.reconciliation_ledger.attempts(execution_record_id))
+            == 2,
+            timeout=3.0,
+        )
         attempts = runtime.reconciliation_ledger.attempts(execution_record_id)
         assert len(attempts) == 2
         assert attempts[0].payload["attempt_id"] == attempts[1].payload["attempt_id"]
@@ -2233,15 +2245,15 @@ async def test_cancelling_outbox_delivery_keeps_reconciliation_recoverable(
         sink.completed.clear()
         sink.block = True
         reconciliation = asyncio.create_task(runtime.areconcile(execution_record_id))
-        assert await asyncio.to_thread(sink.entered.wait, 1.0)
+        await _wait_until(sink.entered.is_set, timeout=5.0)
         reconciliation.cancel()
         with pytest.raises(asyncio.CancelledError):
             await reconciliation
 
         sink.block = False
         sink.release.set()
-        assert await asyncio.to_thread(sink.completed.wait, 1.0)
-        await _wait_until(lambda: runtime.reconciliation_ledger_healthy)
+        await _wait_until(sink.completed.is_set, timeout=5.0)
+        await _wait_until(lambda: runtime.reconciliation_ledger_healthy, timeout=5.0)
 
         recovered = await runtime.areconcile(execution_record_id)
         assert recovered.state is ReconciliationState.CONFIRMED_SUCCEEDED
