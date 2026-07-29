@@ -53,10 +53,13 @@ reconciliation state. A human-readable inspect command may only render the
 same verifier report; it must not implement another verifier or contact a
 network service.
 
-Comparison is equally observational. It accepts two verified attachments for
-the same action identity and reports decision, policy, risk, approval, and
-control drift. It never replays a tool, calls an LLM or human provider, or
-creates a new external effect.
+Attachment comparison is equally observational. It accepts two already verified
+attachments for the same action identity and reports decision, policy, risk,
+approval, and control drift; it does not replay inputs or runtimes. The
+existing `PolicyDriftDetector.compare` remains a separate diagnostic mechanism
+that replays contexts through baseline and candidate runtimes. Neither path
+replays a tool, calls an LLM or human provider, or creates a new external
+effect.
 
 ## Consequences
 
