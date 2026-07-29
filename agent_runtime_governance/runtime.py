@@ -2657,7 +2657,7 @@ class Runtime:
 
     async def _drain_reconciliation_audit_outbox(
         self,
-        outbox_operations: Any | None = None,
+        outbox_operations: DurableOperationCapability | None = None,
         *,
         execution_record_id: str | None = None,
         limit: int | None = None,
