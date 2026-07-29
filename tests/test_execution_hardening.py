@@ -13,6 +13,7 @@ from agent_runtime_governance import (
     DecisionOutcome,
     DecisionRecord,
     GatingMiddleware,
+    IdempotencyInProgressError,
     InMemoryIdempotencyStore,
     InvocationOptions,
     RetryMiddleware,
@@ -778,28 +779,69 @@ def test_registered_schema_is_deeply_immutable() -> None:
 @pytest.mark.asyncio
 async def test_sqlite_idempotency_lease_is_renewed_during_long_execution(
     tmp_path,
+    monkeypatch,
 ) -> None:
     store = SQLiteIdempotencyStore(
         tmp_path / "leases.db",
-        lease_seconds=0.06 * LEASE_TIMING_SCALE,
+        lease_seconds=0.25 * LEASE_TIMING_SCALE,
     )
+    renewed = threading.Event()
+    lease_extended = threading.Event()
+    lease_expiries: list[tuple[datetime, datetime]] = []
+    renew = store.renew
+
+    def read_lease_expiry(claim) -> datetime:
+        with store._connect() as connection:
+            row = connection.execute(
+                "SELECT lease_expires_at FROM idempotency_records "
+                "WHERE execution_record_id = ?",
+                (claim.execution_record_id,),
+            ).fetchone()
+        assert row is not None
+        return datetime.fromisoformat(row[0])
+
+    def record_renewal(claim) -> None:
+        before = read_lease_expiry(claim)
+        renew(claim)
+        after = read_lease_expiry(claim)
+        if after > before:
+            lease_expiries.append((before, after))
+            lease_extended.set()
+        renewed.set()
+
+    monkeypatch.setattr(store, "renew", record_renewal)
     runtime = Runtime(idempotency_store=store)
     started = asyncio.Event()
+    release = asyncio.Event()
 
     @runtime.tool(execution_mode=ExecutionMode.IDEMPOTENT)
     async def write() -> str:
         started.set()
-        await asyncio.sleep(0.16 * LEASE_TIMING_SCALE)
+        await release.wait()
         return "ok"
 
     options = InvocationOptions(idempotency_key="long-operation")
     owner = asyncio.create_task(write.ainvoke(_governance=options))
-    await started.wait()
-    await asyncio.sleep(0.09 * LEASE_TIMING_SCALE)
-    with pytest.raises(ToolExecutionError) as caught:
-        await write.ainvoke(_governance=options)
-    assert caught.value.context.status is ExecutionStatus.UNKNOWN
-    assert await owner == "ok"
+    try:
+        await started.wait()
+        assert await asyncio.to_thread(renewed.wait, LEASE_TIMING_SCALE)
+        assert lease_extended.is_set()
+        initial_expiry, _ = lease_expiries[0]
+        remaining = (initial_expiry - datetime.now(timezone.utc)).total_seconds()
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+        with pytest.raises(ToolExecutionError) as caught:
+            await write.ainvoke(_governance=options)
+        assert caught.value.context.status is ExecutionStatus.UNKNOWN
+        assert isinstance(caught.value.cause, IdempotencyInProgressError)
+        release.set()
+        assert await owner == "ok"
+    finally:
+        release.set()
+        try:
+            await owner
+        finally:
+            runtime.close()
 
 
 @pytest.mark.asyncio
