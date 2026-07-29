@@ -467,7 +467,7 @@ is not a production latency or throughput promise.
 | v0.5.1 | Security hardening: caller metadata isolation and exact approval binding |
 | v0.6.0 | Immutable action contracts from admission through approval, idempotency, executor revalidation, telemetry, and audit |
 | v0.7.0 | Durable `UNKNOWN` reconciliation, strict recovery authorization, and a source-idempotent reconciliation-audit outbox |
-| v0.8.0 (release candidate) | Portable governance evidence, configured external verification, cross-framework conformance, async-first extension dispatch, and internal service boundaries |
+| v0.8.0 (implementation scope) | Portable governance evidence, configured external verification, cross-framework conformance, async-first extension dispatch, and internal service boundaries |
 
 Released versions are preserved as immutable Git tags. See
 [CHANGELOG.md](CHANGELOG.md) for the detailed compatibility and security notes.
