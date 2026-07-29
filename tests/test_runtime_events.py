@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
@@ -442,7 +443,9 @@ async def test_runtime_event_stream_cannot_be_rebound() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sync_runtime_event_subscriber_uses_isolated_daemon_dispatcher() -> None:
+async def test_sync_runtime_event_subscriber_uses_isolated_daemon_dispatcher(
+    caplog,
+) -> None:
     entered = threading.Event()
     release = threading.Event()
     later_subscriber_called = asyncio.Event()
@@ -477,6 +480,7 @@ async def test_sync_runtime_event_subscriber_uses_isolated_daemon_dispatcher() -
         return "ok"
 
     try:
+        caplog.set_level(logging.DEBUG, logger="agent_runtime_governance.runtime")
         assert await runtime.ainvoke("work") == "ok"
         await asyncio.wait_for(asyncio.to_thread(entered.wait, 1), timeout=1.1)
         assert event_worker_names and event_worker_names[0].startswith(
@@ -485,6 +489,10 @@ async def test_sync_runtime_event_subscriber_uses_isolated_daemon_dispatcher() -
         assert await runtime.ainvoke("work") == "ok"
         await asyncio.wait_for(later_subscriber_called.wait(), timeout=0.2)
         assert len(event_worker_names) == 1
+        assert caplog.messages.count(
+            "runtime event subscriber delivery dropped: "
+            "synchronous delivery capacity is busy"
+        ) == 1
         assert (
             await asyncio.wait_for(runtime._invoke_extension(governance_extension), 0.2)
             == "governance extension"

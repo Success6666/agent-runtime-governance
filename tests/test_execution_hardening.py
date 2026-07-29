@@ -785,7 +785,6 @@ async def test_sqlite_idempotency_lease_is_renewed_during_long_execution(
         tmp_path / "leases.db",
         lease_seconds=0.25 * LEASE_TIMING_SCALE,
     )
-    renewed = threading.Event()
     lease_extended = threading.Event()
     lease_expiries: list[tuple[datetime, datetime]] = []
     renew = store.renew
@@ -807,7 +806,6 @@ async def test_sqlite_idempotency_lease_is_renewed_during_long_execution(
         if after > before:
             lease_expiries.append((before, after))
             lease_extended.set()
-        renewed.set()
 
     monkeypatch.setattr(store, "renew", record_renewal)
     runtime = Runtime(idempotency_store=store)
@@ -824,8 +822,7 @@ async def test_sqlite_idempotency_lease_is_renewed_during_long_execution(
     owner = asyncio.create_task(write.ainvoke(_governance=options))
     try:
         await started.wait()
-        assert await asyncio.to_thread(renewed.wait, LEASE_TIMING_SCALE)
-        assert lease_extended.is_set()
+        assert await asyncio.to_thread(lease_extended.wait, LEASE_TIMING_SCALE)
         initial_expiry, _ = lease_expiries[0]
         remaining = (initial_expiry - datetime.now(timezone.utc)).total_seconds()
         if remaining > 0:

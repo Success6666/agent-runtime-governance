@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import inspect
+import logging
 from concurrent.futures import Executor, ThreadPoolExecutor
 from concurrent.futures import Future as ConcurrentFuture
 from contextlib import ExitStack, contextmanager
@@ -148,6 +149,7 @@ _EVENT_DELIVERY_RUNTIME_IDS: ContextVar[frozenset[int]] = ContextVar(
     "agent_runtime_governance_event_delivery_runtime_ids",
     default=frozenset(),
 )
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -952,6 +954,10 @@ class Runtime:
             return await self._invoke_extension(subscriber, event)
         event_sync_slot = self._runtime_event_sync_slot
         if not event_sync_slot.acquire(blocking=False):
+            _LOGGER.debug(
+                "runtime event subscriber delivery dropped: "
+                "synchronous delivery capacity is busy"
+            )
             return None
         try:
             future = self._runtime_event_executor.submit(
