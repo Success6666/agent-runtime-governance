@@ -95,6 +95,18 @@ def test_durable_operation_capability_rebuilds_on_store_or_ledger_reassignment(
         assert runtime._durable_operation_capability is not first_capability
         assert runtime._supports_atomic_reconciliation_preparation() is False
         assert calls == 2
+
+        second_capability = runtime._durable_operation_capability
+        replacement_store = SQLiteIdempotencyStore(tmp_path / "separate.db")
+        runtime.idempotency_store = replacement_store
+
+        assert runtime._durable_operation_capability is not second_capability
+        assert (
+            runtime._durable_operation_capability.idempotency_store
+            is replacement_store
+        )
+        assert runtime._supports_atomic_reconciliation_preparation() is True
+        assert calls == 3
         assert "SQLiteIdempotencyStore" not in runtime_module.__dict__
         assert "SQLiteReconciliationLedger" not in runtime_module.__dict__
     finally:
