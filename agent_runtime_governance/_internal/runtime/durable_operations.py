@@ -78,6 +78,18 @@ class DurableOperationCapability:
         )
 
     @property
+    def idempotency_store(self) -> IdempotencyStore:
+        """Return the idempotency store bound to this operation capability."""
+
+        return self._idempotency_store
+
+    @property
+    def reconciliation_ledger(self) -> ReconciliationLedger | None:
+        """Return the reconciliation ledger bound to this operation capability."""
+
+        return self._reconciliation_ledger
+
+    @property
     def reconciliation_durability(self) -> _ReconciliationDurability:
         ledger = self._reconciliation_ledger
         if getattr(ledger, "production_durable", False) is not True:
