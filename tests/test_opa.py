@@ -7,8 +7,11 @@ from urllib.error import HTTPError
 import pytest
 
 from agent_runtime_governance import (
+    DecisionControl,
+    DecisionExplanationValidationError,
     GovernanceDenied,
     OPAClient,
+    OPADecision,
     OPAMiddleware,
     OPAPlugin,
     PluginManager,
@@ -216,3 +219,43 @@ def test_opa_policy_identity_is_strict_and_reportable() -> None:
         OPAMiddleware(client, policy_version="bad policy", policy_digest="a" * 64)
     with pytest.raises(ValueError, match="policy_digest"):
         OPAMiddleware(client, policy_version="bundle-v1", policy_digest="A" * 64)
+
+
+def test_opa_decision_rejects_invalid_or_ambiguous_controls() -> None:
+    control = DecisionControl(
+        control_id="opa.allow",
+        control_version=1,
+        effect="allow",
+        result="matched",
+        reason_code="opa_allow",
+    )
+    with pytest.raises(TypeError, match="allow"):
+        OPADecision("yes", "reason")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="reason"):
+        OPADecision(True, 1)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="DecisionControl"):
+        OPADecision(True, "reason", (object(),))  # type: ignore[arg-type]
+    with pytest.raises(DecisionExplanationValidationError, match="ordered and unique"):
+        OPADecision(True, "reason", (control, control))
+
+
+@pytest.mark.parametrize(
+    "explanation",
+    [
+        [],
+        {"controls": [], "unexpected": True},
+        {"controls": "not-a-list"},
+        {"controls": [{"control_id": "incomplete"}]},
+    ],
+)
+def test_opa_rejects_malformed_structured_decision_explanations(explanation) -> None:
+    client = OPAClient(
+        "http://localhost:8181",
+        "agent/allow",
+        transport=lambda _payload: {
+            "result": {"allow": True, "decision_explanation": explanation}
+        },
+    )
+
+    with pytest.raises(ValueError, match="OPA decision_explanation"):
+        client.evaluate(ExecutionContext.create(ToolCall("operate")))
