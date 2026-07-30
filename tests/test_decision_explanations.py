@@ -84,6 +84,40 @@ def _context(action, *, input_text: str = "operate") -> ExecutionContext:
     ).bind_action(action)
 
 
+@pytest.fixture
+def policy_controls() -> dict[str, DecisionControl]:
+    return {
+        "allow": DecisionControl(
+            control_id="policy.allow",
+            control_version=1,
+            effect="allow",
+            result="matched",
+            reason_code="policy_allowed",
+        ),
+        "deny": DecisionControl(
+            control_id="policy.deny",
+            control_version=1,
+            effect="deny",
+            result="matched",
+            reason_code="policy_denied",
+        ),
+        "approval": DecisionControl(
+            control_id="policy.require-approval",
+            control_version=1,
+            effect="require_approval",
+            result="matched",
+            reason_code="approval_required",
+        ),
+        "risk": DecisionControl(
+            control_id="policy.risk",
+            control_version=1,
+            effect="risk",
+            result="matched",
+            reason_code="risk_overridden",
+        ),
+    }
+
+
 @pytest.mark.asyncio
 async def test_python_policy_projects_a_canonical_privacy_safe_attachment() -> None:
     action = _action()
@@ -531,72 +565,43 @@ async def test_verification_and_rule_construction_fail_closed_for_invalid_inputs
         )
 
 
-def test_attachment_rejects_inconsistent_control_outcomes() -> None:
+@pytest.mark.parametrize(
+    ("control_names", "final_decision", "requires_approval", "message"),
+    [
+        (("allow",), "deny", False, "denied"),
+        (("deny",), "allow", False, "cannot contain"),
+        (("risk",), "allow", False, "requires a matched"),
+        (("allow", "approval"), "allow", False, "requires_approval=True"),
+    ],
+)
+def test_attachment_rejects_inconsistent_control_outcomes(
+    policy_controls: dict[str, DecisionControl],
+    control_names: tuple[str, ...],
+    final_decision: str,
+    requires_approval: bool,
+    message: str,
+) -> None:
     action = _action()
-    allow = DecisionControl(
-        control_id="policy.allow",
-        control_version=1,
-        effect="allow",
-        result="matched",
-        reason_code="policy_allowed",
-    )
-    deny = DecisionControl(
-        control_id="policy.deny",
-        control_version=1,
-        effect="deny",
-        result="matched",
-        reason_code="policy_denied",
-    )
-    approval = DecisionControl(
-        control_id="policy.require-approval",
-        control_version=1,
-        effect="require_approval",
-        result="matched",
-        reason_code="approval_required",
-    )
-    risk = DecisionControl(
-        control_id="policy.risk",
-        control_version=1,
-        effect="risk",
-        result="matched",
-        reason_code="risk_overridden",
-    )
-    common = {
-        "action_digest": action.action_digest,
-        "policy_version": "policy-v1",
-        "policy_digest": _POLICY_DIGEST,
-        "risk_tier": "LOW",
-        "requires_approval": False,
-    }
-
-    for fields, message in (
-        ({"final_decision": "deny", "controls": (allow,)}, "denied"),
-        ({"final_decision": "allow", "controls": (deny,)}, "cannot contain"),
-        ({"final_decision": "allow", "controls": (risk,)}, "requires a matched"),
-        (
-            {"final_decision": "allow", "controls": (allow, approval)},
-            "requires_approval=True",
-        ),
-    ):
-        with pytest.raises(DecisionExplanationValidationError, match=message):
-            DecisionExplanationAttachment(**{**common, **fields})
+    with pytest.raises(DecisionExplanationValidationError, match=message):
+        DecisionExplanationAttachment(
+            action_digest=action.action_digest,
+            policy_version="policy-v1",
+            policy_digest=_POLICY_DIGEST,
+            final_decision=final_decision,
+            risk_tier="LOW",
+            requires_approval=requires_approval,
+            controls=tuple(policy_controls[name] for name in control_names),
+        )
 
 
-def test_attachment_rejects_malformed_control_provenance() -> None:
-    action = _action()
-    allow = DecisionControl(
-        control_id="policy.allow",
-        control_version=1,
-        effect="allow",
-        result="matched",
-        reason_code="policy_allowed",
-    )
-
+def test_attachment_requires_bound_action() -> None:
     with pytest.raises(DecisionExplanationValidationError, match="bound action"):
         DecisionExplanationAttachment.from_context(
             ExecutionContext.create(ToolCall(name="operate"))
         )
 
+
+def test_attachment_requires_bound_policy_identity() -> None:
     unversioned_action = ActionContract(
         contract_id="ops.unversioned-policy",
         contract_version=1,
@@ -619,7 +624,9 @@ def test_attachment_rejects_malformed_control_provenance() -> None:
             )
         )
 
-    invalid_marker = _context(action).append_history(
+
+def test_attachment_rejects_invalid_control_availability_marker() -> None:
+    invalid_marker = _context(_action()).append_history(
         HistoryEntry(
             "test",
             "allow",
@@ -629,7 +636,9 @@ def test_attachment_rejects_malformed_control_provenance() -> None:
     with pytest.raises(DecisionExplanationValidationError, match="availability marker"):
         DecisionExplanationAttachment.from_context(invalid_marker)
 
-    malformed_controls = _context(action).append_history(
+
+def test_attachment_rejects_malformed_control_history() -> None:
+    malformed_controls = _context(_action()).append_history(
         HistoryEntry(
             "test",
             "allow",
@@ -639,12 +648,16 @@ def test_attachment_rejects_malformed_control_provenance() -> None:
     with pytest.raises(DecisionExplanationValidationError, match="must be a sequence"):
         DecisionExplanationAttachment.from_context(malformed_controls)
 
-    partial_identity = _context(action).append_history(
+
+def test_attachment_rejects_partial_policy_identity_history(
+    policy_controls: dict[str, DecisionControl],
+) -> None:
+    partial_identity = _context(_action()).append_history(
         HistoryEntry(
             "test",
             "allow",
             data={
-                "decision_explanation_controls": [allow.to_dict()],
+                "decision_explanation_controls": [policy_controls["allow"].to_dict()],
                 "policy_version": "policy-v1",
             },
         )
@@ -653,15 +666,10 @@ def test_attachment_rejects_malformed_control_provenance() -> None:
         DecisionExplanationAttachment.from_context(partial_identity)
 
 
-def test_attachment_and_verifier_reject_invalid_comparison_inputs() -> None:
+def test_attachment_and_verifier_reject_invalid_comparison_inputs(
+    policy_controls: dict[str, DecisionControl],
+) -> None:
     action = _action()
-    allow = DecisionControl(
-        control_id="policy.allow",
-        control_version=1,
-        effect="allow",
-        result="matched",
-        reason_code="policy_allowed",
-    )
     common = {
         "action_digest": action.action_digest,
         "policy_version": "policy-v1",
@@ -675,7 +683,9 @@ def test_attachment_and_verifier_reject_invalid_comparison_inputs() -> None:
     with pytest.raises(TypeError, match="DecisionControl"):
         DecisionExplanationAttachment(**{**common, "controls": (object(),)})
 
-    attachment = DecisionExplanationAttachment(**{**common, "controls": (allow,)})
+    attachment = DecisionExplanationAttachment(
+        **{**common, "controls": (policy_controls["allow"],)}
+    )
     report = verify_decision_explanation_document(
         attachment.to_dict(),
         expected_action_digest="b" * 64,
