@@ -240,7 +240,7 @@ if TYPE_CHECKING:
         verify_decision_explanation_document,
     )
 
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 
 _LAZY_VERIFY_EXPORTS = frozenset(
     {
