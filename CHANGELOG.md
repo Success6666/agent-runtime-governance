@@ -4,6 +4,22 @@ All notable changes are documented here.
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-08-08
+
+### Security
+
+- The optional `evidence` and development dependency constraints now allow
+  cryptography 50.x. This lets the isolated production dependency audit select
+  the security-fixed 50.0.0 release instead of being capped at 49.x.
+
+### Changed
+
+- README release status, v0.9 usage guidance, and claim-to-regression-test
+  links now describe the shipped v0.9 contract rather than its former
+  development status.
+
+## [0.9.0] - 2026-07-29
+
 ### Added
 
 - Detached, canonical v1 policy-decision explanation attachments bound to the

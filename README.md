@@ -22,7 +22,10 @@ you already use rather than replacing it. The default in-memory idempotency
 store has bounded TTL/LRU retention and does not survive restarts; longer-lived
 protection requires a durable store. v0.7 adds durable, deterministic
 reconciliation for `UNKNOWN` outcomes, and v0.8 adds portable evidence
-verification and cross-framework conformance.
+verification and cross-framework conformance. The v0.9 line adds detached,
+privacy-safe explanations of why a policy decision was allowed or denied, with
+offline verification and read-only comparison. v0.9.1 is the dependency-audit
+security patch for that release line.
 
 ## Quick start
 
@@ -79,6 +82,24 @@ delete_file(
     _governance=InvocationOptions(input_text="remove the old application log"),
 )
 ```
+
+### v0.9.0: verify why a decision was allowed
+
+v0.9 provides a canonical `DecisionExplanationAttachment` for an already bound
+action. It carries the action and policy identities, deterministic control
+outcomes, and optional evidence-bundle digest without changing the v0.8
+Evidence Bundle or receipt-verification protocols. The attachment is
+privacy-safe: it does not retain raw parameters, prompts, model output, or
+chain-of-thought. It can be verified offline, compared read-only against
+another verified attachment, or rendered through the thin inspect command:
+
+```bash
+python -m agent_runtime_governance.inspect decision-explanation.json
+```
+
+See [`docs/decision-explanations.md`](docs/decision-explanations.md) for the
+attachment contract, supported policy projections, OPA input requirements, and
+the boundary with v0.8 `ReceiptVerifier` and `PolicyDriftDetector`.
 
 ## Shipped guarantees and regression evidence
 
@@ -142,14 +163,21 @@ that retains the implementation scope and corrects that path.
 | v0.7 public imports and call signatures remain compatible while private services are grouped by domain; terminal events are immutable, redacted, and failure-isolated for consumers | [`test_v070_public_call_signatures_remain_compatible`](tests/test_public_api_snapshot.py), [`test_v070_wheel_and_sdist_expose_stable_imports`](tests/test_public_api_snapshot.py), [`test_private_services_are_grouped_under_explicit_internal_domains`](tests/test_internal_service_layout.py), [`test_runtime_event_projection_is_versioned_immutable_and_redacted`](tests/test_runtime_events.py), [`test_failing_event_subscriber_does_not_block_other_consumers`](tests/test_runtime_events.py) |
 | The CI-sized extension-dispatch matrix passed its committed same-host ratio budget on the recorded Windows/Python 3.12 host; this is point-in-time measurement evidence, not a service-level promise | [`v0.8.0-windows-python312.json`](benchmarks/results/v0.8.0-windows-python312.json), [`v0.8 dispatch budget`](benchmarks/budgets/v0.8.0-extension-dispatch.json), [`test_extension_dispatch_budget_uses_same_host_mode_ratios`](tests/test_benchmark_budget.py) |
 
-The staged v0.9-v1.0 direction and its exit criteria are in
+The shipped v0.9 contract and the staged v0.10-v1.0 direction are in
 [`ROADMAP.md`](ROADMAP.md) and [`docs/production-roadmap.md`](docs/production-roadmap.md).
 Planned capabilities are never presented as shipped.
 
-The v0.9 development contract for detached, privacy-safe policy-decision
-attachments is documented in
-[`docs/decision-explanations.md`](docs/decision-explanations.md). It remains
-separate from v0.8 Evidence Bundle and receipt-verification protocols.
+The v0.9.0 release ships detached, privacy-safe policy-decision attachments
+without adding a policy DSL, a dashboard, tool replay, or a new receipt
+protocol. The following claims are covered by the v0.9 regression suite:
+
+| Shipped in v0.9.0 | Evidence |
+| --- | --- |
+| A canonical attachment binds the action digest, policy identity, final decision, risk tier, approval requirement, and deterministic controls without retaining raw request data | [`test_python_policy_projects_a_canonical_privacy_safe_attachment`](tests/test_decision_explanations.py), [`test_attachment_rejects_reordering_tampering_and_policy_substitution`](tests/test_decision_explanations.py) |
+| Built-in, Rule, YAML, and explicitly structured OPA decisions project deterministic controls; an unstructured OPA reason remains diagnostic-only | [`test_rule_projection_excludes_rule_reason_and_proves_a_deny`](tests/test_decision_explanations.py), [`test_yaml_policy_uses_its_own_deterministic_control_namespace`](tests/test_decision_explanations.py), [`test_opa_requires_explicit_structured_controls_for_an_attachment`](tests/test_decision_explanations.py) |
+| Offline verification and read-only comparison accept only verified attachments and do not execute tools, replay runtime state, or perform network lookups | [`test_comparison_only_accepts_verified_same_action_attachments`](tests/test_decision_explanations.py), [`test_comparison_has_no_runtime_or_tool_side_effect`](tests/test_decision_explanations.py) |
+| The thin `inspect` CLI verifies before rendering and emits no unverified decision report | [`test_inspect_command_only_renders_a_verified_attachment`](tests/test_decision_explanations.py) |
+| Existing v0.8 evidence and receipt-verification identities can be referenced without duplicating their protocols | [`test_attachment_binds_existing_evidence_and_receipt_verification`](tests/test_decision_explanations.py) |
 
 The v0.8 verifier, its detached external-evidence boundaries, and its
 input/exit-code contract are documented in
@@ -479,6 +507,8 @@ is not a production latency or throughput promise.
 | v0.7.0 | Durable `UNKNOWN` reconciliation, strict recovery authorization, and a source-idempotent reconciliation-audit outbox |
 | v0.8.0 (withdrawn before distribution) | Portable governance evidence, configured external verification, cross-framework conformance, async-first extension dispatch, and internal service boundaries |
 | v0.8.1 (release-validation patch) | The v0.8 implementation scope with a strict audit of its frozen external production dependencies |
+| v0.9.0 | Detached, privacy-safe decision explanations with offline verification, read-only comparison, and thin inspect presentation |
+| v0.9.1 (security patch) | The v0.9.0 feature scope with cryptography 50.x support so the isolated production dependency audit can select the current security-fixed line |
 
 Released versions are preserved as immutable Git tags. A withdrawn prerelease
 remains visible as a tag, but is not a verified distribution. See
