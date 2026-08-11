@@ -619,6 +619,13 @@ def test_publish_workflow_verifies_the_exact_public_release_after_upload() -> No
     assert "pip check" in verification
     assert "imported the repository checkout" in verification
     assert "pip install -e" not in verification
+    assert "--extra-index-url" not in verification
+    assert "gh attestation verify" in verification
+    assert "release-record/SHA256SUMS release-record/release-manifest.json" in verification
+    assert "actions/upload-artifact" in verification
+    assert "name: public-pypi-verification" in verification
+    assert "if-no-files-found: error" in verification
+    assert "retention-days: 90" in verification
     assert publish.index("Publish with PyPI Trusted Publishing") < publish.index(
         "  verify-public-pypi:"
     )
@@ -639,6 +646,14 @@ def test_adoption_verification_links_existing_runtime_evidence() -> None:
         "release-verification.md",
     ):
         assert value in guide
+    for value in (
+        "examples/strict_action_contract.py",
+        "tests/test_strict_action_example.py",
+        "tests/conformance/test_langgraph.py",
+        "tests/conformance/test_openai_agents.py",
+        "docs/release-verification.md",
+    ):
+        assert (ROOT / value).is_file(), value
     assert "source inspection" in guide.lower()
     assert "downstream exactly-once" in guide.lower()
 

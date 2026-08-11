@@ -28,7 +28,8 @@ cd "$verify_root"
 PowerShell:
 
 ```powershell
-$verifyRoot = Join-Path $env:TEMP "arg-public-verify"
+$verifyRoot = Join-Path $env:TEMP ("arg-public-verify-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $verifyRoot | Out-Null
 python -m venv (Join-Path $verifyRoot "venv")
 $python = Join-Path $verifyRoot "venv\Scripts\python.exe"
 & $python -m pip install --upgrade pip

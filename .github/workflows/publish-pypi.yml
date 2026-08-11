@@ -117,7 +117,18 @@ jobs:
             --pattern 'release-manifest.json'
 
       - name: Verify public artifacts against the release record
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          signer_workflow="github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml"
+          source_ref="refs/tags/$RELEASE_TAG"
+          for asset in release-record/SHA256SUMS release-record/release-manifest.json; do
+            gh attestation verify "$asset" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$signer_workflow" \
+              --source-ref "$source_ref" \
+              --deny-self-hosted-runners
+          done
           python scripts/verify_public_pypi.py \
             --release-tag "$RELEASE_TAG" \
             --manifest release-record/release-manifest.json \
