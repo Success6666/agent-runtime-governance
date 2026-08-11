@@ -88,10 +88,10 @@ def load_release_record(
 
     version = release.get("package_version")
     source_commit = release.get("source_commit")
-    if release.get("tag") != release_tag or version != release_tag.removeprefix("v"):
-        raise PublicPyPIVerificationError("release tag and package version do not match")
     if not isinstance(version, str) or not version:
         raise PublicPyPIVerificationError("release package version is invalid")
+    if release.get("tag") != release_tag or version != release_tag.removeprefix("v"):
+        raise PublicPyPIVerificationError("release tag and package version do not match")
     if not isinstance(source_commit, str) or not re.fullmatch(r"[0-9a-f]{40}", source_commit):
         raise PublicPyPIVerificationError("release source commit is invalid")
     if provenance.get("source_ref") != f"refs/tags/{release_tag}":
@@ -219,10 +219,13 @@ def wait_for_public_artifacts(
     )
 
 
-def _fetch_bytes(url: str, timeout_seconds: float) -> bytes:
+def _fetch_bytes(url: str, timeout_seconds: float, max_bytes: int) -> bytes:
     request = Request(url, headers={"User-Agent": "agent-runtime-governance-release-verifier"})
-    with urlopen(request, timeout=timeout_seconds) as response:
-        return response.read()
+    try:
+        with urlopen(request, timeout=timeout_seconds) as response:
+            return response.read(max_bytes + 1)
+    except (HTTPError, URLError, TimeoutError) as exc:
+        raise PublicPyPIVerificationError(f"public artifact download failed: {exc}") from exc
 
 
 def download_and_verify(
@@ -230,13 +233,13 @@ def download_and_verify(
     output_dir: Path,
     *,
     timeout_seconds: float,
-    fetch_bytes: Callable[[str, float], bytes] = _fetch_bytes,
+    fetch_bytes: Callable[[str, float, int], bytes] = _fetch_bytes,
 ) -> list[dict[str, Any]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     results: list[dict[str, Any]] = []
     for filename in sorted(artifacts):
         artifact = artifacts[filename]
-        payload = fetch_bytes(artifact.url, timeout_seconds)
+        payload = fetch_bytes(artifact.url, timeout_seconds, artifact.size)
         digest = hashlib.sha256(payload).hexdigest()
         if len(payload) != artifact.size or digest != artifact.sha256:
             raise PublicPyPIVerificationError(
