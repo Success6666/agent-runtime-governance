@@ -93,6 +93,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
+      attestations: read
       contents: read
     env:
       RELEASE_TAG: ${{ inputs.tag }}

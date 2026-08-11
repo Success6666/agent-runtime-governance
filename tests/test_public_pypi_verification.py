@@ -86,16 +86,22 @@ def test_public_artifacts_match_release_manifest_and_downloaded_bytes(
     )
     public = verifier.select_public_artifacts(_public_document(payloads), expected)
     by_url = {artifact.url: payloads[filename] for filename, artifact in public.items()}
+    byte_limits: dict[str, int] = {}
+
+    def fetch_bytes(url: str, _timeout: float, max_bytes: int) -> bytes:
+        byte_limits[url] = max_bytes
+        return by_url[url]
 
     results = verifier.download_and_verify(
         public,
         tmp_path / "downloaded",
         timeout_seconds=1,
-        fetch_bytes=lambda url, _timeout, _max_bytes: by_url[url],
+        fetch_bytes=fetch_bytes,
     )
 
     assert version == VERSION
     assert source_commit == SOURCE_COMMIT
+    assert byte_limits == {artifact.url: artifact.size for artifact in public.values()}
     assert {item["filename"] for item in results} == set(payloads)
     assert {item["kind"] for item in results} == {"wheel", "sdist"}
     for item in results:
@@ -161,6 +167,22 @@ def test_release_record_must_be_bound_to_the_requested_tag(
         match="tag and package version",
     ):
         verifier.load_release_record(manifest_path, checksums_path, "v0.9.0")
+
+
+def test_release_record_package_version_must_match_the_requested_tag(
+    tmp_path: Path,
+    verifier: ModuleType,
+) -> None:
+    manifest_path, checksums_path, _ = _release_record(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["release"]["package_version"] = "0.9.0"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(
+        verifier.PublicPyPIVerificationError,
+        match="tag and package version",
+    ):
+        verifier.load_release_record(manifest_path, checksums_path, RELEASE_TAG)
 
 
 def test_untrusted_artifact_url_is_rejected(tmp_path: Path, verifier: ModuleType) -> None:

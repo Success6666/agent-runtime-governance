@@ -607,6 +607,7 @@ def test_publish_workflow_verifies_the_exact_public_release_after_upload() -> No
     verification = publish[publish.index("  verify-public-pypi:") :]
 
     assert "needs: publish" in verification
+    assert "permissions:\n      attestations: read\n      contents: read" in verification
     assert "ref: ${{ inputs.tag }}" in verification
     assert "python scripts/verify_public_pypi.py" in verification
     assert "--manifest release-record/release-manifest.json" in verification
