@@ -23,6 +23,65 @@ The workflow runs after GitHub records a published release, so a missing or
 invalid manifest blocks release assets and PyPI publication. It does not claim
 to retract an already-created GitHub Release object.
 
+## v0.9.1
+
+v0.9.1 was released on 2026-08-08 (UTC) from protected `main` commit
+`4cfb9ccc37835c613b4a41e137d6f10374db4189`.
+
+- The [release-artifact workflow](https://github.com/Success6666/agent-runtime-governance/actions/runs/31248012308)
+  passed and attached the wheel, source distribution, SPDX SBOM, checksums,
+  Release Verification Manifest, and provenance to the
+  [`v0.9.1` release](https://github.com/Success6666/agent-runtime-governance/releases/tag/v0.9.1).
+- The [Trusted Publishing workflow](https://github.com/Success6666/agent-runtime-governance/actions/runs/31248179931)
+  re-verified the release record before publishing
+  [`agent-runtime-governance==0.9.1`](https://pypi.org/project/agent-runtime-governance/0.9.1/).
+- On 2026-08-11 (UTC), a new Python 3.12 environment installed the exact public
+  version with no package cache, passed `pip check`, and imported distribution
+  and runtime version `0.9.1` outside the repository checkout. The public wheel
+  SHA256 was `ca79f30b82d044573d34169981066ed331260d3c3a0baa17613f343c78210a5e`;
+  the source-distribution SHA256 was
+  `be907b72e93c600f919a7d2a6c54e11be3c6ebb21ad6cf1a05af1173ceab4a79`.
+  Both matched the immutable GitHub release record.
+
+## v0.9.0
+
+v0.9.0 was released on 2026-07-29 (UTC) from protected `main` commit
+`35a0dda1902af56b01c363c754288f04a9257b96`.
+
+- The [release-artifact workflow](https://github.com/Success6666/agent-runtime-governance/actions/runs/30487960793)
+  produced and verified the immutable assets for the
+  [`v0.9.0` release](https://github.com/Success6666/agent-runtime-governance/releases/tag/v0.9.0).
+- The [Trusted Publishing workflow](https://github.com/Success6666/agent-runtime-governance/actions/runs/30488395522)
+  published [`agent-runtime-governance==0.9.0`](https://pypi.org/project/agent-runtime-governance/0.9.0/)
+  from those assets.
+- On 2026-08-11 (UTC), a new Python 3.12 environment installed the exact public
+  version, passed `pip check`, and imported distribution and runtime version
+  `0.9.0`. The public wheel SHA256
+  `deed6013a692f76bf5d7197edd2ad521399def68d5e32649cf44650f9613699b`
+  and source-distribution SHA256
+  `40c3e00ba460be9f4660ed12ada29b7c396890f34a60513a822e933424327f40`
+  matched the release manifest and checksums.
+
+## v0.8.1
+
+v0.8.1 was released on 2026-07-29 (UTC) from protected `main` commit
+`97c8efa351b7b4143daeec9993c5d6e42afbda0a` as the release-validation
+replacement for withdrawn v0.8.0.
+
+- The [release-artifact workflow](https://github.com/Success6666/agent-runtime-governance/actions/runs/30458048222)
+  produced and verified the immutable assets for the
+  [`v0.8.1` release](https://github.com/Success6666/agent-runtime-governance/releases/tag/v0.8.1).
+- The [Trusted Publishing workflow](https://github.com/Success6666/agent-runtime-governance/actions/runs/30458444104)
+  published [`agent-runtime-governance==0.8.1`](https://pypi.org/project/agent-runtime-governance/0.8.1/)
+  from those assets.
+- On 2026-08-11 (UTC), a new Python 3.12 environment installed the exact public
+  version, passed `pip check`, and imported distribution and runtime version
+  `0.8.1`. The public wheel SHA256
+  `5dc5f0a0ad8ff1c0bc99b4ec9eefc499d7d4d110f088e9e22de2ccd55a7328b0`
+  and source-distribution SHA256
+  `812040a0a1954f46d1db971c96eb37d5e8a37ee508341cad23a6b76fff7007b9`
+  matched the release manifest and checksums.
+
 ## v0.8.0 (withdrawn before distribution)
 
 The v0.8.0 GitHub Release was created on 2026-07-29 (UTC) from protected

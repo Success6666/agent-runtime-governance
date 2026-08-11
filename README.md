@@ -33,6 +33,10 @@ security patch for that release line.
 pip install agent-runtime-governance
 ```
 
+To verify an exact public package, run the strict single-host production
+example, or reproduce the pinned LangGraph and OpenAI Agents SDK checks, use
+the [adoption verification guide](docs/adoption-verification.md).
+
 ```python
 from pathlib import Path
 
