@@ -85,3 +85,102 @@ jobs:
           packages-dir: packages/
           attestations: true
           print-hash: true
+
+  verify-public-pypi:
+    name: Verify public PyPI
+    needs: publish
+    if: startsWith(inputs.tag, 'v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.tag }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13"
+
+      - name: Download immutable release record
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p release-record
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir release-record \
+            --pattern 'SHA256SUMS' \
+            --pattern 'release-manifest.json'
+
+      - name: Verify public artifacts against the release record
+        run: |
+          python scripts/verify_public_pypi.py \
+            --release-tag "$RELEASE_TAG" \
+            --manifest release-record/release-manifest.json \
+            --checksums release-record/SHA256SUMS \
+            --output-dir "$RUNNER_TEMP/public-pypi-artifacts" \
+            --report "$RUNNER_TEMP/public-pypi-verification.json"
+
+      - name: Install the exact version from the public index
+        run: |
+          release_version="${RELEASE_TAG#v}"
+          install_root="$RUNNER_TEMP/public-pypi-install"
+          work_root="$RUNNER_TEMP/public-pypi-workdir"
+          python -m venv "$install_root"
+          "$install_root/bin/python" -m pip install --upgrade "pip>=26.1.2"
+          mkdir -p "$work_root"
+          cd "$work_root"
+          PYTHONNOUSERSITE=1 "$install_root/bin/python" -m pip install \
+            --isolated \
+            --no-cache-dir \
+            --index-url https://pypi.org/simple \
+            "agent-runtime-governance==$release_version"
+          PYTHONNOUSERSITE=1 "$install_root/bin/python" -m pip check
+          EXPECTED_VERSION="$release_version" \
+          INSTALL_REPORT="$RUNNER_TEMP/public-pypi-install.json" \
+          PYTHONNOUSERSITE=1 \
+          "$install_root/bin/python" - <<'PY'
+          import json
+          import os
+          from importlib.metadata import version
+          from pathlib import Path
+
+          import agent_runtime_governance
+
+          expected = os.environ["EXPECTED_VERSION"]
+          distribution_version = version("agent-runtime-governance")
+          runtime_version = agent_runtime_governance.__version__
+          module_path = Path(agent_runtime_governance.__file__).resolve()
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          if distribution_version != expected or runtime_version != expected:
+              raise SystemExit("public PyPI install version does not match the release")
+          if module_path == workspace or workspace in module_path.parents:
+              raise SystemExit("public PyPI verification imported the repository checkout")
+          report = {
+              "schema_version": 1,
+              "package_version": distribution_version,
+              "runtime_version": runtime_version,
+              "module_path": str(module_path),
+              "index_url": "https://pypi.org/simple",
+              "pip_check": "passed",
+          }
+          Path(os.environ["INSTALL_REPORT"]).write_text(
+              json.dumps(report, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          print(json.dumps(report, sort_keys=True))
+          PY
+
+      - name: Preserve public PyPI verification record
+        uses: actions/upload-artifact@0b2256b8c012f0828dc542b3febcab082c67f72b # v4.3.4
+        with:
+          name: public-pypi-verification
+          path: |
+            ${{ runner.temp }}/public-pypi-verification.json
+            ${{ runner.temp }}/public-pypi-install.json
+          if-no-files-found: error
+          retention-days: 90

@@ -600,6 +600,49 @@ def test_release_and_publish_workflows_gate_manifest_before_distribution() -> No
     )
 
 
+def test_publish_workflow_verifies_the_exact_public_release_after_upload() -> None:
+    publish = (ROOT / ".github" / "workflows" / "publish-pypi.yml").read_text(
+        encoding="utf-8"
+    )
+    verification = publish[publish.index("  verify-public-pypi:") :]
+
+    assert "needs: publish" in verification
+    assert "ref: ${{ inputs.tag }}" in verification
+    assert "python scripts/verify_public_pypi.py" in verification
+    assert "--manifest release-record/release-manifest.json" in verification
+    assert "--checksums release-record/SHA256SUMS" in verification
+    assert "--isolated" in verification
+    assert "--no-cache-dir" in verification
+    assert "--index-url https://pypi.org/simple" in verification
+    assert '"agent-runtime-governance==$release_version"' in verification
+    assert "PYTHONNOUSERSITE=1" in verification
+    assert "pip check" in verification
+    assert "imported the repository checkout" in verification
+    assert "pip install -e" not in verification
+    assert publish.index("Publish with PyPI Trusted Publishing") < publish.index(
+        "  verify-public-pypi:"
+    )
+
+
+def test_adoption_verification_links_existing_runtime_evidence() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    guide = (ROOT / "docs" / "adoption-verification.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "docs/adoption-verification.md" in readme
+    for value in (
+        "examples/strict_action_contract.py",
+        "tests/test_strict_action_example.py",
+        "tests/conformance/test_langgraph.py",
+        "tests/conformance/test_openai_agents.py",
+        "release-verification.md",
+    ):
+        assert value in guide
+    assert "source inspection" in guide.lower()
+    assert "downstream exactly-once" in guide.lower()
+
+
 def test_release_documentation_keeps_the_manifest_claim_bounded() -> None:
     releasing = (ROOT / "RELEASING.md").read_text(encoding="utf-8").lower()
     verification = (ROOT / "docs" / "release-verification.md").read_text(
