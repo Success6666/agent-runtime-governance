@@ -4,8 +4,10 @@ import hashlib
 import importlib.util
 import json
 import sys
+from io import BytesIO
 from pathlib import Path
 from types import ModuleType
+from urllib.error import HTTPError
 
 import pytest
 
@@ -154,6 +156,66 @@ def test_public_index_retry_only_waits_for_missing_release_files(
     )
 
     assert set(selected) == set(payloads)
+
+
+@pytest.mark.parametrize("status_code", [429, 500, 503])
+def test_public_index_retries_transient_http_failures(
+    tmp_path: Path,
+    verifier: ModuleType,
+    status_code: int,
+) -> None:
+    manifest_path, checksums_path, payloads = _release_record(tmp_path)
+    _, _, expected = verifier.load_release_record(
+        manifest_path,
+        checksums_path,
+        RELEASE_TAG,
+    )
+    responses: list[object] = [
+        HTTPError("https://pypi.org/pypi/example/json", status_code, "transient", {}, BytesIO()),
+        _public_document(payloads),
+    ]
+
+    def fetch_json(_url: str, _timeout: float) -> object:
+        response = responses.pop(0)
+        if isinstance(response, HTTPError):
+            raise response
+        return response
+
+    selected = verifier.wait_for_public_artifacts(
+        VERSION,
+        expected,
+        attempts=2,
+        delay_seconds=0,
+        timeout_seconds=1,
+        fetch_json=fetch_json,
+    )
+
+    assert set(selected) == set(payloads)
+
+
+def test_public_index_rejects_non_retryable_http_failure(
+    tmp_path: Path,
+    verifier: ModuleType,
+) -> None:
+    manifest_path, checksums_path, _ = _release_record(tmp_path)
+    _, _, expected = verifier.load_release_record(
+        manifest_path,
+        checksums_path,
+        RELEASE_TAG,
+    )
+
+    def fetch_json(_url: str, _timeout: float) -> object:
+        raise HTTPError("https://pypi.org/pypi/example/json", 400, "invalid", {}, BytesIO())
+
+    with pytest.raises(verifier.PublicPyPIVerificationError, match="request failed"):
+        verifier.wait_for_public_artifacts(
+            VERSION,
+            expected,
+            attempts=2,
+            delay_seconds=0,
+            timeout_seconds=1,
+            fetch_json=fetch_json,
+        )
 
 
 def test_release_record_must_be_bound_to_the_requested_tag(
