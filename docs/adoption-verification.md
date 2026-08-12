@@ -84,7 +84,7 @@ unlisted framework versions.
 
 ## 4. Verify release identity
 
-Every release from v0.8 onward carries a Release Verification Manifest, wheel,
+Every distributable release from v0.8.1 onward carries a Release Verification Manifest, wheel,
 source distribution, SPDX SBOM, and `SHA256SUMS`. The release workflow binds
 those files to the tag and protected `main` commit, then records GitHub build
 provenance. PyPI Trusted Publishing downloads and re-verifies that immutable

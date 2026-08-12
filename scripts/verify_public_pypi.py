@@ -207,7 +207,7 @@ def wait_for_public_artifacts(
         try:
             return select_public_artifacts(fetch_json(url, timeout_seconds), expected)
         except HTTPError as exc:
-            if exc.code != 404:
+            if exc.code not in {404, 429} and not 500 <= exc.code < 600:
                 raise PublicPyPIVerificationError(f"public PyPI request failed: {exc}") from exc
             last_error = exc
         except (URLError, TimeoutError, PublicPyPINotReady) as exc:
